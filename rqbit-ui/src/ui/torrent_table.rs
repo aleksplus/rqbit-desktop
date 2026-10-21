@@ -15,7 +15,9 @@ use rqbit_protocol::{TorrentDetails, TorrentState};
 use crate::client::TorrentClient;
 use crate::host::UiHost;
 use crate::ui::main_panel::MainPanel;
-use crate::ui::utils::{format_bytes, format_eta, format_speed, torrent_action_menu_item};
+use crate::ui::utils::{
+    format_bytes, format_eta, format_speed, torrent_action_menu_item, torrent_bulk_action_menu_item,
+};
 
 /// Visual tone for a torrent row, derived from the torrent state. Drives
 /// row-level styling: paused rows render with dimmed text, and the progress
@@ -321,6 +323,58 @@ fn derive_display_rows(
         .collect()
 }
 
+/// Resolve a shift-click anchor torrent id to its row index among `rows`;
+/// `None` when that torrent is filtered out or deleted.
+fn resolve_anchor_row(anchor_id: Option<u64>, rows: &[TorrentRow]) -> Option<usize> {
+    let id = anchor_id?;
+    rows.iter().position(|r| r.id == id)
+}
+
+/// The row a shift-click at `row_ix` extends from: the anchor row when its
+/// torrent is still visible, otherwise the selected row nearest the click
+/// (ties broken toward the top), otherwise the clicked row itself. The
+/// fallback keeps shift-click extending from the existing selection even
+/// when no anchor was recorded (e.g. rows selected via checkboxes).
+fn shift_range_start(
+    anchor: Option<usize>,
+    selected_rows: &HashSet<usize>,
+    row_ix: usize,
+) -> usize {
+    anchor
+        .or_else(|| {
+            selected_rows
+                .iter()
+                .copied()
+                .min_by_key(|&ix| (ix.abs_diff(row_ix), ix))
+        })
+        .unwrap_or(row_ix)
+}
+
+/// Torrent ids a context menu opened at `row_ix` should target: the whole
+/// current selection when the right-clicked row is part of a multi-row
+/// selection, otherwise just the clicked row. Sorted and deduplicated.
+fn context_menu_target_ids(
+    selected_rows: &HashSet<usize>,
+    row_ix: usize,
+    rows: &[TorrentRow],
+) -> Vec<usize> {
+    let keep_selection = selected_rows.contains(&row_ix) && selected_rows.len() > 1;
+    let mut ids: Vec<usize> = if keep_selection {
+        selected_rows
+            .iter()
+            .filter_map(|&ix| rows.get(ix).map(|r| r.id as usize))
+            .collect()
+    } else {
+        rows.get(row_ix)
+            .map(|r| r.id as usize)
+            .into_iter()
+            .collect()
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Table delegate that holds torrent row data.
 pub struct TorrentTableDelegate {
     /// Full, unfiltered set of rows as last fetched from the client. The
@@ -334,8 +388,11 @@ pub struct TorrentTableDelegate {
     filter: TorrentFilter,
     /// Multi-selection state: set of selected row indices.
     pub selected_rows: HashSet<usize>,
-    /// The anchor row for shift-click range selection.
-    anchor_row: Option<usize>,
+    /// The torrent id anchoring shift-click range selection. Tracked by id,
+    /// not row index, so the anchor survives data refreshes and re-sorting
+    /// (which shift row indices); resolved to a row lazily by
+    /// [`TorrentTableDelegate::anchor_row_ix`].
+    anchor_id: Option<u64>,
     /// Currently active sort column index (None = no active sort).
     sort_col_ix: Option<usize>,
     /// Currently active sort direction.
@@ -380,7 +437,7 @@ impl TorrentTableDelegate {
             ],
             filter: TorrentFilter::default(),
             selected_rows: HashSet::new(),
-            anchor_row: None,
+            anchor_id: None,
             sort_col_ix: None,
             sort_dir: ColumnSort::Default,
             collapsed_folders: HashSet::new(),
@@ -416,6 +473,13 @@ impl TorrentTableDelegate {
         !self.filter.search.trim().is_empty() || !self.filter.status.is_empty()
     }
 
+    /// Row index of the shift-click anchor, when its torrent is still among
+    /// the visible rows (a filtered-out or deleted anchor resolves to
+    /// `None`, and shift-click falls back to the nearest selected row).
+    fn anchor_row_ix(&self) -> Option<usize> {
+        resolve_anchor_row(self.anchor_id, &self.rows)
+    }
+
     /// Recompute the visible `rows` from `all_rows`: apply the stored filter
     /// (search text matches the name as a case-insensitive substring, status
     /// must match the torrent's `state` exactly — a folder group survives
@@ -438,8 +502,9 @@ impl TorrentTableDelegate {
             self.default_folder_key.as_deref(),
         );
         // Row indices shifted, so any index-based selection is now stale.
+        // The id-based shift-click anchor intentionally survives: it resolves
+        // lazily against the new rows and falls back when its torrent is gone.
         self.selected_rows.clear();
-        self.anchor_row = None;
         // Drop collapse state for folders that no longer have any members.
         let live: HashSet<&str> = self
             .all_rows
@@ -518,10 +583,17 @@ impl TableDelegate for TorrentTableDelegate {
                             .checked(checked)
                             .on_click(move |new_checked, _, cx| {
                                 table_state.update(cx, |state, cx| {
+                                    let id = state.delegate().rows.get(row_ix).map(|r| r.id);
+                                    let delegate = state.delegate_mut();
                                     if *new_checked {
-                                        state.delegate_mut().selected_rows.insert(row_ix);
+                                        delegate.selected_rows.insert(row_ix);
                                     } else {
-                                        state.delegate_mut().selected_rows.remove(&row_ix);
+                                        delegate.selected_rows.remove(&row_ix);
+                                    }
+                                    // The toggled row becomes the shift-click
+                                    // anchor, matching a plain row click.
+                                    if let Some(id) = id {
+                                        delegate.anchor_id = Some(id);
                                     }
                                     cx.notify();
                                 });
@@ -730,8 +802,16 @@ impl TableDelegate for TorrentTableDelegate {
                 MouseButton::Left,
                 cx.listener(move |state, e: &MouseDownEvent, _, cx| {
                     let delegate = state.delegate_mut();
+                    let clicked_id = delegate.rows.get(row_ix).map(|r| r.id);
                     if e.modifiers.shift {
-                        let start = delegate.anchor_row.unwrap_or(row_ix);
+                        // Extend from the anchor row — or, when its torrent is
+                        // no longer visible, from the selected row nearest the
+                        // click — replacing the selection with the range.
+                        let start = shift_range_start(
+                            delegate.anchor_row_ix(),
+                            &delegate.selected_rows,
+                            row_ix,
+                        );
                         let (lo, hi) = if start <= row_ix {
                             (start, row_ix)
                         } else {
@@ -747,11 +827,15 @@ impl TableDelegate for TorrentTableDelegate {
                         } else {
                             delegate.selected_rows.insert(row_ix);
                         }
-                        delegate.anchor_row = Some(row_ix);
+                        if let Some(id) = clicked_id {
+                            delegate.anchor_id = Some(id);
+                        }
                     } else {
                         delegate.selected_rows.clear();
                         delegate.selected_rows.insert(row_ix);
-                        delegate.anchor_row = Some(row_ix);
+                        if let Some(id) = clicked_id {
+                            delegate.anchor_id = Some(id);
+                        }
                     }
                     cx.notify();
                 }),
@@ -771,16 +855,36 @@ impl TableDelegate for TorrentTableDelegate {
         let torrent_id = row.id;
         let torrent_name = row.name.clone();
 
-        // Select the right-clicked row so actions target it.
-        self.selected_rows.clear();
-        self.selected_rows.insert(row_ix);
-        self.anchor_row = Some(row_ix);
+        // Right-clicking a row inside an existing multi-row selection keeps
+        // that selection so the actions below target all of it; right-clicking
+        // any other row re-targets the selection to just the clicked row.
+        let target_ids = context_menu_target_ids(&self.selected_rows, row_ix, &self.rows);
+        if target_ids.len() <= 1 {
+            self.selected_rows.clear();
+            self.selected_rows.insert(row_ix);
+        }
+        self.anchor_id = Some(torrent_id);
 
         let client = self.client.clone();
         let host = self.host.clone();
+        let count = target_ids.len();
 
-        let mut m = menu
-            .item(torrent_action_menu_item(
+        let mut m = if count > 1 {
+            menu.item(torrent_bulk_action_menu_item(
+                format!("Pause ({count} torrents)"),
+                target_ids.clone(),
+                rqbit_protocol::TorrentAction::Pause,
+                client.clone(),
+            ))
+            .item(torrent_bulk_action_menu_item(
+                format!("Start ({count} torrents)"),
+                target_ids.clone(),
+                rqbit_protocol::TorrentAction::Start,
+                client.clone(),
+            ))
+            .separator()
+        } else {
+            menu.item(torrent_action_menu_item(
                 format!("Pause: {torrent_name}"),
                 torrent_id as usize,
                 rqbit_protocol::TorrentAction::Pause,
@@ -792,11 +896,14 @@ impl TableDelegate for TorrentTableDelegate {
                 rqbit_protocol::TorrentAction::Start,
                 client.clone(),
             ))
-            .separator();
+            .separator()
+        };
 
         if self.host.capabilities().open_folder {
             // Resolve the output folder lazily (async round-trip; may be a
             // network call on remote clients), then hand it to the host.
+            // Single-target by nature: always the right-clicked torrent, even
+            // when the rest of the menu targets a multi-row selection.
             m = m
                 .item(
                     PopupMenuItem::new("Open Folder").on_click(move |_, _, cx: &mut App| {
@@ -823,8 +930,10 @@ impl TableDelegate for TorrentTableDelegate {
 
         // Parent rows offer deleting the whole folder group at once. Ids are
         // collected from `all_rows` so collapsed (hidden) members are
-        // included; the existing bulk delete dialog handles the rest.
-        if row.is_parent() {
+        // included; the existing bulk delete dialog handles the rest. Only
+        // offered without a multi-row selection — then the selection-wide
+        // delete below is the operative action.
+        if row.is_parent() && count <= 1 {
             let ids: Vec<usize> = self
                 .all_rows
                 .iter()
@@ -848,18 +957,33 @@ impl TableDelegate for TorrentTableDelegate {
                 .separator();
         }
 
-        m.item(
-            PopupMenuItem::new(format!("Delete: {torrent_name}")).on_click({
-                let main_panel = self.main_panel.clone();
-                move |_, window, cx: &mut App| {
-                    if let Some(main) = main_panel.upgrade() {
-                        main.update(cx, |this, cx| {
-                            this.open_delete_dialog(vec![torrent_id as usize], window, cx);
-                        });
+        if count > 1 {
+            m.item(
+                PopupMenuItem::new(format!("Delete ({count} torrents)…")).on_click({
+                    let main_panel = self.main_panel.clone();
+                    move |_, window, cx: &mut App| {
+                        if let Some(main) = main_panel.upgrade() {
+                            main.update(cx, |this, cx| {
+                                this.open_delete_dialog(target_ids.clone(), window, cx);
+                            });
+                        }
                     }
-                }
-            }),
-        )
+                }),
+            )
+        } else {
+            m.item(
+                PopupMenuItem::new(format!("Delete: {torrent_name}")).on_click({
+                    let main_panel = self.main_panel.clone();
+                    move |_, window, cx: &mut App| {
+                        if let Some(main) = main_panel.upgrade() {
+                            main.update(cx, |this, cx| {
+                                this.open_delete_dialog(vec![torrent_id as usize], window, cx);
+                            });
+                        }
+                    }
+                }),
+            )
+        }
     }
 }
 
@@ -868,7 +992,10 @@ mod tests {
     // NOTE: no `use super::*` here — it would pull gpui's own `#[test]`
     // attribute macro (re-exported via `use gpui::*` above) into scope and
     // shadow the builtin `#[test]`.
-    use super::{RowTone, TorrentFilter, TorrentRow, derive_display_rows, normalize_folder};
+    use super::{
+        RowTone, TorrentFilter, TorrentRow, context_menu_target_ids, derive_display_rows,
+        normalize_folder, resolve_anchor_row, shift_range_start,
+    };
     use gpui_kit::component::table::ColumnSort;
     use std::collections::HashSet;
 
@@ -1144,5 +1271,50 @@ mod tests {
             ),
             vec![(1, 0, 1), (2, 0, 1)]
         );
+    }
+
+    #[test]
+    fn context_menu_targets_whole_selection_from_inside() {
+        // Rows 0 and 2 are selected; right-clicking row 2 targets both
+        // selected torrents, sorted by id.
+        let all = [row(1, "a", ""), row(2, "b", ""), row(3, "c", "")];
+        let selected: HashSet<usize> = [0, 2].into_iter().collect();
+        assert_eq!(context_menu_target_ids(&selected, 2, &all), vec![1, 3]);
+    }
+
+    #[test]
+    fn context_menu_retargets_when_click_outside_selection() {
+        let all = [row(1, "a", ""), row(2, "b", ""), row(3, "c", "")];
+        let selected: HashSet<usize> = [0].into_iter().collect();
+        assert_eq!(context_menu_target_ids(&selected, 2, &all), vec![3]);
+    }
+
+    #[test]
+    fn context_menu_single_selected_row_targets_itself() {
+        let all = [row(1, "a", ""), row(2, "b", "")];
+        let selected: HashSet<usize> = [1].into_iter().collect();
+        assert_eq!(context_menu_target_ids(&selected, 1, &all), vec![2]);
+    }
+
+    #[test]
+    fn anchor_resolves_by_torrent_id() {
+        let all = [row(1, "a", ""), row(2, "b", "")];
+        assert_eq!(resolve_anchor_row(Some(2), &all), Some(1));
+        // Deleted or never-set anchors resolve to None.
+        assert_eq!(resolve_anchor_row(Some(42), &all), None);
+        assert_eq!(resolve_anchor_row(None, &all), None);
+    }
+
+    #[test]
+    fn shift_start_falls_back_to_nearest_selected_row() {
+        let selected: HashSet<usize> = [5, 9].into_iter().collect();
+        // Without an anchor the nearest selected row wins; equidistant ties
+        // break toward the smaller index.
+        assert_eq!(shift_range_start(None, &selected, 7), 5);
+        assert_eq!(shift_range_start(None, &selected, 8), 9);
+        // An anchor beats the fallback; nothing selected and no anchor
+        // collapses to the clicked row.
+        assert_eq!(shift_range_start(Some(2), &selected, 8), 2);
+        assert_eq!(shift_range_start(None, &HashSet::new(), 4), 4);
     }
 }

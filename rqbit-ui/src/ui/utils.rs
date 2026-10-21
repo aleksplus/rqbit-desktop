@@ -101,6 +101,29 @@ pub fn torrent_action_menu_item(
     })
 }
 
+/// Build a context-menu item that runs a pause/start action on several
+/// torrents in turn (used when the menu targets a multi-row selection).
+pub fn torrent_bulk_action_menu_item(
+    label: String,
+    torrent_ids: Vec<usize>,
+    action: TorrentAction,
+    client: Arc<dyn TorrentClient>,
+) -> PopupMenuItem {
+    PopupMenuItem::new(label).on_click(move |_, _, cx: &mut App| {
+        let client = client.clone();
+        let action = action.clone();
+        let torrent_ids = torrent_ids.clone();
+        cx.spawn(async move |_| {
+            for id in torrent_ids {
+                let _ = client
+                    .action(&TorrentId::Id(id as u64), action.clone())
+                    .await;
+            }
+        })
+        .detach();
+    })
+}
+
 /// Render a centered modal overlay (dimmed backdrop + panel) for a dialog
 /// entity. Clicking the backdrop invokes `close`. `max_height`, when set, caps
 /// the panel height (used for the file-selection dialog).
