@@ -79,6 +79,23 @@ enum ActiveDialog {
     Add(Entity<AddTorrentDialog>),
 }
 
+/// The title bar's action-button cluster (add / settings / logs / theme).
+///
+/// `Button` lets mouse events bubble up, and `TitleBar` zooms the window on a
+/// double-click anywhere inside it, so a double-click on one of these buttons
+/// would maximize the window. Swallowing the left mouse-down here stops the
+/// title bar from ever registering a click from the cluster. It must be the
+/// mouse-down rather than the click: GPUI only fires an element's click
+/// handlers when it also saw its mouse-down, and the mouse-up still needs to
+/// reach the title bar to reset its window-drag tracking.
+fn title_bar_actions() -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+}
+
 /// Run configured host file-selection adjustments against an entry's resolved
 /// file list and record which ones changed the selection (shown as a hint in
 /// the add dialog). A no-op when the host has none.
@@ -839,10 +856,7 @@ impl MainPanel {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
+                title_bar_actions()
                     .when(caps.add_torrent_files, |this| {
                         this.child(
                             Button::new("add-torrent")
@@ -1161,4 +1175,127 @@ fn dummy_host() -> Arc<dyn UiHost> {
         }
     }
     Arc::new(Dummy)
+}
+
+#[cfg(test)]
+mod tests {
+    // NOTE: no `use super::*` here — it would pull gpui's own `#[test]`
+    // attribute macro (re-exported via `use gpui::*` above) into scope and
+    // shadow the builtin `#[test]` that `#[gpui_kit::test]` expands to.
+    use super::title_bar_actions;
+    use gpui_kit::component::{TitleBar, button::Button};
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{
+        AnyWindowHandle, AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement,
+        ParentElement as _, Point, Render, StatefulInteractiveElement as _, Styled as _,
+        TestAppContext, Window, WindowBounds, WindowOptions, div, px, size,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    /// A real `TitleBar` holding one action button, wrapped in a click-counting
+    /// ancestor. Clicks on the button that bubble past the title bar are
+    /// counted by the ancestor; the title bar's own double-click handler is not
+    /// observable headlessly, but it sits on the same bubbling path.
+    struct Harness {
+        guarded: bool,
+        button_clicks: Rc<Cell<usize>>,
+        ancestor_clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let button_clicks = self.button_clicks.clone();
+            let ancestor_clicks = self.ancestor_clicks.clone();
+            let cluster = if self.guarded {
+                title_bar_actions()
+            } else {
+                div().flex().items_center().gap_2()
+            };
+            div()
+                .id("ancestor")
+                .size_full()
+                .on_click(move |_, _, _| ancestor_clicks.set(ancestor_clicks.get() + 1))
+                .child(
+                    TitleBar::new().child(
+                        cluster.child(
+                            Button::new("theme")
+                                .label("theme")
+                                .on_click(move |_, _, _| {
+                                    button_clicks.set(button_clicks.get() + 1)
+                                }),
+                        ),
+                    ),
+                )
+        }
+    }
+
+    fn open_harness(
+        cx: &mut TestAppContext,
+        guarded: bool,
+    ) -> (AnyWindowHandle, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let button_clicks = Rc::new(Cell::new(0));
+        let ancestor_clicks = Rc::new(Cell::new(0));
+        cx.update(gpui_kit::init);
+        let (window, _) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(600.), px(200.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                {
+                    let button_clicks = button_clicks.clone();
+                    let ancestor_clicks = ancestor_clicks.clone();
+                    move |_, cx| {
+                        cx.new(|_| Harness {
+                            guarded,
+                            button_clicks,
+                            ancestor_clicks,
+                        })
+                    }
+                },
+            )
+            .expect("open test window")
+        });
+        (window, button_clicks, ancestor_clicks)
+    }
+
+    #[gpui_kit::test]
+    fn double_click_on_action_button_stays_out_of_the_title_bar(cx: &mut TestAppContext) {
+        let (window, button_clicks, ancestor_clicks) = open_harness(cx, true);
+
+        cx.update_window(window, |_, window, cx| window.double_click("theme", cx))
+            .expect("test window open");
+
+        assert_eq!(
+            button_clicks.get(),
+            2,
+            "the button still receives both clicks"
+        );
+        assert_eq!(
+            ancestor_clicks.get(),
+            0,
+            "nothing above the action cluster sees the clicks"
+        );
+    }
+
+    /// Control for the test above: without the guard the same double-click
+    /// bubbles through the title bar to its ancestors, which is how the title
+    /// bar's double-click-to-zoom handler gets triggered. Skipped on Linux,
+    /// where that handler calls `zoom_window`, which the headless test
+    /// platform does not implement.
+    #[cfg(not(target_os = "linux"))]
+    #[gpui_kit::test]
+    fn double_click_on_unguarded_button_bubbles_through_the_title_bar(cx: &mut TestAppContext) {
+        let (window, button_clicks, ancestor_clicks) = open_harness(cx, false);
+
+        cx.update_window(window, |_, window, cx| window.double_click("theme", cx))
+            .expect("test window open");
+
+        assert_eq!(button_clicks.get(), 2);
+        assert_eq!(ancestor_clicks.get(), 2);
+    }
 }

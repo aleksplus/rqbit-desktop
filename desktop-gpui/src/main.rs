@@ -74,6 +74,11 @@ async fn main() {
             window_bounds: Some(WindowBounds::centered(size(px(1000.), px(800.)), cx)),
             window_decorations: Some(WindowDecorations::Server),
             window_min_size: Some(size(px(600.), px(400.))),
+            // The custom `TitleBar` drags and zooms the window itself. Without
+            // this, AppKit also treats the title-bar strip as its own drag
+            // region and zooms the window on any double-click there, including
+            // double-clicks on the title-bar buttons.
+            app_owns_titlebar_drag: true,
             ..Default::default()
         };
 
