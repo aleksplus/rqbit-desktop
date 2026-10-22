@@ -217,6 +217,7 @@ mod tests {
             included,
             exists: false,
             progress: 0,
+            custom: Default::default(),
         }
     }
 

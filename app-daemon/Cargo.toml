@@ -27,6 +27,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
+reqwest = { workspace = true, features = ["json", "query"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # WS client for integration tests of the binary protocol end-to-end.

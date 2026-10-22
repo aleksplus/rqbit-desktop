@@ -134,6 +134,7 @@ mod tests {
             url: format!("http://{addr}/hook"),
             timeout_secs: 5,
             headers: [("X-Token".to_string(), "secret".to_string())].into(),
+            poll_secs: 10,
         };
         let client = reqwest::Client::new();
         let (result, _) = tokio::join!(
@@ -173,6 +174,7 @@ mod tests {
             url: format!("http://{addr}/hook"),
             timeout_secs: 5,
             headers: Default::default(),
+            poll_secs: 10,
         };
         let client = reqwest::Client::new();
         let (result, _) = tokio::join!(

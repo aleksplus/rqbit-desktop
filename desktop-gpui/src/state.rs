@@ -1,6 +1,7 @@
-use crate::config::{RqbitDesktopConfig, read_config, write_config};
+use crate::config::{HttpMethod, RqbitDesktopConfig, read_config, write_config};
 use crate::folder_watcher::start_folder_watcher;
-use crate::hooks::HookDispatcher;
+use crate::hooks::{HookDispatcher, HookEvent};
+use app_daemon::columns::{ColumnsHook, ColumnsMethod, ColumnsProvider};
 use librqbit::{api::Api, tracing_subscriber_config_utils::InitLoggingResult};
 use librqbit_dualstack_sockets::TcpListener;
 use std::{path::Path, sync::Arc};
@@ -18,6 +19,10 @@ use tracing::{debug_span, error, warn};
 pub struct SharedState {
     config: RqbitDesktopConfig,
     api: Arc<Api>,
+    /// Hook-provided custom columns (the `torrent_columns` event), `None`
+    /// when no hook provides columns. Swapped together with the session on
+    /// reconfigure; `LocalClient` re-reads it per call.
+    columns: Option<Arc<ColumnsProvider>>,
 }
 
 impl SharedState {
@@ -29,11 +34,20 @@ impl SharedState {
     /// config, which starts listeners).
     #[cfg(test)]
     pub(crate) fn for_test(config: RqbitDesktopConfig, api: Arc<Api>) -> Self {
-        Self { config, api }
+        Self {
+            config,
+            api,
+            columns: None,
+        }
     }
 
     pub fn config(&self) -> RqbitDesktopConfig {
         self.config.clone()
+    }
+
+    /// The custom-column provider, when a hook provides columns.
+    pub fn columns(&self) -> Option<Arc<ColumnsProvider>> {
+        self.columns.clone()
     }
 
     /// Replace the in-memory config snapshot (does not persist to disk).
@@ -60,10 +74,40 @@ impl Clone for State {
     }
 }
 
+/// A session's Api plus the hook-columns provider built alongside it.
+struct SessionApi {
+    api: Api,
+    columns: Option<Arc<ColumnsProvider>>,
+}
+
+/// Hooks subscribed to `torrent_columns`, converted for the daemon-side
+/// provider. Disabled hooks and hooks without a URL are skipped.
+fn column_hooks(config: &RqbitDesktopConfig) -> Vec<ColumnsHook> {
+    config
+        .hooks
+        .hooks
+        .iter()
+        .filter(|h| {
+            h.enabled && h.events.contains(&HookEvent::TorrentColumns) && !h.url.trim().is_empty()
+        })
+        .map(|h| ColumnsHook {
+            name: h.name.clone(),
+            url: h.url.clone(),
+            method: match h.method {
+                HttpMethod::Post => ColumnsMethod::Post,
+                HttpMethod::Get => ColumnsMethod::Get,
+            },
+            timeout_secs: h.timeout_secs,
+            headers: h.headers.clone(),
+            poll_secs: h.poll_secs,
+        })
+        .collect()
+}
+
 async fn api_from_config(
     init_logging: &InitLoggingResult,
     config: &RqbitDesktopConfig,
-) -> anyhow::Result<Api> {
+) -> anyhow::Result<SessionApi> {
     config
         .validate()
         .context("error validating configuration")?;
@@ -180,6 +224,22 @@ async fn api_from_config(
         session.spawn(debug_span!("http_api"), "http_api", http_api_task);
     }
 
+    // Hook-provided custom columns: polled for as long as this session
+    // lives, served to the web view over the WS protocol and read by
+    // LocalClient for the native UI.
+    let column_hooks = column_hooks(config);
+    let columns = if column_hooks.is_empty() {
+        None
+    } else {
+        let provider = ColumnsProvider::new(Arc::new(api.clone()), column_hooks);
+        let poller = provider.clone();
+        session.spawn(debug_span!("hook_columns"), "hook_columns", async move {
+            poller.run().await;
+            Ok(())
+        });
+        Some(provider)
+    };
+
     // The bundled web view: the same WS protocol (`/ws`) and embedded browser
     // client (`/`) `app-daemon` serves, pointed at this session. One librqbit
     // instance then serves both the native UI and the browser UI. Spawned on
@@ -195,8 +255,10 @@ async fn api_from_config(
         let listen_addr = config.web_view.listen_addr;
         let api = api.clone();
         let line_broadcast = init_logging.line_broadcast.clone();
+        let columns_for_router = columns.clone();
         let web_view_task = async move {
-            let router = app_daemon::server::router(Arc::new(api), Some(line_broadcast));
+            let router =
+                app_daemon::server::router(Arc::new(api), Some(line_broadcast), columns_for_router);
             let listener = tokio::net::TcpListener::bind(listen_addr)
                 .await
                 .with_context(|| format!("error listening on {listen_addr}"))?;
@@ -207,7 +269,7 @@ async fn api_from_config(
         };
         session.spawn(debug_span!("web_view"), "web_view", web_view_task);
     }
-    Ok(api)
+    Ok(SessionApi { api, columns })
 }
 
 impl State {
@@ -222,7 +284,7 @@ impl State {
 
         let config = read_config(&config_filename).unwrap_or_default();
 
-        let api = api_from_config(&init_logging, &config)
+        let session_api = api_from_config(&init_logging, &config)
             .await
             .map_err(|e| {
                 warn!(error=?e, "error reading configuration");
@@ -232,7 +294,8 @@ impl State {
 
         let shared = Arc::new(RwLock::new(SharedState {
             config,
-            api: Arc::new(api),
+            api: Arc::new(session_api.api),
+            columns: session_api.columns,
         }));
 
         // The hook dispatcher reads hooks from the shared config at dispatch
@@ -295,15 +358,18 @@ impl State {
         old_api.session().stop().await;
 
         // Build the replacement API without holding any lock across the await.
-        let api = match api_from_config(&self.init_logging, &config).await {
+        let session_api = match api_from_config(&self.init_logging, &config).await {
             Ok(api) => api,
             Err(e) => {
                 // The config file was already written by the caller; adopt the
                 // new config here too so the UI does not silently roll the
                 // user's changes back (the old session is stopped either way,
                 // and no folder watcher is started for it — restart the app
-                // or fix the config and re-apply).
-                self.shared.write().config = config;
+                // or fix the config and re-apply). The old session's column
+                // poller died with it, so drop the stale provider.
+                let mut shared = self.shared.write();
+                shared.config = config;
+                shared.columns = None;
                 return Err(e.into());
             }
         };
@@ -315,7 +381,8 @@ impl State {
         {
             let mut existing = self.shared.write();
             existing.config = config;
-            existing.api = Arc::new(api);
+            existing.api = Arc::new(session_api.api);
+            existing.columns = session_api.columns;
         }
         // The old session's folder watcher exits with its cancellation
         // token; start one for the new session (no-op when unconfigured).
@@ -348,10 +415,11 @@ pub(crate) mod tests {
                 )
             })
             .clone();
-        let api = Arc::new(api_from_config(&init_logging, &config).await.unwrap());
+        let session_api = api_from_config(&init_logging, &config).await.unwrap();
         let shared = Arc::new(RwLock::new(SharedState {
             config,
-            api: api.clone(),
+            api: Arc::new(session_api.api),
+            columns: session_api.columns,
         }));
         let hooks = Arc::new(HookDispatcher::new(
             shared.clone(),

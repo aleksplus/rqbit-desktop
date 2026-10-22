@@ -7,16 +7,19 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, checkbox::Checkbox, h_flex,
     menu::PopupMenuItem, progress::Progress,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use rqbit_protocol::{TorrentDetails, TorrentState};
+use rqbit_protocol::{
+    CustomColumnKind, CustomColumnSpec, CustomColumnsState, TorrentDetails, TorrentState,
+};
 
 use crate::client::TorrentClient;
 use crate::host::UiHost;
 use crate::ui::main_panel::MainPanel;
 use crate::ui::utils::{
-    format_bytes, format_eta, format_speed, torrent_action_menu_item, torrent_bulk_action_menu_item,
+    format_bytes, format_eta, format_speed, render_custom_cell, torrent_action_menu_item,
+    torrent_bulk_action_menu_item,
 };
 
 /// Visual tone for a torrent row, derived from the torrent state. Drives
@@ -82,6 +85,9 @@ pub struct TorrentRow {
     /// standalone row. Stamped by [`derive_display_rows`] on the visible
     /// copies; `all_rows` entries always keep 1.
     pub group_size: usize,
+    /// Hook-provided custom column values, keyed by column key. Empty when
+    /// no hook provides data for this torrent.
+    pub custom: BTreeMap<String, String>,
 }
 
 impl TorrentRow {
@@ -156,6 +162,7 @@ impl TorrentRow {
             folder_key: normalize_folder(&t.output_folder),
             depth: 0,
             group_size: 1,
+            custom: t.custom.clone().unwrap_or_default(),
         }
     }
 
@@ -192,9 +199,13 @@ fn row_matches(r: &TorrentRow, needle: &str, status: &str) -> bool {
 }
 
 /// Ordering comparator for a sortable column key; larger == "greater".
-/// Uses the raw numeric fields directly — no string re-parsing. Unknown (or
-/// absent) keys compare Equal; callers tie-break by id.
-fn column_key_cmp(key: Option<&str>) -> impl Fn(&TorrentRow, &TorrentRow) -> std::cmp::Ordering {
+/// Uses the raw numeric fields directly — no string re-parsing. Dynamic
+/// (hook-provided) keys compare the rows' custom value maps as strings.
+/// Unknown (or absent) keys compare Equal; callers tie-break by id.
+fn column_key_cmp(
+    key: Option<&str>,
+    custom_keys: &HashSet<String>,
+) -> impl Fn(&TorrentRow, &TorrentRow) -> std::cmp::Ordering {
     let key = key.unwrap_or("").to_string();
     move |a, b| match key.as_str() {
         "name" => a.name.cmp(&b.name),
@@ -217,6 +228,7 @@ fn column_key_cmp(key: Option<&str>) -> impl Fn(&TorrentRow, &TorrentRow) -> std
                 (None, None) => std::cmp::Ordering::Equal,
             }
         }
+        k if custom_keys.contains(k) => a.custom.get(k).cmp(&b.custom.get(k)),
         _ => std::cmp::Ordering::Equal,
     }
 }
@@ -245,6 +257,7 @@ fn derive_display_rows(
     sort_dir: ColumnSort,
     collapsed: &HashSet<String>,
     default_folder: Option<&str>,
+    custom_keys: &HashSet<String>,
 ) -> Vec<TorrentRow> {
     let needle = filter.search.trim().to_lowercase();
     let status = filter.status.as_str();
@@ -297,7 +310,7 @@ fn derive_display_rows(
     // parent's key and the children within each unit; the parent always
     // stays positionally first. Every arm tie-breaks by ascending id — the
     // list arrives in HashMap order, so input position must never matter.
-    let key_cmp = column_key_cmp(sort_key);
+    let key_cmp = column_key_cmp(sort_key, custom_keys);
     let dir_cmp = |a: &TorrentRow, b: &TorrentRow| match sort_dir {
         ColumnSort::Default => a.id.cmp(&b.id),
         ColumnSort::Ascending => key_cmp(a, b).then(a.id.cmp(&b.id)),
@@ -383,6 +396,12 @@ pub struct TorrentTableDelegate {
     pub all_rows: Vec<TorrentRow>,
     pub rows: Vec<TorrentRow>,
     columns: Vec<Column>,
+    /// Hook-provided dynamic columns currently appended to `columns`. Empty
+    /// when no hook provides columns or the providing hook is unreachable.
+    custom_specs: Vec<CustomColumnSpec>,
+    /// Render kind per dynamic column key (mirrors `custom_specs`; avoids a
+    /// linear scan per rendered cell).
+    custom_kinds: HashMap<String, CustomColumnKind>,
     /// Currently active search/status filter, pushed in by the panel via
     /// [`TorrentTableDelegate::set_filter`].
     filter: TorrentFilter,
@@ -413,6 +432,25 @@ pub struct TorrentTableDelegate {
 }
 
 impl TorrentTableDelegate {
+    /// The static columns every torrent list shows, before any
+    /// hook-provided dynamic ones.
+    fn base_columns() -> Vec<Column> {
+        vec![
+            Column::new("select", "").width(40.),
+            Column::new("name", "Name").width(300.).sortable(),
+            Column::new("state", "Status").width(100.).sortable(),
+            Column::new("progress", "Progress").width(140.).sortable(),
+            Column::new("down", "↓ Speed").width(120.).sortable(),
+            Column::new("downloaded", "Downloaded")
+                .width(110.)
+                .sortable(),
+            Column::new("up", "↑ Speed").width(120.).sortable(),
+            Column::new("uploaded", "Uploaded").width(100.).sortable(),
+            Column::new("eta", "ETA").width(100.).sortable(),
+            Column::new("peers", "Peers").width(90.).sortable(),
+        ]
+    }
+
     pub fn new(
         main_panel: WeakEntity<MainPanel>,
         client: Arc<dyn TorrentClient>,
@@ -421,20 +459,9 @@ impl TorrentTableDelegate {
         Self {
             all_rows: Vec::new(),
             rows: Vec::new(),
-            columns: vec![
-                Column::new("select", "").width(40.),
-                Column::new("name", "Name").width(300.).sortable(),
-                Column::new("state", "Status").width(100.).sortable(),
-                Column::new("progress", "Progress").width(140.).sortable(),
-                Column::new("down", "↓ Speed").width(120.).sortable(),
-                Column::new("downloaded", "Downloaded")
-                    .width(110.)
-                    .sortable(),
-                Column::new("up", "↑ Speed").width(120.).sortable(),
-                Column::new("uploaded", "Uploaded").width(100.).sortable(),
-                Column::new("eta", "ETA").width(100.).sortable(),
-                Column::new("peers", "Peers").width(90.).sortable(),
-            ],
+            columns: Self::base_columns(),
+            custom_specs: Vec::new(),
+            custom_kinds: HashMap::new(),
             filter: TorrentFilter::default(),
             selected_rows: HashSet::new(),
             anchor_id: None,
@@ -467,6 +494,66 @@ impl TorrentTableDelegate {
         }
     }
 
+    /// Replace the hook-provided dynamic columns. `None` (no column hook
+    /// configured) and a disconnected state both drop every dynamic column —
+    /// hook data is only shown while the providing service is reachable.
+    /// Returns whether the visible column set changed; the caller must then
+    /// `refresh()` the table state so the framework re-reads the columns.
+    pub fn set_custom_columns(&mut self, state: Option<&CustomColumnsState>) -> bool {
+        let specs: Vec<CustomColumnSpec> = match state {
+            Some(s) if s.connected => s.columns.clone(),
+            _ => Vec::new(),
+        };
+        if specs == self.custom_specs {
+            return false;
+        }
+        self.custom_specs = specs;
+        self.custom_kinds = self
+            .custom_specs
+            .iter()
+            .map(|s| (s.key.clone(), s.kind))
+            .collect();
+        // The sort index may point past the (shorter) column list.
+        if self.sort_col_ix.is_some_and(|ix| ix >= self.columns.len()) {
+            self.sort_col_ix = None;
+            self.sort_dir = ColumnSort::Default;
+        }
+        self.rebuild_columns();
+        true
+    }
+
+    /// Persist user-resized widths back into the column defs so they survive
+    /// a `refresh()` (which re-reads `column()` into the framework's cached
+    /// column groups).
+    pub fn set_column_widths(&mut self, widths: &[Pixels]) {
+        for (col, width) in self.columns.iter_mut().zip(widths) {
+            col.width = *width;
+        }
+    }
+
+    /// Rebuild `columns` from the static base plus the dynamic specs,
+    /// re-mirroring the active sort onto the fresh definitions so the header
+    /// arrow survives the rebuild.
+    fn rebuild_columns(&mut self) {
+        let mut columns = Self::base_columns();
+        for spec in &self.custom_specs {
+            let mut col = Column::new(spec.key.clone(), spec.name.clone()).sortable();
+            if let Some(width) = spec.width {
+                col = col.width(width);
+            }
+            columns.push(col);
+        }
+        for (ix, col) in columns.iter_mut().enumerate() {
+            col.sort = if Some(ix) == self.sort_col_ix {
+                Some(self.sort_dir)
+            } else {
+                // Keep the sortable flag, clear any stale active sort.
+                col.sort.map(|_| ColumnSort::Default)
+            };
+        }
+        self.columns = columns;
+    }
+
     /// Whether a search text or status filter is currently constraining the
     /// visible rows. While true, matching groups are force-expanded.
     fn filter_active(&self) -> bool {
@@ -493,6 +580,8 @@ impl TorrentTableDelegate {
             .sort_col_ix
             .and_then(|ix| self.columns.get(ix))
             .map(|c| c.key.to_string());
+        let custom_keys: HashSet<String> =
+            self.custom_specs.iter().map(|s| s.key.clone()).collect();
         self.rows = derive_display_rows(
             &self.all_rows,
             &self.filter,
@@ -500,6 +589,7 @@ impl TorrentTableDelegate {
             self.sort_dir,
             &self.collapsed_folders,
             self.default_folder_key.as_deref(),
+            &custom_keys,
         );
         // Row indices shifted, so any index-based selection is now stale.
         // The id-based shift-click anchor intentionally survives: it resolves
@@ -709,7 +799,18 @@ impl TableDelegate for TorrentTableDelegate {
             "up" => div().child(row.up_speed.clone()),
             "uploaded" => div().child(row.uploaded.clone()),
             "eta" => div().child(row.eta.clone()),
-            _ => div(),
+            // Hook-provided dynamic columns: text or a tinted status badge.
+            _ => match self.custom_kinds.get(col.key.as_ref()).copied() {
+                Some(kind) => render_custom_cell(
+                    row.custom
+                        .get(col.key.as_ref())
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    kind,
+                    cx.theme(),
+                ),
+                None => div(),
+            },
         }
     }
 
@@ -765,9 +866,18 @@ impl TableDelegate for TorrentTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) {
         // Persist the active sort so it survives subsequent data refreshes
-        // (which replace `self.rows` wholesale).
+        // (which replace `self.rows` wholesale), and mirror it onto the
+        // column definitions so the header arrow survives a `refresh()`
+        // (which re-reads them into the framework's column groups).
         self.sort_col_ix = Some(col_ix);
         self.sort_dir = sort;
+        for (ix, col) in self.columns.iter_mut().enumerate() {
+            col.sort = if ix == col_ix {
+                Some(sort)
+            } else {
+                col.sort.map(|_| ColumnSort::Default)
+            };
+        }
         // Re-derives `rows` (filtering, grouping, and ordering); it also
         // clears the index-based selection, which just went stale.
         self.apply_filter();
@@ -1027,6 +1137,7 @@ mod tests {
             folder_key: normalize_folder(folder),
             depth: 0,
             group_size: 1,
+            custom: Default::default(),
         }
     }
 
@@ -1058,10 +1169,19 @@ mod tests {
         default_folder: Option<&str>,
     ) -> Vec<(u64, u8, usize)> {
         let collapsed: HashSet<String> = collapsed.iter().map(|s| s.to_string()).collect();
-        derive_display_rows(all, filter, sort_key, dir, &collapsed, default_folder)
-            .iter()
-            .map(|r| (r.id, r.depth, r.group_size))
-            .collect()
+        // No dynamic columns in these tests; the custom-key set is empty.
+        derive_display_rows(
+            all,
+            filter,
+            sort_key,
+            dir,
+            &collapsed,
+            default_folder,
+            &HashSet::new(),
+        )
+        .iter()
+        .map(|r| (r.id, r.depth, r.group_size))
+        .collect()
     }
 
     #[test]

@@ -96,12 +96,14 @@ pub fn torrent_details(resp: &TorrentDetailsResponse, trackers: Vec<String>) -> 
                     length: f.length,
                     included: f.included,
                     padding: f.attributes.padding,
+                    custom: None,
                 })
                 .collect()
         }),
         stats: resp.stats.as_ref().map(|s| Box::new(TorrentStats::from(s))),
         comment: resp.comment.clone(),
         trackers,
+        custom: None,
     }
 }
 

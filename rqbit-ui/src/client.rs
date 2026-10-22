@@ -15,8 +15,9 @@ use async_trait::async_trait;
 use futures::stream::LocalBoxStream;
 
 use rqbit_protocol::{
-    AddSource, ApiAddTorrent, ClientMessage, DhtStats, PeerStatsSnapshot, ProtoError, PushUpdate,
-    SessionStats, TorrentAction, TorrentDetails, TorrentId, TorrentList, TorrentStats,
+    AddSource, ApiAddTorrent, ClientMessage, CustomColumnsState, DhtStats, PeerStatsSnapshot,
+    ProtoError, PushUpdate, SessionStats, TorrentAction, TorrentDetails, TorrentId, TorrentList,
+    TorrentStats,
 };
 
 /// Result type all client methods return.
@@ -89,6 +90,12 @@ pub trait TorrentClient: 'static {
     /// `Api::api_dht_stats` — `Err` with
     /// [`rqbit_protocol::ProtoErrorKind::DhtDisabled`] when DHT is off.
     async fn dht_stats(&self) -> ClientResult<DhtStats>;
+    /// Hook-provided custom columns + connectivity (`None` = no column
+    /// hook is configured). Only consulted by poll-mode clients; push-mode
+    /// clients receive [`PushUpdate::CustomColumns`] instead.
+    async fn custom_columns(&self) -> Option<CustomColumnsState> {
+        None
+    }
     /// The `Api::api_torrent_action_*` methods.
     async fn action(&self, torrent: &TorrentId, action: TorrentAction) -> ClientResult<()>;
     /// `Api::api_add_torrent`. With `list_only: true` this resolves the file

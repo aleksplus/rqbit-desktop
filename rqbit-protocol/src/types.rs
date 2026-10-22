@@ -13,6 +13,7 @@
 //!   32-bit `usize` wasm targets.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A torrent address on the wire. (librqbit's `TorrentIdOrHash` cannot be
 /// used directly: its `Deserialize` calls `deserialize_any`, which
@@ -96,6 +97,10 @@ pub struct TorrentFile {
     pub included: bool,
     /// BEP-47 padding file (the only attribute the UI acts on).
     pub padding: bool,
+    /// Hook-provided custom column values for this file, keyed by column key
+    /// (`CustomColumnSpec::key`). `None`/empty = no hook data.
+    #[serde(default)]
+    pub custom: Option<BTreeMap<String, String>>,
 }
 
 /// Live (seeding/downloading) stats for a torrent. Carries exactly the
@@ -143,6 +148,50 @@ pub struct TorrentDetails {
     /// Announce URLs (from the managed torrent handle — the details payload
     /// librqbit returns has no trackers; the UI's Trackers tab reads them).
     pub trackers: Vec<String>,
+    /// Hook-provided custom column values for this torrent, keyed by column
+    /// key (`CustomColumnSpec::key`). `None`/empty = no hook data.
+    #[serde(default)]
+    pub custom: Option<BTreeMap<String, String>>,
+}
+
+/// How a hook-provided custom-column cell renders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomColumnKind {
+    /// Render the value as plain text.
+    #[default]
+    Text,
+    /// Render the value as a colored status badge (recognized values map to
+    /// success / warning / danger tones, everything else stays plain text).
+    Status,
+}
+
+/// One hook-provided column definition, served verbatim from the hook's
+/// `torrent_columns` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomColumnSpec {
+    /// Stable identifier; matches the keys of the per-torrent/per-file value
+    /// maps on `TorrentDetails::custom` / `TorrentFile::custom`.
+    pub key: String,
+    /// Header label.
+    pub name: String,
+    /// The hook provides per-file values too (file table only).
+    pub files: bool,
+    pub kind: CustomColumnKind,
+    /// Preferred column width in logical pixels; `None` = UI default.
+    pub width: Option<f32>,
+}
+
+/// Custom column set + connectivity, pushed to (or polled by) the UIs. The
+/// columns are only rendered while `connected` is true.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CustomColumnsState {
+    /// Column definitions, in the order the hook declared them.
+    pub columns: Vec<CustomColumnSpec>,
+    /// Whether the providing hook answered the last poll.
+    pub connected: bool,
+    /// Name of the hook that provided the columns (status bar label).
+    pub source: Option<String>,
 }
 
 /// Response of `Api::api_torrent_list_ext`.

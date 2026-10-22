@@ -21,21 +21,34 @@ use rqbit_protocol::codec;
 use rqbit_protocol::conv;
 use rqbit_protocol::types::TorrentList;
 use rqbit_protocol::{
-    AddSource, ClientMessage, PushUpdate, Request, ResponsePayload, ServerMessage,
+    AddSource, ClientMessage, CustomColumnsState, PushUpdate, Request, ResponsePayload,
+    ServerMessage,
 };
 use tokio::sync::{broadcast, mpsc};
+
+use crate::columns::ColumnsProvider;
 
 /// How often subscribed state is sampled for pushes.
 const PUSH_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Execute one request against the Api. Public so integration tests can
-/// exercise the mapping without a socket.
-pub async fn handle_request(api: &Api, req: Request) -> Result<ResponsePayload, proto::ProtoError> {
+/// Execute one request against the Api, decorating list/details responses
+/// with hook-provided custom column values when a provider is present.
+/// Public so integration tests can exercise the mapping without a socket.
+pub async fn handle_request(
+    api: &Api,
+    req: Request,
+    columns: Option<&ColumnsProvider>,
+) -> Result<ResponsePayload, proto::ProtoError> {
     use proto::ProtoErrorKind;
     Ok(match req {
-        Request::List { with_stats } => ResponsePayload::List(Box::new(TorrentList::from(
-            &api.api_torrent_list_ext(ApiTorrentListOpts { with_stats }),
-        ))),
+        Request::List { with_stats } => {
+            let mut list =
+                TorrentList::from(&api.api_torrent_list_ext(ApiTorrentListOpts { with_stats }));
+            if let Some(snapshot) = columns.and_then(|c| c.snapshot()) {
+                snapshot.decorate_list(&mut list);
+            }
+            ResponsePayload::List(Box::new(list))
+        }
         Request::Details { torrent } => {
             let id = torrent.to_api()?;
             let resp = api.api_torrent_details(id).map_err(|e| {
@@ -49,7 +62,11 @@ pub async fn handle_request(api: &Api, req: Request) -> Result<ResponsePayload, 
                 .map(|h| h.shared().trackers.iter().map(|t| t.to_string()).collect())
                 .unwrap_or_default();
             trackers.sort();
-            ResponsePayload::Details(Box::new(conv::torrent_details(&resp, trackers)))
+            let mut details = conv::torrent_details(&resp, trackers);
+            if let Some(snapshot) = columns.and_then(|c| c.snapshot()) {
+                snapshot.decorate_details(&mut details);
+            }
+            ResponsePayload::Details(Box::new(details))
         }
         Request::Stats { torrent } => {
             let id = torrent.to_api()?;
@@ -172,6 +189,7 @@ pub async fn run_connection(
     socket: WebSocket,
     api: Arc<Api>,
     line_broadcast: Option<LineBroadcast>,
+    columns: Option<Arc<ColumnsProvider>>,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
@@ -191,20 +209,28 @@ pub async fn run_connection(
     {
         let state = state.clone();
         let api = api.clone();
+        let columns = columns.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(PUSH_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_list: Vec<u8> = Vec::new();
             let mut last_stats: Vec<u8> = Vec::new();
+            let mut last_columns: Vec<u8> = Vec::new();
             loop {
                 interval.tick().await;
                 if !state.lock().session_level {
                     continue;
                 }
-                let list = TorrentList::from(
+                let mut list = TorrentList::from(
                     &api.api_torrent_list_ext(ApiTorrentListOpts { with_stats: true }),
                 );
+                // Attach hook-provided custom column values so the change
+                // diff picks up column updates too.
+                let columns_snapshot = columns.as_ref().and_then(|c| c.snapshot());
+                if let Some(snapshot) = &columns_snapshot {
+                    snapshot.decorate_list(&mut list);
+                }
                 if let Ok(bytes) = codec::encode_server(&ServerMessage::Push(
                     PushUpdate::TorrentList(Box::new(list)),
                 )) && bytes != last_list
@@ -222,6 +248,22 @@ pub async fn run_connection(
                     last_stats = bytes.clone();
                     if tx.send(WsMessage::Binary(bytes.into())).is_err() {
                         break;
+                    }
+                }
+                if let Some(snapshot) = &columns_snapshot {
+                    let state = CustomColumnsState {
+                        columns: snapshot.state.columns.clone(),
+                        connected: snapshot.state.connected,
+                        source: snapshot.state.source.clone(),
+                    };
+                    if let Ok(bytes) = codec::encode_server(&ServerMessage::Push(
+                        PushUpdate::CustomColumns(Box::new(state)),
+                    )) && bytes != last_columns
+                    {
+                        last_columns = bytes.clone();
+                        if tx.send(WsMessage::Binary(bytes.into())).is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -281,7 +323,7 @@ pub async fn run_connection(
         };
         match msg {
             ClientMessage::Request { id, req } => {
-                let result = handle_request(&api, req).await;
+                let result = handle_request(&api, req, columns.as_deref()).await;
                 let frame = codec::encode_server(&ServerMessage::Response { id, result })
                     .unwrap_or_else(|e| {
                         codec::encode_server(&ServerMessage::Response {
@@ -326,17 +368,27 @@ pub async fn run_connection(
 
 /// The WS route plus the embedded web client, served on the daemon's own
 /// port at `/` — the same port and path the classic React webui occupies
-/// in the upstream `rqbit server`.
-pub fn router(api: Arc<Api>, line_broadcast: Option<LineBroadcast>) -> axum::Router {
+/// in the upstream `rqbit server`. `columns` (when present) provides
+/// hook-declared custom columns: the sampler pushes their state and
+/// list/details responses are decorated with their values.
+pub fn router(
+    api: Arc<Api>,
+    line_broadcast: Option<LineBroadcast>,
+    columns: Option<Arc<ColumnsProvider>>,
+) -> axum::Router {
     use axum::routing::get;
 
     axum::Router::new()
         .route("/ws", get(ws_route))
         .fallback(serve_static)
-        .with_state((api, line_broadcast))
+        .with_state((api, line_broadcast, columns))
 }
 
-type RouterState = (Arc<Api>, Option<LineBroadcast>);
+type RouterState = (
+    Arc<Api>,
+    Option<LineBroadcast>,
+    Option<Arc<ColumnsProvider>>,
+);
 
 /// Serve the embedded web client under `/` (upstream-webui convention):
 /// `/` (and `/index.html`) is the HTML, whose relative `./pkg/…` asset paths
@@ -374,8 +426,8 @@ async fn serve_static(uri: axum::http::Uri) -> axum::response::Response {
 }
 
 async fn ws_route(
-    axum::extract::State((api, line_broadcast)): axum::extract::State<RouterState>,
+    axum::extract::State((api, line_broadcast, columns)): axum::extract::State<RouterState>,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> axum::response::Response {
-    upgrade.on_upgrade(move |socket| run_connection(socket, api, line_broadcast))
+    upgrade.on_upgrade(move |socket| run_connection(socket, api, line_broadcast, columns))
 }

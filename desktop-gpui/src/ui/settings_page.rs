@@ -941,6 +941,14 @@ fn set_hook_timeout(h: &mut HookConfig, v: SharedString) {
         h.timeout_secs = secs.max(1);
     }
 }
+fn get_hook_poll(h: &HookConfig) -> String {
+    h.poll_secs.to_string()
+}
+fn set_hook_poll(h: &mut HookConfig, v: SharedString) {
+    if let Ok(secs) = v.parse::<u64>() {
+        h.poll_secs = secs.max(2);
+    }
+}
 
 /// Build the groups of the Hooks settings page: one per configured hook,
 /// plus a trailing group with the add button.
@@ -976,6 +984,11 @@ fn hook_groups(config: ConfigArc) -> Vec<SettingGroup> {
                     "Timeout (seconds)",
                     hook_input_field(config.clone(), ix, get_hook_timeout, set_hook_timeout),
                 ),
+                SettingItem::new(
+                    "Poll (seconds)",
+                    hook_input_field(config.clone(), ix, get_hook_poll, set_hook_poll),
+                )
+                .description("Polling interval for the \"Torrent columns\" event."),
                 SettingItem::new(
                     "Events",
                     SettingField::render(hook_events_field(config.clone(), ix)),

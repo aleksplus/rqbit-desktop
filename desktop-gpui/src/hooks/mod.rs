@@ -26,6 +26,13 @@
 //!   preparing the add-torrent dialog, the resolved file list is sent to the
 //!   hook and the JSON response decides which files are pre-selected. The
 //!   user can still adjust the selection before confirming.
+//! - [`HookEvent::TorrentColumns`] — a polled request/response event: every
+//!   `HookConfig::poll_secs` the torrent list (optionally with per-torrent
+//!   file lists) is sent to the hook, and the response declares custom
+//!   columns with per-torrent/per-file values rendered by the UIs. Handled
+//!   by `app_daemon::columns::ColumnsProvider` so the browser client gets
+//!   the same data over the WebSocket protocol; see that module's docs for
+//!   the payload contract.
 //!
 //! # Payloads
 //!
@@ -82,15 +89,23 @@ pub enum HookEvent {
     TorrentDeleted,
     TorrentCompleted,
     FileSelection,
+    /// Polled on a timer (see `HookConfig::poll_secs`): the app sends the
+    /// torrent list to the hook and the response declares custom columns
+    /// plus per-torrent / per-file values. Implemented by
+    /// `app_daemon::columns::ColumnsProvider`; the UIs render the columns in
+    /// the torrent and file tables and show a connectivity icon in the
+    /// status bar.
+    TorrentColumns,
 }
 
 impl HookEvent {
     /// All events, in display order (used by the settings UI).
-    pub const ALL: [HookEvent; 4] = [
+    pub const ALL: [HookEvent; 5] = [
         HookEvent::TorrentAdded,
         HookEvent::TorrentDeleted,
         HookEvent::TorrentCompleted,
         HookEvent::FileSelection,
+        HookEvent::TorrentColumns,
     ];
 
     /// The wire name of this event (also used as the payload's `event` field).
@@ -100,6 +115,7 @@ impl HookEvent {
             HookEvent::TorrentDeleted => "torrent_deleted",
             HookEvent::TorrentCompleted => "torrent_completed",
             HookEvent::FileSelection => "file_selection",
+            HookEvent::TorrentColumns => "torrent_columns",
         }
     }
 
@@ -110,6 +126,7 @@ impl HookEvent {
             HookEvent::TorrentDeleted => "Deleted",
             HookEvent::TorrentCompleted => "Completed",
             HookEvent::FileSelection => "File selection",
+            HookEvent::TorrentColumns => "Torrent columns",
         }
     }
 }

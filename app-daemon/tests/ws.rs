@@ -38,13 +38,13 @@ async fn handle_request_maps_api_surface() {
     let api = quiet_api().await;
 
     // Session stats: an empty session still reports speeds/uptime.
-    let resp = server::handle_request(&api, proto::Request::SessionStats)
+    let resp = server::handle_request(&api, proto::Request::SessionStats, None)
         .await
         .unwrap();
     assert!(matches!(resp, proto::ResponsePayload::SessionStats(_)));
 
     // List: empty session → empty list.
-    let resp = server::handle_request(&api, proto::Request::List { with_stats: true })
+    let resp = server::handle_request(&api, proto::Request::List { with_stats: true }, None)
         .await
         .unwrap();
     match resp {
@@ -53,7 +53,7 @@ async fn handle_request_maps_api_surface() {
     }
 
     // DHT is disabled in this session → DhtDisabled error kind.
-    let err = server::handle_request(&api, proto::Request::DhtStats)
+    let err = server::handle_request(&api, proto::Request::DhtStats, None)
         .await
         .unwrap_err();
     assert_eq!(err.kind, proto::ProtoErrorKind::DhtDisabled);
@@ -65,6 +65,7 @@ async fn handle_request_maps_api_surface() {
         proto::Request::Details {
             torrent: bogus.clone(),
         },
+        None,
     )
     .await
     .unwrap_err();
@@ -77,6 +78,7 @@ async fn handle_request_maps_api_surface() {
             torrent: bogus,
             action: proto::TorrentAction::Pause,
         },
+        None,
     )
     .await
     .unwrap_err();
@@ -88,6 +90,7 @@ async fn handle_request_maps_api_surface() {
         proto::Request::Stats {
             torrent: proto::TorrentId::Hash("nope".into()),
         },
+        None,
     )
     .await
     .unwrap_err();
@@ -103,7 +106,7 @@ async fn spawn_server_addr() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
     let api = quiet_api().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = app_daemon::server::router(api, None);
+    let app = app_daemon::server::router(api, None, None);
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (addr, handle)
 }

@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    App, Context, Div, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
     Render, Styled, div, px,
 };
-use gpui_kit::component::{ActiveTheme, menu::PopupMenuItem, v_flex};
+use gpui_kit::component::{ActiveTheme, Theme, menu::PopupMenuItem, v_flex};
 
-use rqbit_protocol::{TorrentAction, TorrentId};
+use rqbit_protocol::{CustomColumnKind, TorrentAction, TorrentId};
 
 use crate::client::{AddTorrentRequest, TorrentClient, UiAddSource};
 use crate::ui::{add_torrent_dialog::AddTorrentEntry, file_table::FileRow, main_panel::MainPanel};
@@ -80,6 +80,47 @@ pub fn format_eta(seconds: u64) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+/// Visual role of a recognized status value in a `kind: "status"`
+/// hook-provided custom column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    Success,
+    Warning,
+    Danger,
+}
+
+/// Map a custom-column status value to a visual tone (case-insensitive).
+/// `None` = unrecognized; such values render as plain text.
+pub fn status_tone(value: &str) -> Option<StatusTone> {
+    match value.trim().to_lowercase().as_str() {
+        "ok" | "synced" | "sync" | "done" | "complete" | "completed" | "up" | "yes" | "true"
+        | "healthy" => Some(StatusTone::Success),
+        "pending" | "syncing" | "partial" | "in-progress" | "progress" | "queued"
+        | "connecting" | "unknown" => Some(StatusTone::Warning),
+        "error" | "failed" | "fail" | "missing" | "conflict" | "stale" | "out-of-date"
+        | "outdated" | "down" | "no" | "false" => Some(StatusTone::Danger),
+        _ => None,
+    }
+}
+
+/// Render one hook-provided custom-column cell: plain text, or
+/// colorized text for recognized status values when the column kind is
+/// [`CustomColumnKind::Status`]. Only the text is tinted — the background
+/// is left untouched.
+pub fn render_custom_cell(value: &str, kind: CustomColumnKind, theme: &Theme) -> Div {
+    if let CustomColumnKind::Status = kind
+        && let Some(tone) = status_tone(value)
+    {
+        let color = match tone {
+            StatusTone::Success => theme.success,
+            StatusTone::Warning => theme.warning,
+            StatusTone::Danger => theme.danger,
+        };
+        return div().text_color(color).child(value.to_string());
+    }
+    div().child(value.to_string())
 }
 
 /// Build a context-menu item that runs a pause/start action on a torrent.
@@ -211,6 +252,8 @@ pub async fn build_entry(
                 included: f.included,
                 exists,
                 progress: 0,
+                // Freshly resolved torrents have no hook data yet.
+                custom: Default::default(),
             }
         })
         .collect();
@@ -223,4 +266,24 @@ pub async fn build_entry(
         files,
         hook_note: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_tone_maps_recognized_values_case_insensitively() {
+        assert_eq!(status_tone("Synced"), Some(StatusTone::Success));
+        assert_eq!(status_tone("OK"), Some(StatusTone::Success));
+        assert_eq!(status_tone(" pending "), Some(StatusTone::Warning));
+        assert_eq!(status_tone("FAILED"), Some(StatusTone::Danger));
+    }
+
+    #[test]
+    fn status_tone_leaves_unrecognized_values_alone() {
+        assert_eq!(status_tone(""), None);
+        assert_eq!(status_tone("some bespoke state"), None);
+        assert_eq!(status_tone("42"), None);
+    }
 }

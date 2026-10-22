@@ -37,6 +37,9 @@ pub struct HookConfig {
     pub timeout_secs: u64,
     /// Extra HTTP headers sent with every request.
     pub headers: std::collections::BTreeMap<String, String>,
+    /// Seconds between polls of this hook — only used by the
+    /// `torrent_columns` event (all other events fire on demand).
+    pub poll_secs: u64,
 }
 
 impl Default for HookConfig {
@@ -49,6 +52,7 @@ impl Default for HookConfig {
             url: String::new(),
             timeout_secs: 10,
             headers: Default::default(),
+            poll_secs: 10,
         }
     }
 }
@@ -394,11 +398,16 @@ mod tests {
                 hooks: vec![HookConfig {
                     name: "svc".into(),
                     enabled: false,
-                    events: vec![HookEvent::TorrentCompleted, HookEvent::FileSelection],
+                    events: vec![
+                        HookEvent::TorrentCompleted,
+                        HookEvent::FileSelection,
+                        HookEvent::TorrentColumns,
+                    ],
                     method: HttpMethod::Get,
                     url: "http://127.0.0.1:9999/hook".into(),
                     timeout_secs: 3,
                     headers: [("Authorization".to_string(), "Bearer x".to_string())].into(),
+                    poll_secs: 5,
                 }],
             },
             ..Default::default()
@@ -406,6 +415,8 @@ mod tests {
         let s = serde_json::to_string(&cfg).unwrap();
         assert!(s.contains(r#""torrent_completed""#));
         assert!(s.contains(r#""file_selection""#));
+        assert!(s.contains(r#""torrent_columns""#));
+        assert!(s.contains(r#""poll_secs":5"#));
         let back: RqbitDesktopConfig = serde_json::from_str(&s).unwrap();
         assert!(cfg == back);
     }
@@ -417,5 +428,6 @@ mod tests {
         assert_eq!(h.timeout_secs, 10);
         assert_eq!(h.method, HttpMethod::Post);
         assert_eq!(h.events, vec![HookEvent::TorrentAdded]);
+        assert_eq!(h.poll_secs, 10);
     }
 }

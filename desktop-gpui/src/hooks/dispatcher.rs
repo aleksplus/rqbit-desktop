@@ -491,6 +491,7 @@ mod tests {
                     included: true,
                     exists: false,
                     progress: 0,
+                    custom: Default::default(),
                 },
                 FileRow {
                     file_index: 1,
@@ -499,6 +500,7 @@ mod tests {
                     included: true,
                     exists: false,
                     progress: 0,
+                    custom: Default::default(),
                 },
             ],
             hook_note: None,
@@ -519,6 +521,7 @@ mod tests {
             url: format!("http://{addr}/select"),
             timeout_secs: 5,
             headers: Default::default(),
+            poll_secs: 10,
         }])
         .await;
 
@@ -566,6 +569,7 @@ mod tests {
             url: format!("http://{addr}/added"),
             timeout_secs: 5,
             headers: Default::default(),
+            poll_secs: 10,
         }])
         .await;
 

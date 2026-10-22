@@ -42,6 +42,13 @@ impl LocalClient {
         self.shared.read().api()
     }
 
+    /// The live custom-column snapshot, when a hook provides columns. Read
+    /// per call so a settings reconfigure (which swaps the provider with the
+    /// session) is picked up immediately.
+    fn columns(&self) -> Option<app_daemon::columns::ColumnsSnapshot> {
+        self.shared.read().columns().and_then(|p| p.snapshot())
+    }
+
     /// Fire the `torrent_deleted` hook after a successful delete/forget.
     /// Mirrors the flow the settings/main panel used to inline.
     fn dispatch_deleted(
@@ -75,9 +82,13 @@ impl LocalClient {
 impl TorrentClient for LocalClient {
     async fn list(&self, with_stats: bool) -> ClientResult<TorrentList> {
         let api = self.api();
-        Ok(TorrentList::from(&api.api_torrent_list_ext(
-            librqbit::api::ApiTorrentListOpts { with_stats },
-        )))
+        let mut list = TorrentList::from(
+            &api.api_torrent_list_ext(librqbit::api::ApiTorrentListOpts { with_stats }),
+        );
+        if let Some(snapshot) = self.columns() {
+            snapshot.decorate_list(&mut list);
+        }
+        Ok(list)
     }
 
     async fn details(&self, torrent: &TorrentId) -> ClientResult<TorrentDetails> {
@@ -95,7 +106,11 @@ impl TorrentClient for LocalClient {
             .map(|h| h.shared().trackers.iter().map(|t| t.to_string()).collect())
             .unwrap_or_default();
         trackers.sort();
-        Ok(conv::torrent_details(&resp, trackers))
+        let mut details = conv::torrent_details(&resp, trackers);
+        if let Some(snapshot) = self.columns() {
+            snapshot.decorate_details(&mut details);
+        }
+        Ok(details)
     }
 
     async fn stats(&self, torrent: &TorrentId) -> ClientResult<TorrentStats> {
@@ -141,6 +156,13 @@ impl TorrentClient for LocalClient {
         api.api_dht_stats()
             .map(|s| DhtStats::from(&s))
             .map_err(|e| conv::proto_error_from_api_error(&e, ProtoErrorKind::DhtDisabled))
+    }
+
+    async fn custom_columns(&self) -> Option<proto::CustomColumnsState> {
+        self.shared
+            .read()
+            .columns()
+            .and_then(|p| p.custom_columns_state())
     }
 
     async fn action(&self, torrent: &TorrentId, action: TorrentAction) -> ClientResult<()> {

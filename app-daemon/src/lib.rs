@@ -8,6 +8,7 @@
 //!   1:1 onto the `Api` methods the shared UI calls.
 //! - `main.rs`: CLI, logging, session bootstrap, axum serving.
 
+pub mod columns;
 pub mod embed;
 pub mod server;
 

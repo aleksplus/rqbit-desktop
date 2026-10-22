@@ -21,7 +21,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rqbit_protocol::{DhtStats, ProtoErrorKind, PushUpdate, SessionStats, TorrentAction};
+use rqbit_protocol::{
+    CustomColumnsState, DhtStats, ProtoErrorKind, PushUpdate, SessionStats, TorrentAction,
+};
 
 use futures::StreamExt as _;
 
@@ -70,6 +72,10 @@ fn dht_footer_status(res: &ClientResult<DhtStats>) -> DhtFooterStatus {
         Err(_) => DhtFooterStatus::Error,
     }
 }
+
+/// Raw Lucide `plug` SVG (ISC license), embedded so both the desktop and web
+/// builds can tint it without registering an asset source.
+const PLUG_SVG: &[u8] = include_bytes!("../../assets/plug.svg");
 
 /// The modal dialog currently open, if any. At most one dialog can be open at
 /// a time; opening a new one replaces the previous.
@@ -128,6 +134,11 @@ pub struct MainPanel {
     footer_stats: Option<SessionStats>,
     /// Latest DHT health for the footer (None until the first poll completes).
     dht_status: Option<DhtFooterStatus>,
+    /// Hook-provided custom columns + connectivity. `None` = no column hook
+    /// is configured; `connected: false` = configured but unreachable (the
+    /// tables then hide the dynamic columns and the footer shows a gray
+    /// plug). Fed by the poll loop or `PushUpdate::CustomColumns`.
+    custom_columns: Option<CustomColumnsState>,
     /// Search box for filtering torrents by name.
     search_input: Entity<InputState>,
     /// Status filter dropdown (empty string = "All").
@@ -178,6 +189,7 @@ impl MainPanel {
             pending_delete_dialog: None,
             footer_stats: None,
             dht_status: None,
+            custom_columns: None,
             search_input: cx
                 .new(|_cx| InputState::new(window, _cx).placeholder("Search torrents…")),
             status_filter: cx.new(|_cx| {
@@ -210,22 +222,32 @@ impl MainPanel {
         });
         this.table_state = table_state.clone();
 
-        // Open/update detail panel when a row is selected in the table.
+        // Open/update detail panel when a row is selected in the table, and
+        // persist column widths so user resizes survive the delegate's
+        // column rebuilds (a `refresh()` re-reads the delegate's columns).
         cx.subscribe(&table_state, |this, table, event: &TableEvent, cx| {
-            if let TableEvent::SelectRow(row_ix) = event {
-                let torrent_id = table.read(cx).delegate().rows.get(*row_ix).map(|r| r.id);
-                if let Some(id) = torrent_id {
-                    if let Some(panel) = &this.detail_panel {
-                        // Update existing panel to show the newly selected torrent.
-                        panel.update(cx, |panel, cx| {
-                            panel.switch_torrent(id as usize, cx);
-                        });
-                    } else {
-                        // Mark that we need to create a panel; defer to render where window is available.
-                        this.pending_detail_id = Some(id as usize);
-                        cx.notify();
+            match event {
+                TableEvent::SelectRow(row_ix) => {
+                    let torrent_id = table.read(cx).delegate().rows.get(*row_ix).map(|r| r.id);
+                    if let Some(id) = torrent_id {
+                        if let Some(panel) = &this.detail_panel {
+                            // Update existing panel to show the newly selected torrent.
+                            panel.update(cx, |panel, cx| {
+                                panel.switch_torrent(id as usize, cx);
+                            });
+                        } else {
+                            // Mark that we need to create a panel; defer to render where window is available.
+                            this.pending_detail_id = Some(id as usize);
+                            cx.notify();
+                        }
                     }
                 }
+                TableEvent::ColumnWidthsChanged(widths) => {
+                    table.update(cx, |state, _cx| {
+                        state.delegate_mut().set_column_widths(widths);
+                    });
+                }
+                _ => {}
             }
         })
         .detach();
@@ -303,9 +325,11 @@ impl MainPanel {
             loop {
                 let stats = client.session_stats().await;
                 let dht_status = dht_footer_status(&client.dht_stats().await);
+                let custom_columns = client.custom_columns().await;
                 let _ = this.update(cx, |this, cx| {
                     this.footer_stats = stats.ok();
                     this.dht_status = Some(dht_status);
+                    this.apply_custom_columns(custom_columns, cx);
                     cx.notify();
                 });
 
@@ -316,6 +340,23 @@ impl MainPanel {
             }
         });
         self._stats_task = Some(task);
+    }
+
+    /// Push new hook-column state into the torrent table: the dynamic
+    /// columns are dropped while disconnected (or unconfigured) and only
+    /// trigger a table `refresh()` when the visible set actually changed.
+    fn apply_custom_columns(&mut self, state: Option<CustomColumnsState>, cx: &mut Context<Self>) {
+        if self.custom_columns == state {
+            return;
+        }
+        self.custom_columns = state.clone();
+        self.table_state.update(cx, |table, cx| {
+            if table.delegate_mut().set_custom_columns(state.as_ref()) {
+                table.refresh(cx);
+            }
+            cx.notify();
+        });
+        cx.notify();
     }
 
     /// Consume pushed updates (torrent list + footer stats) from a pushing
@@ -343,6 +384,11 @@ impl MainPanel {
                         let _ = this.update(cx, |this, cx| {
                             this.footer_stats = Some(*stats);
                             cx.notify();
+                        });
+                    }
+                    PushUpdate::CustomColumns(state) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.apply_custom_columns(Some(*state), cx);
                         });
                     }
                     // Torrent-level pushes are not consumed here: the detail
@@ -1075,6 +1121,34 @@ impl MainPanel {
             None => (cx.theme().muted_foreground, "—".to_string()),
         };
 
+        // Hook service connectivity: a green plug + service name while the
+        // column-providing hook responds, a gray one + "offline" when it is
+        // configured but unreachable. Rendered not at all when no hook
+        // provides columns.
+        let plug_group = self.custom_columns.as_ref().map(|columns| {
+            let (color, status_text) = if columns.connected {
+                (cx.theme().success, "connected".to_string())
+            } else {
+                (cx.theme().muted_foreground, "offline".to_string())
+            };
+            let label = columns
+                .source
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("Service")
+                .to_string();
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(Icon::default().data(PLUG_SVG).text_color(color))
+                .child(div().font_medium().child(label))
+                .child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(status_text),
+                )
+        });
+
         StatusBar::new()
             // ↓ Download speed (and total fetched)
             .left(
@@ -1118,6 +1192,9 @@ impl MainPanel {
                             .child(dht_text),
                     ),
             )
+            .left(Separator::vertical())
+            // Hook service plug (hidden when no column hook is configured).
+            .when_some(plug_group, |this, group| this.left(group))
             // Uptime
             .right(
                 h_flex()

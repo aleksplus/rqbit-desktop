@@ -3,12 +3,14 @@
 //! the `librqbit::Api` Rust layer. UI clients (the browser wasm build of
 //! rqbit-ui) connect to this process.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
 
+use app_daemon::columns::{ColumnsHook, ColumnsMethod, ColumnsProvider};
 use app_daemon::server;
 use app_daemon::start_session;
 
@@ -35,6 +37,17 @@ struct Args {
     /// Disable the DHT (mostly for tests and offline use).
     #[arg(long)]
     disable_dht: bool,
+
+    /// URL of a hook service that provides custom columns (the
+    /// `torrent_columns` event). Repeatable; the first service that
+    /// responds owns the columns shown in the UIs. POSTed the torrent
+    /// list every --column-hook-poll-secs.
+    #[arg(long)]
+    column_hook: Vec<String>,
+
+    /// Seconds between polls of each --column-hook service.
+    #[arg(long, default_value_t = 10)]
+    column_hook_poll_secs: u64,
 }
 
 #[tokio::main]
@@ -60,7 +73,28 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let app = server::router(daemon.api.clone(), daemon.line_broadcast.clone());
+    let columns = if args.column_hook.is_empty() {
+        None
+    } else {
+        let hooks = args
+            .column_hook
+            .iter()
+            .enumerate()
+            .map(|(ix, url)| ColumnsHook {
+                name: format!("hook {}", ix + 1),
+                url: url.clone(),
+                method: ColumnsMethod::Post,
+                timeout_secs: 10,
+                headers: BTreeMap::new(),
+                poll_secs: args.column_hook_poll_secs,
+            })
+            .collect();
+        let provider = ColumnsProvider::new(daemon.api.clone(), hooks);
+        provider.start();
+        Some(provider)
+    };
+
+    let app = server::router(daemon.api.clone(), daemon.line_broadcast.clone(), columns);
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

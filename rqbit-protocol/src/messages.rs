@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::ProtoError;
 pub use crate::types::TorrentId;
 use crate::types::{
-    ApiAddTorrent, DhtStats, PeerStatsSnapshot, SessionInfo, SessionStats, TorrentDetails,
-    TorrentList, TorrentStats,
+    ApiAddTorrent, CustomColumnsState, DhtStats, PeerStatsSnapshot, SessionInfo, SessionStats,
+    TorrentDetails, TorrentList, TorrentStats,
 };
 
 pub type RequestId = u64;
@@ -156,4 +156,8 @@ pub enum PushUpdate {
     /// Log lines from `Api::api_log_lines_stream` (the log page's stream,
     /// pushed as raw tracing line bytes).
     LogLines(Vec<u8>),
+    /// Hook-provided custom column definitions + connectivity. Sent when the
+    /// encoded state changes; the rows of `TorrentList`/details responses
+    /// carry the matching per-row values in their `custom` maps.
+    CustomColumns(Box<CustomColumnsState>),
 }

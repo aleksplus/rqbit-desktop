@@ -143,6 +143,7 @@ impl TorrentDetailPanel {
             let details = client.details(&torrent).await;
             let stats = client.stats(&torrent).await;
             let peer_stats = client.peer_stats(&torrent).await;
+            let custom_columns = client.custom_columns().await;
 
             let _ = this.update(cx, |this, cx| {
                 if let Ok(d) = &details {
@@ -164,6 +165,7 @@ impl TorrentDetailPanel {
                                     included: file.included,
                                     exists: false,
                                     progress: file_progress.get(idx).copied().unwrap_or(0),
+                                    custom: file.custom.clone().unwrap_or_default(),
                                 })
                                 .collect()
                         })
@@ -172,6 +174,12 @@ impl TorrentDetailPanel {
                         let delegate = state.delegate_mut();
                         delegate.rows = files;
                         delegate.apply_sort();
+                        // Hook-provided file columns: swap the set when it
+                        // changed (dropped while disconnected), then refresh
+                        // so the framework re-reads the columns.
+                        if delegate.set_custom_columns(custom_columns.as_ref()) {
+                            state.refresh(cx);
+                        }
                         cx.notify();
                     });
                 }
@@ -212,6 +220,8 @@ impl TorrentDetailPanel {
 
                 let peer_stats = client.peer_stats(&torrent).await;
                 let stats = client.stats(&torrent).await;
+                // Hook-provided custom values ride on the details payload.
+                let details = client.details(&torrent).await;
 
                 let _ = this.update(cx, |this, cx| {
                     if let Ok(ref ps) = peer_stats {
@@ -237,6 +247,20 @@ impl TorrentDetailPanel {
                             cx.notify();
                         });
                         this.stats = Some(s);
+                    }
+                    if let Ok(d) = details
+                        && let Some(files) = &d.files
+                    {
+                        this.file_table_state.update(cx, |state, cx| {
+                            let delegate = state.delegate_mut();
+                            for row in delegate.rows.iter_mut() {
+                                if let Some(file) = files.get(row.file_index) {
+                                    row.custom = file.custom.clone().unwrap_or_default();
+                                }
+                            }
+                            delegate.apply_sort();
+                            cx.notify();
+                        });
                     }
                     this.peer_stats = peer_stats.ok();
                     cx.notify();
