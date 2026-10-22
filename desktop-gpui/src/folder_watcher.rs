@@ -69,7 +69,7 @@ fn path_is_in(path: &Path, folder: &Path) -> bool {
 
 /// `folder` as an excluded subtree when it is a strict subfolder of `parent`
 /// (and not `parent` itself — that config keeps working, the move just
-/// becomes a no-op "destination exists" skip).
+/// becomes a no-op: the source is already in the destination folder).
 fn strict_subfolder(folder: &Path, parent: &Path) -> Option<PathBuf> {
     if folder.as_os_str().is_empty() {
         return None;
@@ -124,8 +124,8 @@ pub fn start_folder_watcher(shared: Arc<RwLock<SharedState>>, hooks: Arc<HookDis
 
         // Files already in the folder are added first; live events cover the
         // rest (a duplicate add of the same file is harmless — the session
-        // reports it as already managed, and the source is gone or the
-        // destination already exists).
+        // reports it as already managed, and the source is moved out of the
+        // watch folder all the same, renamed when its name is taken there).
         for entry in WalkDir::new(&watch_folder)
             .into_iter()
             .filter_map(Result::ok)
@@ -231,9 +231,11 @@ fn read_and_validate(path: &Path) -> anyhow::Result<AddTorrent<'static>> {
     }
 }
 
-/// Move `src` into `dest_folder`, keeping its file name. The folder is
-/// created if needed, an existing file is never overwritten, and a rename
-/// across filesystems falls back to copy + remove. Used by
+/// Move `src` into `dest_folder`, keeping its file name — or, when that name
+/// is already taken there, the first free `name (1).ext`, `name (2).ext`, …
+/// ([`first_free_sibling`]). An existing file is never overwritten, the
+/// folder is created if needed, and a rename across filesystems falls back to
+/// copy + remove. Used by
 /// [`crate::hooks::HookDispatcher::add_and_dispatch_added`] for
 /// move-after-add on both watcher- and dialog-originated files.
 pub(crate) fn move_file(src: &Path, dest_folder: &Path) -> anyhow::Result<()> {
@@ -241,11 +243,21 @@ pub(crate) fn move_file(src: &Path, dest_folder: &Path) -> anyhow::Result<()> {
         .file_name()
         .with_context(|| format!("{} has no file name", src.display()))?;
     let dest = dest_folder.join(file_name);
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if canon(src) == canon(&dest) {
+        // The source already lives in the destination folder under its own
+        // name (e.g. the move folder is the watch folder). Renaming would
+        // produce a new watched file and an endless rename chain.
+        debug!(path = %src.display(), "source already in move folder, keeping it");
+        return Ok(());
+    }
     std::fs::create_dir_all(dest_folder)
         .with_context(|| format!("error creating {}", dest_folder.display()))?;
-    if dest.exists() {
-        anyhow::bail!("not moving, destination exists: {}", dest.display());
-    }
+    let dest = if dest.exists() {
+        first_free_sibling(&dest)
+    } else {
+        dest
+    };
     if let Err(e) = std::fs::rename(src, &dest) {
         if e.kind() != std::io::ErrorKind::CrossesDevices {
             return Err(e).with_context(|| format!("error moving to {}", dest.display()));
@@ -255,6 +267,29 @@ pub(crate) fn move_file(src: &Path, dest_folder: &Path) -> anyhow::Result<()> {
         std::fs::remove_file(src).with_context(|| format!("error removing {}", src.display()))?;
     }
     Ok(())
+}
+
+/// `base.torrent` exists -> the first free `base (1).torrent`,
+/// `base (2).torrent`, … next to it. The extension is kept in place so moved
+/// files stay recognizable as `.torrent` / `.magnet` (and re-watchable).
+fn first_free_sibling(base: &Path) -> PathBuf {
+    let name = base.file_name().unwrap_or_default();
+    let stem = Path::new(name)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let ext = Path::new(name).extension().map(|e| e.to_string_lossy());
+    for n in 1u64.. {
+        let candidate = match &ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = base.with_file_name(candidate);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("an unused name is eventually found")
 }
 
 #[cfg(test)]
@@ -323,20 +358,46 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn move_file_refuses_to_overwrite() {
+    fn move_file_renames_to_free_name_on_collision() {
         let src_dir = TempDir::new("src");
         let dest_dir = TempDir::new("dest");
         let src = src_dir.path().join("t.torrent");
         std::fs::write(&src, b"new").unwrap();
-        std::fs::write(dest_dir.path().join("t.torrent"), b"old").unwrap();
+        std::fs::write(dest_dir.path().join("t.torrent"), b"old1").unwrap();
+        std::fs::write(dest_dir.path().join("t (1).torrent"), b"old2").unwrap();
+        // An unrelated name with the same number must not confuse the search.
+        std::fs::write(dest_dir.path().join("other (1).torrent"), b"x").unwrap();
 
-        let err = move_file(&src, dest_dir.path()).unwrap_err();
+        move_file(&src, dest_dir.path()).unwrap();
 
-        assert!(err.to_string().contains("destination exists"));
-        assert_eq!(std::fs::read(&src).unwrap(), b"new");
+        assert!(!src.exists());
         assert_eq!(
             std::fs::read(dest_dir.path().join("t.torrent")).unwrap(),
-            b"old"
+            b"old1"
+        );
+        assert_eq!(
+            std::fs::read(dest_dir.path().join("t (1).torrent")).unwrap(),
+            b"old2"
+        );
+        assert_eq!(
+            std::fs::read(dest_dir.path().join("t (2).torrent")).unwrap(),
+            b"new",
+            "moved file gets the first free numbered name, extension intact"
+        );
+    }
+
+    #[test]
+    fn move_file_into_its_own_folder_is_a_no_op() {
+        let dir = TempDir::new("same");
+        let src = dir.path().join("t.torrent");
+        std::fs::write(&src, b"data").unwrap();
+
+        move_file(&src, dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(&src).unwrap(), b"data");
+        assert!(
+            !dir.path().join("t (1).torrent").exists(),
+            "no rename may happen, or the watcher would rename forever"
         );
     }
 
