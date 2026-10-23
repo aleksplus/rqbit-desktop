@@ -1,6 +1,9 @@
 //! Watches the configured "autoload torrents" folder and feeds new
 //! `.torrent` / `.magnet` files through the same add path as the add-torrent
-//! dialog ([`HookDispatcher::add_and_dispatch_added`]). The shared callback
+//! dialog ([`HookDispatcher::add_and_dispatch_added`]). Like the dialog, the
+//! file list of `.torrent` files is resolved first and the `file_selection`
+//! hooks run over it, so a hook's pre-selection (e.g. watched files
+//! unchecked) applies to autoloaded torrents too. The shared callback
 //! also moves the source file to the configured "move added torrents to"
 //! folder after the add, for both watcher- and dialog-originated files.
 //! Watched torrents are added paused when `auto_add_paused` is set in the
@@ -197,10 +200,16 @@ async fn process_file(
             return;
         }
     };
+    // Run the `file_selection` hooks against the resolved file list, so
+    // autoloaded torrents get the same pre-selection as ones added through
+    // the dialog (e.g. watched files unchecked). Magnets have no local file
+    // list and are added unrestricted (see
+    // [`HookDispatcher::file_selection_only_files`]).
+    let only_files = hooks.file_selection_only_files(api, &add).await;
     // overwrite: true, matching librqbit's own folder watcher.
     let from = path.display().to_string();
     if let Err(e) = hooks
-        .add_and_dispatch_added(api, add, None, true, auto_add_paused, Some(path))
+        .add_and_dispatch_added(api, add, only_files, true, auto_add_paused, Some(path))
         .await
     {
         warn!(path = %from, error = %e, "error adding torrent from watch folder");
@@ -311,6 +320,14 @@ pub(crate) mod tests {
             name
         )
         .into_bytes()
+    }
+
+    /// A minimal two-file torrent (`test/aaa.mkv` = 5 bytes,
+    /// `test/bbb.nfo` = 1 byte), for exercising file selection.
+    pub(crate) fn multi_file_torrent_bytes() -> Vec<u8> {
+        "d4:infod5:filesld6:lengthi5e4:pathl7:aaa.mkveed6:lengthi1e4:pathl7:bbb.nfoeee4:name4:test12:piece lengthi16384e6:pieces20:####################ee"
+            .as_bytes()
+            .to_vec()
     }
 
     pub(crate) struct TempDir(std::path::PathBuf);
@@ -611,5 +628,97 @@ pub(crate) mod tests {
             "only the watch-root torrent should have been added"
         );
         assert_eq!(torrents[0].name.as_deref(), Some("hello"));
+    }
+
+    /// A watched `.torrent` has its file selection adjusted by the
+    /// `file_selection` hooks before the add — here the hook excludes the
+    /// second file, and the session ends up with only the first file
+    /// included (the same pre-selection the add dialog applies).
+    #[tokio::test]
+    async fn watched_folder_applies_file_selection_hooks() {
+        use crate::config::{HookConfig, HttpMethod, RqbitDesktopConfigHooks};
+        use crate::hooks::HookEvent;
+        use crate::hooks::testutil::serve_once;
+
+        let watch_dir = TempDir::new("watch-sel");
+        let move_dir = TempDir::new("move-sel");
+        let src = watch_dir.path().join("multi.torrent");
+        std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let session = librqbit::Session::new_with_opts(
+            std::env::temp_dir(),
+            librqbit::SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let api = Arc::new(Api::new(session, None, None));
+        let config = crate::config::RqbitDesktopConfig {
+            load_torrents_folder: watch_dir.path().to_path_buf(),
+            move_torrents_folder: move_dir.path().to_path_buf(),
+            hooks: RqbitDesktopConfigHooks {
+                hooks: vec![HookConfig {
+                    name: "selector".into(),
+                    enabled: true,
+                    events: vec![HookEvent::FileSelection],
+                    method: HttpMethod::Post,
+                    url: format!("http://{addr}/select"),
+                    timeout_secs: 10,
+                    headers: Default::default(),
+                    poll_secs: 10,
+                }],
+            },
+            ..Default::default()
+        };
+        let shared = Arc::new(RwLock::new(SharedState::for_test(config, api.clone())));
+        let hooks = Arc::new(HookDispatcher::new(
+            shared.clone(),
+            tokio::runtime::Handle::current(),
+        ));
+
+        // The hook runs inside the watcher task; serve the one-shot response
+        // concurrently.
+        tokio::spawn(serve_once(listener, r#"{"exclude": [1]}"#));
+
+        start_folder_watcher(shared, hooks);
+
+        for _ in 0..100 {
+            if api
+                .api_torrent_list_ext(ApiTorrentListOpts { with_stats: false })
+                .torrents
+                .len()
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let torrents = api
+            .api_torrent_list_ext(ApiTorrentListOpts { with_stats: false })
+            .torrents;
+        assert_eq!(torrents.len(), 1, "the torrent should have been added");
+        let files = api
+            .api_torrent_details(librqbit::api::TorrentIdOrHash::Id(torrents[0].id.unwrap()))
+            .unwrap()
+            .files
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].included, "aaa.mkv should stay selected");
+        assert!(
+            !files[1].included,
+            "bbb.nfo should have been deselected by the hook"
+        );
+        assert!(
+            move_dir.path().join("multi.torrent").exists(),
+            "source file should have been moved after the add"
+        );
     }
 }

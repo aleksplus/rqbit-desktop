@@ -79,6 +79,9 @@ pub use dispatcher::HookDispatcher;
 pub(crate) use payload::envelope;
 pub use payload::{TorrentDeletedPayload, TorrentInfo};
 
+#[cfg(test)]
+pub(crate) use http::testutil;
+
 use serde::{Deserialize, Serialize};
 
 /// A torrent lifecycle event a hook can subscribe to.

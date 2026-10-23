@@ -8,7 +8,7 @@ use gpui::{
 };
 use gpui_kit::component::{ActiveTheme, Theme, menu::PopupMenuItem, v_flex};
 
-use rqbit_protocol::{CustomColumnKind, TorrentAction, TorrentId};
+use rqbit_protocol::{ApiAddTorrent, CustomColumnKind, TorrentAction, TorrentId};
 
 use crate::client::{AddTorrentRequest, TorrentClient, UiAddSource};
 use crate::ui::{add_torrent_dialog::AddTorrentEntry, file_table::FileRow, main_panel::MainPanel};
@@ -224,6 +224,14 @@ pub async fn build_entry(
             source_hint: None,
         })
         .await?;
+    Ok(entry_from_list_only(&response, source))
+}
+
+/// Build an [`AddTorrentEntry`] from a list-only add response (`id: None`).
+/// Shared by the dialog path ([`build_entry`]) and the desktop's autoload
+/// path, which runs `file_selection` hooks over the resolved files before
+/// actually adding the torrent.
+pub fn entry_from_list_only(response: &ApiAddTorrent, source: UiAddSource) -> AddTorrentEntry {
     let name = response
         .details
         .name
@@ -257,7 +265,7 @@ pub async fn build_entry(
             }
         })
         .collect();
-    Ok(AddTorrentEntry {
+    AddTorrentEntry {
         source,
         name,
         info_hash: response.details.info_hash.clone(),
@@ -265,7 +273,7 @@ pub async fn build_entry(
         source_path: None,
         files,
         hook_note: None,
-    })
+    }
 }
 
 #[cfg(test)]

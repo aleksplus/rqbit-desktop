@@ -229,6 +229,22 @@ impl TorrentClient for LocalClient {
             rqbit_ui::UiAddSource::Url(s) => librqbit::AddTorrent::from_url(s.clone()),
             rqbit_ui::UiAddSource::Bytes(bytes) => librqbit::AddTorrent::from_bytes(bytes.clone()),
         };
+        // List-only: resolve the metadata/file list without adding (the add
+        // dialog's preview); the response carries `id: None`. Going through
+        // the API directly, as `add_and_dispatch_added` is for real adds.
+        if req.list_only {
+            let response = api
+                .api_add_torrent(
+                    add,
+                    Some(librqbit::AddTorrentOptions {
+                        list_only: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|e| conv::proto_error_from_api_error(&e, ProtoErrorKind::BadRequest))?;
+            return Ok(ApiAddTorrent::from(&response));
+        }
         let only_files = req
             .only_files
             .as_ref()
@@ -264,5 +280,69 @@ impl TorrentClient for LocalClient {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => format!("--- log stream lagged: {e} ---").into_bytes(),
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::folder_watcher::tests::torrent_bytes;
+
+    /// `list_only` resolves the file list without adding the torrent to the
+    /// session — the add dialog's preview contract (the response carries
+    /// `id: None`).
+    #[tokio::test]
+    async fn list_only_resolves_without_adding() {
+        let session = librqbit::Session::new_with_opts(
+            std::env::temp_dir(),
+            librqbit::SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let api = Arc::new(librqbit::Api::new(session, None, None));
+        let shared = Arc::new(RwLock::new(SharedState::for_test(
+            crate::config::RqbitDesktopConfig::default(),
+            api.clone(),
+        )));
+        let hooks = Arc::new(HookDispatcher::new(
+            shared.clone(),
+            tokio::runtime::Handle::current(),
+        ));
+        let client = LocalClient::new(shared, hooks);
+
+        let response = client
+            .add_torrent(&AddTorrentRequest {
+                source: rqbit_ui::UiAddSource::Bytes(torrent_bytes()),
+                only_files: None,
+                overwrite: false,
+                paused: false,
+                list_only: true,
+                source_hint: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(response.id.is_none(), "list-only response carries no id");
+        assert!(
+            response
+                .details
+                .files
+                .as_ref()
+                .is_some_and(|files| !files.is_empty()),
+            "list-only response resolves the file list"
+        );
+        assert_eq!(
+            api.api_torrent_list_ext(librqbit::api::ApiTorrentListOpts { with_stats: false })
+                .torrents
+                .len(),
+            0,
+            "list-only must not add the torrent to the session"
+        );
     }
 }

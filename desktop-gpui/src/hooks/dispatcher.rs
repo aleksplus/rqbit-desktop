@@ -10,7 +10,10 @@ use tracing::{debug, warn};
 
 use crate::config::HookConfig;
 use crate::state::SharedState;
+use rqbit_protocol::ApiAddTorrent;
+use rqbit_ui::client::UiAddSource;
 use rqbit_ui::ui::add_torrent_dialog::AddTorrentEntry;
+use rqbit_ui::ui::utils::entry_from_list_only;
 
 use super::HookEvent;
 use super::payload::{
@@ -282,6 +285,68 @@ impl HookDispatcher {
         applied
     }
 
+    /// Resolve a torrent's file list (via a list-only add, nothing is added
+    /// to the session) and run the `file_selection` hooks over it, returning
+    /// the `only_files` restriction the torrent should be added with (`None`
+    /// = all files / no restriction). This is the autoload counterpart of the
+    /// add-dialog flow, which runs the same hooks while preparing the dialog.
+    /// Only torrent *bytes* can be listed without adding; magnets would need
+    /// network metadata resolution, so they are added unrestricted — their
+    /// file list is not known before the add. Any failure (list-only add,
+    /// hook delivery) degrades to "no restriction": the torrent is still
+    /// added.
+    pub async fn file_selection_only_files(
+        &self,
+        api: &Api,
+        add: &AddTorrent<'_>,
+    ) -> Option<Vec<usize>> {
+        // Skip the list-only add entirely when nothing listens.
+        if matching_hooks(&self.shared, HookEvent::FileSelection).is_empty() {
+            return None;
+        }
+        let bytes = match add {
+            AddTorrent::TorrentFileBytes(bytes) => bytes.clone(),
+            AddTorrent::Url(_) => return None,
+        };
+        let response = match api
+            .api_add_torrent(
+                AddTorrent::from_bytes(bytes),
+                Some(AddTorrentOptions {
+                    list_only: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                warn!(error = %e, "could not resolve file list for file selection hooks");
+                return None;
+            }
+        };
+        // The entry only carries the file list through
+        // `apply_file_selection`, which never reads its `source`.
+        let mut entry = entry_from_list_only(
+            &ApiAddTorrent::from(&response),
+            UiAddSource::Bytes(Vec::new()),
+        );
+        if self.apply_file_selection(&mut entry).await.is_empty() {
+            return None;
+        }
+        let selected: Vec<usize> = entry
+            .files
+            .iter()
+            .filter(|f| f.included)
+            .map(|f| f.file_index)
+            .collect();
+        // Never add with nothing selected: despite the per-response guard in
+        // `apply_file_selection`, fall back to "all files" if it happens.
+        if selected.is_empty() || selected.len() == entry.files.len() {
+            return None;
+        }
+        Some(selected)
+    }
+
     /// Spawn the background completion watcher on the tokio runtime. It polls
     /// the session every [`WATCH_INTERVAL`] and diffs the per-torrent
     /// `finished` flag; not-finished → finished transitions fire
@@ -453,8 +518,11 @@ mod tests {
     use rqbit_ui::ui::file_table::FileRow;
 
     /// A minimal real session (no DHT, no listener, no persistence) wrapped
-    /// in a SharedState with the given hooks config.
-    async fn test_dispatcher(hooks: Vec<HookConfig>) -> HookDispatcher {
+    /// in a SharedState with the given hooks config. Also returns the session
+    /// API, for dispatchers that need it (e.g. `file_selection_only_files`).
+    async fn test_dispatcher_with_api(
+        hooks: Vec<HookConfig>,
+    ) -> (HookDispatcher, Arc<librqbit::Api>) {
         let session = librqbit::Session::new_with_opts(
             std::env::temp_dir(),
             librqbit::SessionOptions {
@@ -472,8 +540,15 @@ mod tests {
             hooks: RqbitDesktopConfigHooks { hooks },
             ..Default::default()
         };
-        let shared = Arc::new(RwLock::new(SharedState::for_test(config, api)));
-        HookDispatcher::new(shared, tokio::runtime::Handle::current())
+        let shared = Arc::new(RwLock::new(SharedState::for_test(config, api.clone())));
+        (
+            HookDispatcher::new(shared, tokio::runtime::Handle::current()),
+            api,
+        )
+    }
+
+    async fn test_dispatcher(hooks: Vec<HookConfig>) -> HookDispatcher {
+        test_dispatcher_with_api(hooks).await.0
     }
 
     fn test_entry() -> AddTorrentEntry {
@@ -553,6 +628,69 @@ mod tests {
         let applied = dispatcher.apply_file_selection(&mut entry).await;
         assert!(applied.is_empty());
         assert!(entry.files.iter().all(|f| f.included));
+    }
+
+    // ── Autoload file selection (`file_selection_only_files`) ─────────────
+
+    use crate::folder_watcher::tests::multi_file_torrent_bytes;
+
+    fn selection_hook(addr: std::net::SocketAddr) -> HookConfig {
+        HookConfig {
+            name: "selector".into(),
+            enabled: true,
+            events: vec![HookEvent::FileSelection],
+            method: HttpMethod::Post,
+            url: format!("http://{addr}/select"),
+            timeout_secs: 5,
+            headers: Default::default(),
+            poll_secs: 10,
+        }
+    }
+
+    /// The autoload path: the file list is resolved via a list-only add (the
+    /// session stays empty) and the hook's response becomes the
+    /// `only_files` restriction.
+    #[tokio::test]
+    async fn file_selection_only_files_applies_hook_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_once(listener, r#"{"exclude": [1]}"#);
+
+        let (dispatcher, api) = test_dispatcher_with_api(vec![selection_hook(addr)]).await;
+        let add = AddTorrent::from_bytes(multi_file_torrent_bytes());
+        let (only_files, raw_request) =
+            tokio::join!(dispatcher.file_selection_only_files(&api, &add), server);
+
+        assert_eq!(only_files, Some(vec![0]), "bbb.nfo should be excluded");
+        assert!(raw_request.contains("aaa.mkv"), "hook got the file list");
+        assert_eq!(
+            api.api_torrent_list_ext(librqbit::api::ApiTorrentListOpts { with_stats: false })
+                .torrents
+                .len(),
+            0,
+            "the list-only add must not add the torrent"
+        );
+    }
+
+    /// Without any `file_selection` hook there is no restriction — and no
+    /// list-only add at all.
+    #[tokio::test]
+    async fn file_selection_only_files_without_hooks_is_none() {
+        let (dispatcher, api) = test_dispatcher_with_api(vec![]).await;
+        let add = AddTorrent::from_bytes(multi_file_torrent_bytes());
+        assert_eq!(dispatcher.file_selection_only_files(&api, &add).await, None);
+    }
+
+    /// Magnets have no locally known file list, so they are added
+    /// unrestricted even when a `file_selection` hook is configured.
+    #[tokio::test]
+    async fn file_selection_only_files_skips_magnets() {
+        let (dispatcher, api) =
+            test_dispatcher_with_api(vec![selection_hook("127.0.0.1:1".parse().unwrap())]).await;
+        let add = AddTorrent::from_url(
+            "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&dn=x",
+        );
+        assert_eq!(dispatcher.file_selection_only_files(&api, &add).await, None);
     }
 
     #[tokio::test]
