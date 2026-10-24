@@ -1,4 +1,5 @@
 use gpui::*;
+use gpui_kit::base::SelectableText;
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable, WindowExt as _,
     button::{Button, ButtonVariants},
@@ -503,7 +504,7 @@ impl TorrentDetailPanel {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("General"),
                     )
-                    .child(info_row("Info Hash", info_hash))
+                    .child(selectable_info_row("Info Hash", info_hash))
                     .child(info_row("Output Folder", output_folder))
                     .child(self.render_playlist_row(cx))
                     .child(info_row("Total Pieces", total_pieces.to_string()))
@@ -838,4 +839,25 @@ fn info_row(label: impl Into<String>, value: impl Into<String>) -> Div {
                 .child(label),
         )
         .child(div().flex_1().child(value))
+}
+
+/// Like [`info_row`], but the value is selectable text: drag or double-click
+/// to select, ⌘C / Ctrl-C copies via the window's `TextSelectionLayer`
+/// (mounted by the gpui-base `Root` that `gpui_kit::open_window` installs).
+fn selectable_info_row(label: impl Into<String>, value: impl Into<String>) -> Div {
+    let label = label.into();
+    let value = value.into();
+    h_flex()
+        .gap_2()
+        .child(
+            div()
+                .w(px(140.))
+                .text_color(gpui::rgb(0x888888))
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .child(SelectableText::new("selectable-info-value", value)),
+        )
 }
