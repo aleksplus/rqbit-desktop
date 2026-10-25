@@ -3,8 +3,9 @@
 //!
 //! This crate maps **the Rust API layer only** — the `librqbit::Api` methods
 //! the desktop UI actually calls (see [`messages::Request`]) — not the REST
-//! bindings. Upstream `crates/librqbit` is third-party-maintained and left
-//! untouched, so the payloads here are *wire DTOs*: self-contained serde
+//! bindings. `librqbit` is third-party-maintained (used from crates.io plus a
+//! small local patch — see the root `Cargo.toml`), so the payloads here are
+//! *wire DTOs*: self-contained serde
 //! types carrying exactly the fields the shared UI renders, shaped for a
 //! binary non-self-describing codec (postcard) rather than librqbit's
 //! JSON representation. Types that only native code needs (settings, hooks,

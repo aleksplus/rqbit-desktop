@@ -21,6 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # librqbit is used from crates.io with local patches (cargo-patch-crate):
+      # materialize patched sources into target/patch/ before any build.
+      - name: Apply librqbit patch
+        run: |
+          cargo install patch-crate --locked
+          cargo patch-crate
+
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin
 

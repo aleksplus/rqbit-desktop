@@ -25,9 +25,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # desktop-gpui is not in the workspace default-members, so unlike
-      # test.yml this needs the GPUI Linux stack: fontconfig/xkbcommon/wayland
-      # (linked or dlopen'd by gpui-pre-platform) and openssl (librqbit
+      # librqbit is used from crates.io with local patches (cargo-patch-crate):
+      # materialize patched sources into target/patch/ before any build.
+      - name: Apply librqbit patch
+        run: |
+          cargo install patch-crate --locked
+          cargo patch-crate
+
+      # The GPUI Linux stack is needed by desktop-gpui: fontconfig/xkbcommon/
+      # wayland (linked or dlopen'd by gpui-pre-platform) and openssl (librqbit
       # default-tls on Linux).
       - name: Install GPUI build dependencies
         run: |

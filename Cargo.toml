@@ -1,44 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rqbit",
-    "crates/librqbit",
-    "crates/buffers",
-    "crates/clone_to_owned",
-    "crates/bencode",
-    "crates/sha1w",
-    "crates/librqbit_core",
-    "crates/librqbit_lsd",
-    "crates/peer_binary_protocol",
-    "crates/dht",
-    "crates/upnp",
-    "crates/tracker_comms",
-    "crates/upnp-serve",
     "desktop-gpui",
     "app-daemon",
     "rqbit-protocol",
     "rqbit-ui",
     "web-gpui",
-]
-
-# The default build (plain `cargo build` / `cargo test`) skips the `rqbit`
-# CLI: its default features enable the React `webui`, which requires
-# `crates/librqbit/webui/dist` to exist. Build it explicitly with
-# `-p rqbit` (e.g. `make devserver`) when needed.
-default-members = [
-    "crates/librqbit",
-    "crates/buffers",
-    "crates/clone_to_owned",
-    "crates/bencode",
-    "crates/sha1w",
-    "crates/librqbit_core",
-    "crates/peer_binary_protocol",
-    "crates/dht",
-    "crates/upnp",
-    "crates/tracker_comms",
-    "crates/upnp-serve",
-    "app-daemon",
-    "rqbit-protocol",
 ]
 
 [workspace.package]
@@ -62,104 +29,46 @@ debug = true
 
 [workspace.dependencies]
 # Internal crates - keys are import names used in source code, package is the actual crate name
-librqbit = { path = "crates/librqbit", version = "9.0.1", default-features = false }
-bencode = { path = "crates/bencode", package = "librqbit-bencode", version = "9.0.1", default-features = false }
-buffers = { path = "crates/buffers", package = "librqbit-buffers", version = "9.0.1" }
-clone_to_owned = { path = "crates/clone_to_owned", package = "librqbit-clone-to-owned", version = "9.0.1" }
-librqbit-core = { path = "crates/librqbit_core", version = "9.0.1", default-features = false }
-dht = { path = "crates/dht", package = "librqbit-dht", version = "9.0.1", default-features = false }
-librqbit-lsd = { path = "crates/librqbit_lsd", version = "9.0.1", default-features = false }
-peer_binary_protocol = { path = "crates/peer_binary_protocol", package = "librqbit-peer-protocol", version = "9.0.1", default-features = false }
-sha1w = { path = "crates/sha1w", package = "librqbit-sha1-wrapper", version = "9.0.1", default-features = false }
-tracker_comms = { path = "crates/tracker_comms", package = "librqbit-tracker-comms", version = "9.0.1", default-features = false }
-librqbit-upnp = { path = "crates/upnp", version = "9.0.1" }
-upnp-serve = { path = "crates/upnp-serve", package = "librqbit-upnp-serve", version = "9.0.1", default-features = false }
 rqbit-protocol = { path = "rqbit-protocol", version = "9.0.1" }
 rqbit-ui = { path = "rqbit-ui", version = "9.0.1" }
 
+# rqbit (librqbit) comes from crates.io. Local modifications are kept as a
+# cargo-patch-crate patch in patches/ - run `cargo patch-crate` before the
+# first build (see AGENTS.md).
+librqbit = { version = "=9.0.1", default-features = false }
+librqbit-core = { version = "9.0.1", default-features = false }
+
 # External crates
 anyhow = "1"
-arc-swap = "1.7"
-arrayvec = "0.7"
-assert_cfg = "0.1"
-async-backtrace = "0.2"
-async-compression = "0.4"
-async-stream = "0.3"
 async-trait = "0.1"
-atoi = "3"
-aws-lc-rs = "1.12"
 axum = "0.8"
-axum-extra = "0.12"
-backon = "1.5"
 base64 = "0.23"
-bitvec = "1"
-bstr = "1"
-byteorder = "1"
 bytes = "1"
-chardetng = "1"
-chrono = "0.4"
 clap = "4"
-clap_complete = "4"
-console-subscriber = "0.5"
-criterion = "0.8"
-crypto-hash = "0.3"
-dashmap = "6"
-data-encoding = "2"
 directories = "6"
-encoding_rs = "0.8"
 futures = "0.3"
 gethostname = "1"
-governor = "0.10"
-hex = "0.4"
-home = "0.5"
 http = "1"
-httparse = "1"
-indexmap = "2"
-intervaltree = "0.2"
-itertools = "0.15"
-leaky-bucket = "1.1"
-libc = "0.2"
 librqbit-dualstack-sockets = "0.7"
-librqbit-utp = "0.7"
-lru = "0.18"
-mdns-sd = "0.21"
-memchr = "2"
-memmap2 = "0.9"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
-mime_guess = { version = "2", default-features = false }
-network-interface = "2"
-nix = "0.30"
 notify = "8"
-openssl = "0.10"
 parking_lot = "0.12"
-parse_duration = "2"
-pollster = "1"
-quick-xml = "0.41"
-rand = "0.10"
-regex = "1"
 reqwest = { version = "0.13", default-features = false }
-rlimit = "0.11"
 serde = "1"
 serde_derive = "1"
 serde_json = "1"
-serde_urlencoded = "0.7"
 serde_with = "3"
-signal-hook = "0.3"
-size_format = "1"
-socket2 = "0.6"
-sqlx = { version = "0.9", default-features = false }
-tempfile = "3"
-thiserror = "2"
 tokio = "1"
-tokio-socks = "0.5"
-tokio-stream = "0.1"
-tokio-test = "0.4"
-tokio-util = "0.7"
-tower-http = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false }
 url = { version = "2", default-features = false }
-urlencoding = "2"
-uuid = "1"
 walkdir = "2"
-windows = "0.62"
+
+# Crates patched locally via cargo-patch-crate (see patches/). After cloning,
+# run `cargo patch-crate` once to materialize them into target/patch/ before
+# building.
+[workspace.metadata.patch]
+crates = ["librqbit"]
+
+[patch.crates-io]
+librqbit = { path = "./target/patch/librqbit-9.0.1" }

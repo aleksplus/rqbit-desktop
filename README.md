@@ -8,6 +8,10 @@
 
 Also has a native desktop app built with [GPUI](https://github.com/zed-industries/zed) (the UI framework behind Zed), and the same client compiled to WebAssembly running in the browser.
 
+> **About this repository:** this is the rqbit **desktop client** repo (native GPUI app, browser build, headless daemon). The rqbit engine itself (`librqbit`) lives [upstream](https://github.com/ikatson/rqbit) and on [crates.io](https://crates.io/crates/librqbit); this repo uses it as a Cargo dependency and applies its local API additions as a [cargo-patch-crate](https://github.com/mokeyish/cargo-patch-crate) patch (`patches/`).
+>
+> **After cloning, run `cargo install patch-crate && cargo patch-crate` once before building** — it materializes the patched librqbit source into `target/patch/`.
+
 ## Usage quick start
 
 ### Optional - start the server
@@ -262,20 +266,12 @@ Supported query parameters, all optional:
 
 ## Code organization
 
-- crates/rqbit - main binary
-- crates/librqbit - main library
-- crates/librqbit-core - torrent utils
-- crates/bencode - bencode serializing/deserializing
-- crates/buffers - wrappers around binary buffers
-- crates/clone_to_owned - a trait to make something owned
-- crates/sha1w - wrappers around sha1 libraries
-- crates/peer_binary_protocol - the protocol to talk to peers
-- crates/dht - Distributed Hash Table implementation
-- crates/upnp - upnp port forwarding
-- crates/upnp_serve - upnp MediaServer
 - desktop-gpui - native desktop app built with GPUI
-- app-daemon - headless daemon exposing the rqbit session to UI clients over WebSocket
+- app-daemon - headless daemon exposing the rqbit session to UI clients over WebSocket; also serves the embedded web client
+- rqbit-ui - shared UI components (librqbit-free, tokio-free)
+- rqbit-protocol - wire protocol DTOs between the UI clients and the daemon
 - web-gpui - browser (WebAssembly) build of the GPUI client
+- the rqbit engine (`librqbit`: session, DHT, peer protocol, storage) is used from crates.io, with local API additions applied as a cargo-patch-crate patch in `patches/`
 - [librqbit-utp](https://github.com/ikatson/librqbit-utp/) - uTP protocol
 - [librqbit-dualstack-sockets](https://github.com/ikatson/librqbit-dualstack-sockets) - cross-platform IPv6+IPv4 listeners with canonical IPs
 

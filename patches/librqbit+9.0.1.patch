@@ -1,0 +1,1291 @@
+diff --git a/examples/simulate_traffic.rs b/examples/simulate_traffic.rs
+index 9e4286e..5d91afa 100644
+--- a/examples/simulate_traffic.rs
++++ b/examples/simulate_traffic.rs
+@@ -186,6 +186,7 @@ impl TestHarness {
+                         connect_timeout: Some(Duration::from_secs(1)),
+                         read_write_timeout: Some(Duration::from_secs(32)),
+                         keep_alive_interval: None,
++                        ..Default::default()
+                     }),
+                 }),
+                 ..Default::default()
+@@ -274,6 +275,7 @@ impl TestHarness {
+                         connect_timeout: Some(Duration::from_secs(1)),
+                         read_write_timeout: Some(Duration::from_secs(32)),
+                         keep_alive_interval: None,
++                        ..Default::default()
+                     }),
+                 }),
+                 ..Default::default()
+diff --git a/src/api.rs b/src/api.rs
+index f795c1f..9607b6d 100644
+--- a/src/api.rs
++++ b/src/api.rs
+@@ -15,10 +15,7 @@ use crate::{
+         AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, TorrentId,
+     },
+     session_stats::snapshot::SessionStatsSnapshot,
+-    torrent_state::{
+-        FileStream, ManagedTorrentHandle,
+-        peer::stats::snapshot::{PeerStatsFilter, PeerStatsSnapshot},
+-    },
++    torrent_state::{FileStream, ManagedTorrentHandle},
+     type_aliases::BF,
+ };
+ 
+@@ -29,6 +26,9 @@ use futures::Stream;
+ #[cfg(feature = "tracing-subscriber-utils")]
+ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
+ 
++pub use crate::torrent_state::peer::stats::snapshot::{
++    PeerCounters, PeerStats, PeerStatsFilter, PeerStatsFilterState, PeerStatsSnapshot,
++};
+ pub use crate::torrent_state::stats::{LiveStats, TorrentStats};
+ 
+ pub type Result<T> = std::result::Result<T, ApiError>;
+@@ -228,6 +228,7 @@ impl Api {
+                         // These will be filled in /details and /stats endpoints
+                         files: None,
+                         stats: None,
++                        comment: None,
+                     };
+                     if opts.with_stats {
+                         r.stats = Some(mgr.stats());
+@@ -257,6 +258,12 @@ impl Api {
+             handle.name().as_deref(),
+             only_files.as_deref(),
+             output_folder,
++            handle
++                .metadata
++                .load()
++                .as_ref()
++                .and_then(|m| m.comment.as_ref())
++                .map(|c| c.to_string()),
+         )
+     }
+ 
+@@ -398,6 +405,12 @@ impl Api {
+                         .output_folder
+                         .to_string_lossy()
+                         .into_owned(),
++                    handle
++                        .metadata
++                        .load()
++                        .as_ref()
++                        .and_then(|m| m.comment.as_ref())
++                        .map(|c| c.to_string()),
+                 )
+                 .context("error making torrent details")?;
+                 ApiAddTorrentResponse {
+@@ -430,6 +443,7 @@ impl Api {
+                     None,
+                     only_files.as_deref(),
+                     output_folder.to_string_lossy().into_owned().to_string(),
++                    None,
+                 )
+                 .context("error making torrent details")?,
+             },
+@@ -446,6 +460,12 @@ impl Api {
+                         .output_folder
+                         .to_string_lossy()
+                         .into_owned(),
++                    handle
++                        .metadata
++                        .load()
++                        .as_ref()
++                        .and_then(|m| m.comment.as_ref())
++                        .map(|c| c.to_string()),
+                 )
+                 .context("error making torrent details")?;
+                 ApiAddTorrentResponse {
+@@ -549,6 +569,8 @@ pub struct TorrentDetailsResponse {
+     pub files: Option<Vec<TorrentDetailsResponseFile>>,
+     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
+     pub stats: Option<TorrentStats>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub comment: Option<String>,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+@@ -566,6 +588,7 @@ fn make_torrent_details(
+     name: Option<&str>,
+     only_files: Option<&[usize]>,
+     output_folder: String,
++    comment: Option<String>,
+ ) -> Result<TorrentDetailsResponse> {
+     let files = match info {
+         Some(info) => info
+@@ -596,6 +619,7 @@ fn make_torrent_details(
+         files: Some(files),
+         output_folder,
+         total_pieces,
++        comment,
+         stats: None,
+     })
+ }
+diff --git a/src/chunk_tracker.rs b/src/chunk_tracker.rs
+index 8db129b..de06369 100644
+--- a/src/chunk_tracker.rs
++++ b/src/chunk_tracker.rs
+@@ -271,6 +271,11 @@ impl ChunkTracker {
+ 
+     pub fn mark_piece_downloaded(&mut self, idx: ValidPieceIndex) {
+         let id = idx.get() as usize;
++        // While its hash was being checked the piece was neither in-flight nor have, and
++        // anything that queues "selected and not have" - update_only_files() re-selecting
++        // its file - queued it. A piece we have is not one a peer should be handed, so
++        // whatever queued it in that window is undone here.
++        self.queue_pieces.set(id, false);
+         if !self.have.as_slice()[id] {
+             self.have.as_slice_mut().set(id, true);
+             let len = self.lengths.piece_length(idx) as u64;
+@@ -666,4 +671,46 @@ mod tests {
+         assert!(ct.queue_pieces[1]);
+         assert!(ct.queue_pieces[2]);
+     }
++
++    // Between its last chunk arriving and its hash passing, a piece is neither queued,
++    // in-flight nor have. update_only_files() sees "selected and not have" and queues it,
++    // and the hash then passes: without this, the piece is have AND queued, and the next
++    // peer to ask is handed a piece we have.
++    #[test]
++    fn test_a_piece_queued_during_its_hash_check_is_dequeued_when_it_passes() {
++        let piece_len = CHUNK_SIZE * 2;
++        let l = Lengths::new(piece_len as u64 * 3, piece_len).unwrap();
++        let files = vec![FileInfo {
++            relative_filename: "0".into(),
++            offset_in_torrent: 0,
++            piece_range: 0..3,
++            len: piece_len as u64 * 3,
++            attrs: Default::default(),
++        }];
++        let bf_len = l.piece_bitfield_bytes();
++        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
++        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
++        selected.get_mut(0..3).unwrap().fill(true);
++        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
++        let p0 = l.validate_piece_index(0).unwrap();
++
++        // A peer takes the piece, delivers all of it, and the hash check starts: it is
++        // out of the queue and, in the real thing, just out of the in-flight map too.
++        ct.reserve_needed_piece(p0);
++        assert!(!ct.queue_pieces[0]);
++
++        // Meanwhile the user deselects the file and selects it again.
++        ct.update_only_files(&files, &HashSet::new()).unwrap();
++        ct.update_only_files(&files, &HashSet::from_iter([0]))
++            .unwrap();
++        assert!(ct.queue_pieces[0]);
++
++        // The hash passes.
++        ct.mark_piece_downloaded(p0);
++        assert!(ct.is_piece_have(p0));
++        assert!(
++            !ct.queue_pieces[0],
++            "a piece we have is still queued, so a second peer will download it again"
++        );
++    }
+ }
+diff --git a/src/ip_ranges.rs b/src/ip_ranges.rs
+index 46c381b..e5b9860 100644
+--- a/src/ip_ranges.rs
++++ b/src/ip_ranges.rs
+@@ -58,7 +58,7 @@ impl IpRanges {
+         self.v4.len + self.v6.len
+     }
+ 
+-    pub async fn load_from_url(url: &str) -> Result<Self> {
++    pub async fn load_from_url(client: &reqwest::Client, url: &str) -> Result<Self> {
+         let parsed_url = Url::parse(url).context("failed to parse URL")?;
+ 
+         if parsed_url.scheme() == "file" {
+@@ -69,7 +69,9 @@ impl IpRanges {
+             return Self::load_from_file(path).await;
+         }
+ 
+-        let response = reqwest::get(parsed_url)
++        let response = client
++            .get(parsed_url)
++            .send()
+             .await
+             .context("error fetching list")?;
+         if !response.status().is_success() {
+@@ -273,7 +275,8 @@ mod tests {
+     #[tokio::test]
+     async fn test_list_real_url() {
+         setup_test_logging();
+-        let _ = IpRanges::load_from_url("https://raw.githubusercontent.com/Naunter/BT_BlockLists/refs/heads/master/bt_blocklists.gz")
++        let client = reqwest::Client::new();
++        let _ = IpRanges::load_from_url(&client, "https://raw.githubusercontent.com/Naunter/BT_BlockLists/refs/heads/master/bt_blocklists.gz")
+             .await
+             .unwrap();
+     }
+diff --git a/src/peer_connection.rs b/src/peer_connection.rs
+index c06259a..ca2690c 100644
+--- a/src/peer_connection.rs
++++ b/src/peer_connection.rs
+@@ -77,6 +77,12 @@ pub struct PeerConnectionOptions {
+ 
+     #[serde_as(as = "Option<serde_with::DurationSeconds>")]
+     pub keep_alive_interval: Option<Duration>,
++
++    /// The most chunk requests to keep outstanding per peer (default 128, and
++    /// never more than the peer's reqq). A newly needed piece, such as the
++    /// one at a stream's read position after a seek, is requested only after
++    /// those, so a smaller window makes streams react faster to seeks.
++    pub max_request_window: Option<usize>,
+ }
+ 
+ pub(crate) struct PeerConnection<H> {
+@@ -170,8 +176,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
+         );
+ 
+         let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
+-        let handshake = Handshake::new(self.info_hash, self.peer_id);
+-        let hlen = handshake.serialize_unchecked_len(&mut *write_buf);
++        let my_handshake = Handshake::new(self.info_hash, self.peer_id);
++        let hlen = my_handshake.serialize_unchecked_len(&mut *write_buf);
+         with_timeout(
+             "writing handshake",
+             rwtimeout,
+@@ -182,10 +188,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
+         )
+         .await?;
+ 
+-        let handshake_supports_extended = handshake.supports_extended();
++        // What the peer supports is in the peer's handshake, not in ours.
++        let handshake_supports_extended = incoming.handshake.supports_extended();
+ 
+         self.handler
+-            .on_handshake(handshake, incoming.kind)
++            .on_handshake(incoming.handshake, incoming.kind)
+             .map_err(Error::Anyhow)?;
+ 
+         self.manage_peer(ManagePeerArgs {
+diff --git a/src/read_buf.rs b/src/read_buf.rs
+index 729894c..f57237f 100644
+--- a/src/read_buf.rs
++++ b/src/read_buf.rs
+@@ -49,24 +49,38 @@ impl ReadBuf {
+ 
+     // Read the BT handshake.
+     // This MUST be run as the first operation on the buffer.
++    //
++    // The 68-byte handshake may arrive split across several reads (e.g. when the
++    // peer, or a proxy in between, writes it in more than one chunk), so keep
++    // reading until it is complete. The timeout covers the whole handshake.
+     pub async fn read_handshake(
+         &mut self,
+         conn: &mut BoxAsyncReadVectored,
+         timeout: Duration,
+     ) -> Result<Handshake> {
+-        self.len = with_timeout(
+-            "reading",
+-            timeout,
+-            conn.read(&mut *self.buf).map_err(Error::ReadHandshake),
+-        )
+-        .await?;
+-        if self.len == 0 {
+-            return Err(Error::PeerDisconnectedReadingHandshake);
+-        }
+-        let (h, size) =
+-            Handshake::deserialize(&self.buf[..self.len]).map_err(Error::DeserializeHandshake)?;
+-        self.advance(size);
+-        Ok(h)
++        self.start = 0;
++        self.len = 0;
++        with_timeout("reading", timeout, async {
++            loop {
++                let n = conn
++                    .read(&mut self.buf[self.len..])
++                    .await
++                    .map_err(Error::ReadHandshake)?;
++                if n == 0 {
++                    return Err(Error::PeerDisconnectedReadingHandshake);
++                }
++                self.len += n;
++                match Handshake::deserialize(&self.buf[..self.len]) {
++                    Ok((h, size)) => {
++                        self.advance(size);
++                        return Ok(h);
++                    }
++                    Err(MessageDeserializeError::NotEnoughData(..)) => continue,
++                    Err(e) => return Err(Error::DeserializeHandshake(e)),
++                }
++            }
++        })
++        .await
+     }
+ 
+     fn is_contiguous(&self) -> bool {
+@@ -206,7 +220,7 @@ impl ReadBuf {
+ mod tests {
+     use librqbit_core::constants::CHUNK_SIZE;
+     use peer_binary_protocol::{
+-        MAX_MSG_LEN, Message, Piece,
++        Handshake, MAX_MSG_LEN, Message, Piece,
+         extended::{
+             ExtendedMessage, PeerExtendedMessageIds,
+             ut_metadata::{UtMetadata, UtMetadataData},
+@@ -337,6 +351,70 @@ mod tests {
+         assert_one(BUFLEN - 1, 100, [99..BUFLEN - 1, 0..0]);
+     }
+ 
++    fn test_handshake() -> Vec<u8> {
++        let mut hs = Vec::new();
++        hs.push(19u8);
++        hs.extend_from_slice(b"BitTorrent protocol");
++        hs.extend_from_slice(&[0u8; 8]);
++        hs.extend_from_slice(&[0xaa; 20]); // info hash
++        hs.extend_from_slice(&[0xbb; 20]); // peer id
++        hs
++    }
++
++    async fn read_handshake_written_as(chunks: Vec<Vec<u8>>) -> crate::Result<Handshake> {
++        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
++            .await
++            .unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let writer = async move {
++            let mut w = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
++                .await
++                .unwrap();
++            w.set_nodelay(true).unwrap();
++            for c in chunks {
++                w.write_all(&c).await.unwrap();
++                w.flush().await.unwrap();
++                tokio::time::sleep(Duration::from_millis(50)).await;
++            }
++            // Keep the connection open until the reader is done.
++            tokio::time::sleep(Duration::from_millis(500)).await;
++        };
++        let reader = async {
++            let reader = listener.accept().await.unwrap().0.into_split().0;
++            let mut reader: BoxAsyncReadVectored = Box::new(reader);
++            let mut rb = ReadBuf::new();
++            rb.read_handshake(&mut reader, Duration::from_secs(5)).await
++        };
++        let (h, ()) = tokio::join!(reader, writer);
++        h
++    }
++
++    #[tokio::test]
++    async fn handshake_split_across_reads_is_reassembled() {
++        setup_test_logging();
++        let hs = test_handshake();
++        // Split in the middle of the info hash, and byte by byte for the first few.
++        let mut chunks: Vec<Vec<u8>> = hs[..3].iter().map(|b| vec![*b]).collect();
++        chunks.push(hs[3..40].to_vec());
++        chunks.push(hs[40..].to_vec());
++        let h = read_handshake_written_as(chunks).await.unwrap();
++        assert_eq!(h.info_hash.0, [0xaa; 20]);
++        assert_eq!(h.peer_id.0, [0xbb; 20]);
++    }
++
++    #[tokio::test]
++    async fn handshake_cut_short_is_an_error() {
++        setup_test_logging();
++        let hs = test_handshake();
++        let err = read_handshake_written_as(vec![hs[..40].to_vec()])
++            .await
++            .unwrap_err();
++        assert!(
++            matches!(err, crate::Error::PeerDisconnectedReadingHandshake),
++            "{err:?}"
++        );
++    }
++
+     #[tokio::test]
+     async fn can_read_long_metainfo_correctly() {
+         setup_test_logging();
+diff --git a/src/session.rs b/src/session.rs
+index 75071b9..ab0d3d7 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -153,6 +153,13 @@ pub struct Session {
+     client_name_and_version: String,
+ }
+ 
++/// A 40 character hex string is a v1 info hash. Checking the length alone
++/// also matches URLs that happen to be 40 characters long, such as
++/// https://nyaa.si/download/1234567.torrent.
++fn is_bare_info_hash(s: &str) -> bool {
++    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
++}
++
+ async fn torrent_from_url(
+     reqwest_client: &reqwest::Client,
+     url: &str,
+@@ -738,7 +745,7 @@ impl Session {
+ 
+             let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
+                 info!(url = blocklist_url, "loading p2p blocklist");
+-                let bl = IpRanges::load_from_url(&blocklist_url)
++                let bl = IpRanges::load_from_url(&reqwest_client, &blocklist_url)
+                     .await
+                     .with_context(|| format!("error reading blocklist from {blocklist_url}"))?;
+                 info!(len = bl.len(), "loaded blocklist");
+@@ -749,7 +756,7 @@ impl Session {
+ 
+             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
+                 info!(url = allowlist_url, "loading p2p allowlist");
+-                let al = IpRanges::load_from_url(&allowlist_url)
++                let al = IpRanges::load_from_url(&reqwest_client, &allowlist_url)
+                     .await
+                     .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
+                 info!(len = al.len(), "loaded allowlist");
+@@ -1008,6 +1015,7 @@ impl Session {
+                         warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
+                     }
+                 },
++                else => continue,
+             }
+         }
+     }
+@@ -1037,6 +1045,9 @@ impl Session {
+             keep_alive_interval: other
+                 .keep_alive_interval
+                 .or(self.peer_opts.keep_alive_interval),
++            max_request_window: other
++                .max_request_window
++                .or(self.peer_opts.max_request_window),
+         }
+     }
+ 
+@@ -1082,6 +1093,12 @@ impl Session {
+         callback(&mut self.db.read().torrents.iter().map(|(id, t)| (*id, t)))
+     }
+ 
++    /// The session-wide default output folder torrents are downloaded to
++    /// when no explicit destination is given.
++    pub fn default_output_folder(&self) -> &Path {
++        &self.output_folder
++    }
++
+     /// Add a torrent to the session.
+     #[inline(never)]
+     pub fn add_torrent<'a>(
+@@ -1092,7 +1109,9 @@ impl Session {
+         async move {
+             let mut opts = opts.unwrap_or_default();
+             let add_res = match add {
+-                AddTorrent::Url(magnet) if magnet.starts_with("magnet:") || magnet.len() == 40 => {
++                AddTorrent::Url(magnet)
++                    if magnet.starts_with("magnet:") || is_bare_info_hash(&magnet) =>
++                {
+                     let magnet = Magnet::parse(&magnet)
+                         .context("provided path is not a valid magnet URL")?;
+                     let info_hash = magnet
+@@ -1156,6 +1175,7 @@ impl Session {
+                             torrent.meta.info.data.validate()?,
+                             torrent.torrent_bytes,
+                             torrent.meta.info.raw_bytes.0,
++                            torrent.meta.comment.clone(),
+                         )?),
+                         trackers: trackers
+                             .iter()
+@@ -1350,6 +1370,7 @@ impl Session {
+                     force_tracker_interval: opts.force_tracker_interval,
+                     peer_connect_timeout: peer_opts.connect_timeout,
+                     peer_read_write_timeout: peer_opts.read_write_timeout,
++                    peer_max_request_window: peer_opts.max_request_window,
+                     allow_overwrite: opts.overwrite,
+                     output_folder,
+                     ratelimits: opts.ratelimits,
+@@ -1663,6 +1684,7 @@ impl Session {
+                         info,
+                         torrent_file_from_info_bytes(info_bytes.as_ref(), trackers)?,
+                         info_bytes.0,
++                        None,
+                     )?,
+                     peer_rx: rx,
+                     seen_peers: {
+@@ -1810,7 +1832,24 @@ mod tests {
+     use itertools::Itertools;
+     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
+ 
+-    use super::torrent_file_from_info_bytes;
++    use super::{is_bare_info_hash, torrent_file_from_info_bytes};
++
++    #[test]
++    fn test_is_bare_info_hash() {
++        assert!(is_bare_info_hash(
++            "08ada5a7a6183aae1e09d831df6748d566095a10"
++        ));
++        assert!(is_bare_info_hash(
++            "08ADA5A7A6183AAE1E09D831DF6748D566095A10"
++        ));
++        // 40 characters, but a URL.
++        assert!(!is_bare_info_hash(
++            "https://nyaa.si/download/2164312.torrent"
++        ));
++        assert!(!is_bare_info_hash(
++            "08ada5a7a6183aae1e09d831df6748d566095a1"
++        ));
++    }
+ 
+     #[test]
+     fn test_torrent_file_from_info_and_bytes() {
+diff --git a/src/storage/filesystem/opened_file.rs b/src/storage/filesystem/opened_file.rs
+index ccd29b6..23214e5 100644
+--- a/src/storage/filesystem/opened_file.rs
++++ b/src/storage/filesystem/opened_file.rs
+@@ -19,7 +19,16 @@ pub trait OurFileExt {
+ impl OurFileExt for File {
+     #[cfg(unix)]
+     fn pwrite_all_vectored(&self, offset: u64, bufs: [IoSlice<'_>; 2]) -> anyhow::Result<usize> {
+-        nix::sys::uio::pwritev(self, &bufs, offset.try_into()?).context("error calling pwritev")
++        // off_t is 32 bits on 32-bit Android (and on 32-bit Linux built without
++        // _FILE_OFFSET_BITS=64), so pwritev cannot address anything past 2 GiB there.
++        // pwrite_all goes through pwrite64 and takes the u64 as is, so past that point
++        // write the two buffers one after the other instead.
++        match nix::libc::off_t::try_from(offset) {
++            Ok(offset) => {
++                nix::sys::uio::pwritev(self, &bufs, offset).context("error calling pwritev")
++            }
++            Err(_) => pwrite_all_unvectored(self, offset, bufs),
++        }
+     }
+ 
+     #[cfg(not(unix))]
+@@ -106,6 +115,21 @@ impl OurFileExt for File {
+     }
+ }
+ 
++/// What pwrite_all_vectored() falls back to when the offset does not fit the platform's
++/// pwritev: the same bytes, in two plain positional writes.
++#[cfg(unix)]
++fn pwrite_all_unvectored(
++    file: &File,
++    mut offset: u64,
++    bufs: [IoSlice<'_>; 2],
++) -> anyhow::Result<usize> {
++    for buf in &bufs {
++        file.pwrite_all(offset, buf)?;
++        offset += buf.len() as u64;
++    }
++    Ok(bufs[0].len() + bufs[1].len())
++}
++
+ #[derive(Default, Debug)]
+ struct OpenedFileLocked {
+     #[allow(unused)]
+@@ -186,7 +210,8 @@ impl OpenedFile {
+         if !g.tried_marking_sparse {
+             g.tried_marking_sparse = true;
+             let f = g.fd.as_ref().ok_or(Error::FsFileIsNone)?;
+-            tracing::debug!(path=?g.path, marked=super::sparse::mark_file_sparse(f), "marking sparse");
++            let marked = super::sparse::mark_file_sparse(f);
++            tracing::debug!(path=?g.path, marked, "marking sparse");
+         }
+         let g = parking_lot::RwLockWriteGuard::downgrade(g);
+         Ok(RwLockReadGuard::try_map(g, |f| f.fd.as_ref()).ok().unwrap())
+@@ -195,7 +220,7 @@ impl OpenedFile {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use std::io::Read;
++    use std::io::{IoSlice, Read};
+ 
+     use librqbit_core::constants::CHUNK_SIZE;
+     use peer_binary_protocol::DoubleBufHelper;
+@@ -203,9 +228,16 @@ mod tests {
+ 
+     use crate::storage::filesystem::opened_file::OurFileExt;
+ 
+-    #[test]
+-    fn test_pwrite_all_vectored() {
+-        let td = TempDir::with_prefix("test_pwrite_all_vectored").unwrap();
++    // Writes every split of a random buffer at `offset` with `write`, and checks the file
++    // holds exactly those bytes there.
++    fn check_pwrite_all_vectored(
++        name: &str,
++        offset: u64,
++        write: impl Fn(&std::fs::File, u64, [IoSlice<'_>; 2]) -> anyhow::Result<usize>,
++    ) {
++        use std::io::Seek;
++
++        let td = TempDir::with_prefix(name).unwrap();
+         let mut tmp_buf = [0u8; CHUNK_SIZE as usize];
+         for bufsize in [10000usize, CHUNK_SIZE as usize] {
+             let mut buf = vec![0u8; bufsize];
+@@ -219,13 +251,56 @@ mod tests {
+                     .unwrap();
+                 let (first, second) = buf.split_at(split_point);
+                 let bufs = DoubleBufHelper::new(first, second).as_ioslices(bufsize);
+-                file.pwrite_all_vectored(0, bufs).unwrap();
++                assert_eq!(write(&file, offset, bufs).unwrap(), bufsize, "{path:?}");
+ 
+                 let mut file = std::fs::File::open(&path).unwrap();
+-                assert_eq!(file.metadata().unwrap().len(), bufsize as u64, "{path:?}");
++                assert_eq!(
++                    file.metadata().unwrap().len(),
++                    offset + bufsize as u64,
++                    "{path:?}"
++                );
++                file.seek(std::io::SeekFrom::Start(offset)).unwrap();
+                 file.read_exact(&mut tmp_buf[..bufsize]).unwrap();
+                 assert_eq!(&tmp_buf[..bufsize], buf);
+             }
+         }
+     }
++
++    #[test]
++    fn test_pwrite_all_vectored() {
++        check_pwrite_all_vectored("test_pwrite_all_vectored", 0, |f, offset, bufs| {
++            f.pwrite_all_vectored(offset, bufs)
++        });
++    }
++
++    // 2 GiB is where a 32-bit off_t runs out. On a 64-bit host this still goes through
++    // pwritev, so it cannot reproduce the 32-bit failure; on a 32-bit target the same
++    // test takes the fallback.
++    //
++    // Unix only, and not because the code under test is: writing at this offset leaves a
++    // 2 GiB hole, which is free where files are sparse by default and is not on NTFS,
++    // where Windows zero-fills it -- six files of it, more than a CI runner has room or
++    // time for. Windows takes the seek_write path below, whose offset is a u64 with no
++    // such boundary, so there is nothing there for this test to find.
++    #[cfg(unix)]
++    #[test]
++    fn test_pwrite_all_vectored_past_2gib() {
++        check_pwrite_all_vectored(
++            "test_pwrite_all_vectored_past_2gib",
++            1u64 << 31,
++            |f, offset, bufs| f.pwrite_all_vectored(offset, bufs),
++        );
++    }
++
++    // The fallback itself, at an offset a 32-bit off_t cannot hold: the path a 32-bit
++    // Android device takes for every write past 2 GiB into a file.
++    #[cfg(unix)]
++    #[test]
++    fn test_pwrite_all_unvectored_past_2gib() {
++        check_pwrite_all_vectored(
++            "test_pwrite_all_unvectored_past_2gib",
++            (1u64 << 31) + 12345,
++            super::pwrite_all_unvectored,
++        );
++    }
+ }
+diff --git a/src/storage/middleware/write_through_cache.rs b/src/storage/middleware/write_through_cache.rs
+index ee792e8..1dd0e4f 100644
+--- a/src/storage/middleware/write_through_cache.rs
++++ b/src/storage/middleware/write_through_cache.rs
+@@ -55,6 +55,10 @@ impl<U: StorageFactory + Clone> StorageFactory for WriteThroughCacheStorageFacto
+         })
+     }
+ 
++    fn is_type_id(&self, type_id: std::any::TypeId) -> bool {
++        self.underlying.is_type_id(type_id)
++    }
++
+     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
+         self.clone().boxed()
+     }
+diff --git a/src/storage/mod.rs b/src/storage/mod.rs
+index 8a51e92..230067b 100644
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -58,6 +58,11 @@ pub trait StorageFactory: Send + Sync + Any {
+         Ok(storage)
+     }
+ 
++    /// Whether this factory, or the one it ultimately wraps, is of the given type.
++    ///
++    /// It has to survive both wrapping and boxing: this is how e.g. session persistence
++    /// asks whether it's dealing with a FilesystemStorageFactory, and a middleware in
++    /// between must not hide it. A middleware forwards this to what it wraps.
+     fn is_type_id(&self, type_id: TypeId) -> bool {
+         Self::type_id(self) == type_id
+     }
+@@ -89,7 +94,7 @@ impl<SF: StorageFactory> StorageFactoryExt for SF {
+             }
+ 
+             fn is_type_id(&self, type_id: TypeId) -> bool {
+-                self.sf.type_id() == type_id
++                self.sf.is_type_id(type_id)
+             }
+ 
+             fn clone_box(&self) -> BoxStorageFactory {
+@@ -112,6 +117,10 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
+         (**self).create(shared, metadata)
+     }
+ 
++    fn is_type_id(&self, type_id: TypeId) -> bool {
++        (**self).is_type_id(type_id)
++    }
++
+     fn clone_box(&self) -> BoxStorageFactory {
+         (**self).clone_box()
+     }
+@@ -179,6 +188,15 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
+         (**self).pwrite_all(file_id, offset, buf)
+     }
+ 
++    fn pwrite_all_vectored(
++        &self,
++        file_id: usize,
++        offset: u64,
++        bufs: [IoSlice<'_>; 2],
++    ) -> anyhow::Result<usize> {
++        (**self).pwrite_all_vectored(file_id, offset, bufs)
++    }
++
+     fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+         (**self).remove_file(file_id, filename)
+     }
+@@ -207,3 +225,67 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
+         (**self).on_piece_completed(piece_id)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::any::TypeId;
++
++    use super::{
++        BoxStorageFactory, StorageFactory, StorageFactoryExt, filesystem::FilesystemStorageFactory,
++    };
++    use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
++
++    // A middleware like the ones in storage::middleware: it wraps another factory and
++    // forwards is_type_id, so that what it wraps stays recognizable through it.
++    #[derive(Clone)]
++    struct Middleware<U> {
++        underlying_factory: U,
++    }
++
++    impl<U: StorageFactory + Clone> StorageFactory for Middleware<U> {
++        type Storage = U::Storage;
++
++        fn create(
++            &self,
++            shared: &ManagedTorrentShared,
++            metadata: &TorrentMetadata,
++        ) -> anyhow::Result<Self::Storage> {
++            self.underlying_factory.create(shared, metadata)
++        }
++
++        fn is_type_id(&self, type_id: TypeId) -> bool {
++            self.underlying_factory.is_type_id(type_id)
++        }
++
++        fn clone_box(&self) -> BoxStorageFactory {
++            self.clone().boxed()
++        }
++    }
++
++    #[test]
++    fn test_is_type_id_survives_boxing() {
++        let fs = TypeId::of::<FilesystemStorageFactory>();
++
++        assert!(FilesystemStorageFactory::default().is_type_id(fs));
++        // Box<U> has to forward, or the answer is the TypeId of the box itself.
++        assert!(FilesystemStorageFactory::default().boxed().is_type_id(fs));
++
++        // And boxed() has to forward too, or every middleware's override is lost and the
++        // answer is the middleware's own type.
++        let wrapped = Middleware {
++            underlying_factory: FilesystemStorageFactory::default(),
++        };
++        assert!(wrapped.is_type_id(fs));
++        assert!(wrapped.clone().boxed().is_type_id(fs));
++        assert!(wrapped.boxed().clone_box().is_type_id(fs));
++
++        // A factory that isn't the one asked about still says so.
++        assert!(
++            !Middleware {
++                underlying_factory: FilesystemStorageFactory::default(),
++            }
++            .boxed()
++            .is_type_id(TypeId::of::<Middleware<FilesystemStorageFactory>>())
++        );
++    }
++}
+diff --git a/src/stream_connect.rs b/src/stream_connect.rs
+index ab9b0e9..bdc7188 100644
+--- a/src/stream_connect.rs
++++ b/src/stream_connect.rs
+@@ -68,10 +68,12 @@ pub(crate) struct StreamConnectorArgs {
+ }
+ 
+ impl SocksProxyConfig {
++    /// socks5h:// resolves hostnames via the proxy; socks5:// resolves them locally.
+     pub fn parse(url: &str) -> anyhow::Result<Self> {
+         let url = ::url::Url::parse(url).context("invalid proxy URL")?;
+-        if url.scheme() != "socks5" {
+-            anyhow::bail!("proxy URL should have socks5 scheme");
++        match url.scheme() {
++            "socks5" | "socks5h" => {}
++            other => anyhow::bail!("unsupported proxy URL scheme \"{other}\""),
+         }
+         let host = url.host_str().context("missing host")?;
+         let port = url.port().context("missing port")?;
+@@ -324,3 +326,51 @@ impl StreamConnector {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_parse_socks5() {
++        let c = SocksProxyConfig::parse("socks5://myhost:1234").unwrap();
++        assert_eq!(c.host, "myhost");
++        assert_eq!(c.port, 1234);
++        assert_eq!(c.username_password, None);
++    }
++
++    #[test]
++    fn test_parse_socks5h() {
++        let c = SocksProxyConfig::parse("socks5h://myhost:1234").unwrap();
++        assert_eq!(c.host, "myhost");
++        assert_eq!(c.port, 1234);
++    }
++
++    #[test]
++    fn test_parse_with_password() {
++        let c = SocksProxyConfig::parse("socks5h://user:pass@myhost:1234").unwrap();
++        assert_eq!(c.host, "myhost");
++        assert_eq!(c.port, 1234);
++        assert_eq!(
++            c.username_password,
++            Some(("user".to_owned(), "pass".to_owned()))
++        );
++    }
++
++    #[test]
++    fn test_parse_rejects_other_schemes() {
++        for url in [
++            "http://myhost:1234",
++            "socks4://myhost:1234",
++            "socks4a://myhost:1234",
++        ] {
++            assert!(SocksProxyConfig::parse(url).is_err(), "should reject {url}");
++        }
++    }
++
++    #[test]
++    fn test_parse_rejects_garbage() {
++        assert!(SocksProxyConfig::parse("not a url").is_err());
++        assert!(SocksProxyConfig::parse("socks5://").is_err());
++    }
++}
+diff --git a/src/torrent_state/live/mod.rs b/src/torrent_state/live/mod.rs
+index b4146d8..10d8f00 100644
+--- a/src/torrent_state/live/mod.rs
++++ b/src/torrent_state/live/mod.rs
+@@ -217,6 +217,14 @@ pub struct TorrentStateLive {
+ }
+ 
+ impl TorrentStateLive {
++    fn max_request_window(&self) -> usize {
++        self.shared
++            .options
++            .peer_max_request_window
++            .unwrap_or(DEFAULT_PEER_REQUEST_WINDOW)
++            .max(1)
++    }
++
+     pub(crate) fn new(
+         paused: TorrentStatePaused,
+         fatal_errors_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
+@@ -475,7 +483,7 @@ impl TorrentStateLive {
+             addr: checked_peer.addr,
+             incoming: true,
+             on_bitfield_notify: Default::default(),
+-            flow_control: Mutex::new(PeerFlowControl::default()),
++            flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
+             state: self.clone(),
+             tx,
+             counters,
+@@ -539,7 +547,7 @@ impl TorrentStateLive {
+             addr,
+             incoming: false,
+             on_bitfield_notify: Default::default(),
+-            flow_control: Mutex::new(PeerFlowControl::default()),
++            flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
+             state: state.clone(),
+             tx,
+             counters,
+@@ -802,9 +810,13 @@ impl TorrentStateLive {
+     }
+ 
+     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
+-        let mut g = self.lock_write("update_only_files");
+-        let pt = g.get_pieces_mut()?;
+-        let hns = pt.update_only_files(&self.metadata.file_infos, only_files)?;
++        let hns = self
++            .lock_write("update_only_files")
++            .get_pieces_mut()?
++            .update_only_files(&self.metadata.file_infos, only_files)?;
++        // With the state lock released. A dying peer holds its shard of the peer table
++        // while it asks whether the torrent is finished (on_peer_died), so touching the
++        // table under the state lock is the reverse order, and the two deadlock.
+         if !hns.finished() {
+             self.reconnect_all_not_needed_peers();
+         }
+@@ -999,11 +1011,11 @@ struct PeerFlowControl {
+     request_window: usize,
+ }
+ 
+-impl Default for PeerFlowControl {
+-    fn default() -> Self {
++impl PeerFlowControl {
++    fn new(max_request_window: usize) -> Self {
+         Self {
+             i_am_choked: true,
+-            request_window: DEFAULT_PEER_REQUEST_WINDOW,
++            request_window: max_request_window,
+         }
+     }
+ }
+@@ -1164,7 +1176,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
+         if let Some(reqq) = hs.reqq.and_then(|reqq| usize::try_from(reqq).ok())
+             && reqq > 0
+         {
+-            let request_window = reqq.min(DEFAULT_PEER_REQUEST_WINDOW);
++            let request_window = reqq.min(self.state.max_request_window());
+             let mut flow = self.lock_flow_control("update request window");
+             if flow.request_window != request_window {
+                 debug!(
+@@ -1543,11 +1555,10 @@ impl PeerHandler {
+                     }
+                 };
+                 trace!("updated bitfield with have={}", have);
+-                if let Some(true) = live
+-                    .bitfield
+-                    .get(..self.state.lengths.total_pieces() as usize)
+-                    .map(|s| s.all())
+-                {
++                self.state
++                    .peers
++                    .update_seeder_flag(live, self.state.lengths.total_pieces() as usize);
++                if live.seeder {
+                     debug!("peer has full torrent");
+                 }
+             });
+@@ -1569,7 +1580,9 @@ impl PeerHandler {
+         {
+             debug!("peer has full torrent");
+         }
+-        self.state.peers.update_bitfield(self.addr, bf);
++        self.state
++            .peers
++            .update_bitfield(self.addr, bf, self.state.lengths.total_pieces() as usize);
+         self.on_bitfield_notify.notify_waiters();
+         Ok(())
+     }
+diff --git a/src/torrent_state/live/peer/mod.rs b/src/torrent_state/live/peer/mod.rs
+index 9be84c2..93f3d01 100644
+--- a/src/torrent_state/live/peer/mod.rs
++++ b/src/torrent_state/live/peer/mod.rs
+@@ -260,6 +260,12 @@ pub(crate) struct LivePeerState {
+     // This is used to track the pieces the peer has.
+     pub bitfield: BF,
+ 
++    // Whether the bitfield above covers the whole torrent, i.e. the peer is a seeder.
++    // Cached so that the aggregate seeder counter can be maintained on transitions
++    // instead of scanning every peer's bitfield on each stats call. Kept in sync
++    // with the bitfield by PeerStates::update_seeder_flag.
++    pub seeder: bool,
++
+     // When the peer sends us data this is used to track if we asked for it.
+     inflight_requests: HashSet<InflightRequest>,
+ 
+@@ -288,6 +294,7 @@ impl LivePeerState {
+             client_name: None,
+             peer_interested: initial_interested,
+             bitfield: BF::default(),
++            seeder: false,
+             inflight_requests: Default::default(),
+             late_cancelled_request_tolerance: 0,
+             request_slots_changed: Default::default(),
+diff --git a/src/torrent_state/live/peers/mod.rs b/src/torrent_state/live/peers/mod.rs
+index d80b6e9..3cd3477 100644
+--- a/src/torrent_state/live/peers/mod.rs
++++ b/src/torrent_state/live/peers/mod.rs
+@@ -111,12 +111,31 @@ impl PeerStates {
+         })
+     }
+ 
+-    pub fn update_bitfield(&self, handle: PeerHandle, bitfield: BF) -> Option<()> {
++    pub fn update_bitfield(
++        &self,
++        handle: PeerHandle,
++        bitfield: BF,
++        total_pieces: usize,
++    ) -> Option<()> {
+         self.with_live_mut(handle, "update_bitfield", |live| {
+             live.bitfield = bitfield;
++            self.update_seeder_flag(live, total_pieces);
+         })
+     }
+ 
++    // Recompute the cached "this peer has the full torrent" flag after its bitfield
++    // changed, keeping the aggregate seeder counters in sync. Must be called on every
++    // bitfield change of a live peer.
++    pub fn update_seeder_flag(&self, live: &mut LivePeerState, total_pieces: usize) {
++        let seeder = live.has_full_torrent(total_pieces);
++        if seeder == live.seeder {
++            return;
++        }
++        live.seeder = seeder;
++        self.stats.seeder_flag_changed(seeder);
++        self.session_stats.seeder_flag_changed(seeder);
++    }
++
+     pub fn mark_peer_connecting(&self, h: PeerHandle) -> crate::Result<(PeerRx, PeerTx)> {
+         let rx = self
+             .with_peer_mut(h, "mark_peer_connecting", |peer| {
+@@ -160,3 +179,133 @@ impl PeerStates {
+         });
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use librqbit_core::hash_id::Id20;
++
++    use super::*;
++    use crate::stream_connect::ConnectionKind;
++
++    const TOTAL_PIECES: usize = 8;
++
++    fn full_bitfield() -> BF {
++        BF::from_boxed_slice(vec![0xffu8; 1].into_boxed_slice())
++    }
++
++    fn empty_bitfield() -> BF {
++        BF::from_boxed_slice(vec![0u8; 1].into_boxed_slice())
++    }
++
++    fn make_peer_states() -> PeerStates {
++        PeerStates {
++            session_stats: Default::default(),
++            live_outgoing_peers: Default::default(),
++            stats: Default::default(),
++            states: Default::default(),
++        }
++    }
++
++    // Returns the peer handle, keeping the receiving end of the peer channel alive.
++    fn add_live_peer(peers: &PeerStates, addr: &str) -> (PeerHandle, PeerRx) {
++        let addr: SocketAddr = addr.parse().unwrap();
++        peers.add_if_not_seen(addr).unwrap();
++        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
++        peers
++            .with_peer_mut(addr, "test", |peer| {
++                peer.incoming_connection(Id20::default(), tx, peers, ConnectionKind::Tcp)
++            })
++            .unwrap()
++            .unwrap();
++        (addr, rx)
++    }
++
++    fn live_seeders(peers: &PeerStates) -> (u32, u32) {
++        (
++            peers.stats().live_seeders,
++            peers.session_stats.snapshot().live_seeders,
++        )
++    }
++
++    #[test]
++    fn full_bitfield_counts_as_seeder_and_is_uncounted_on_disconnect() {
++        let peers = make_peer_states();
++        let (addr, _rx) = add_live_peer(&peers, "127.0.0.1:1234");
++        assert_eq!(live_seeders(&peers), (0, 0));
++
++        peers
++            .update_bitfield(addr, empty_bitfield(), TOTAL_PIECES)
++            .unwrap();
++        assert_eq!(live_seeders(&peers), (0, 0));
++
++        peers
++            .update_bitfield(addr, full_bitfield(), TOTAL_PIECES)
++            .unwrap();
++        assert_eq!(live_seeders(&peers), (1, 1));
++
++        // Repeated updates must not double-count.
++        peers
++            .update_bitfield(addr, full_bitfield(), TOTAL_PIECES)
++            .unwrap();
++        assert_eq!(live_seeders(&peers), (1, 1));
++
++        peers.drop_peer(addr).unwrap();
++        assert_eq!(live_seeders(&peers), (0, 0));
++    }
++
++    #[test]
++    fn bitfield_completed_piece_by_piece_counts_as_seeder() {
++        let peers = make_peer_states();
++        let (addr, _rx) = add_live_peer(&peers, "127.0.0.1:1234");
++        peers
++            .update_bitfield(addr, empty_bitfield(), TOTAL_PIECES)
++            .unwrap();
++
++        for piece in 0..TOTAL_PIECES {
++            peers
++                .with_live_mut(addr, "test", |live| {
++                    *live.bitfield.get_mut(piece).unwrap() = true;
++                    peers.update_seeder_flag(live, TOTAL_PIECES);
++                })
++                .unwrap();
++            let expected = u32::from(piece == TOTAL_PIECES - 1);
++            assert_eq!(live_seeders(&peers), (expected, expected));
++        }
++    }
++
++    #[test]
++    fn seeder_is_uncounted_when_peer_leaves_live_state() {
++        let peers = make_peer_states();
++        let (addr, _rx) = add_live_peer(&peers, "127.0.0.1:1234");
++        peers
++            .update_bitfield(addr, full_bitfield(), TOTAL_PIECES)
++            .unwrap();
++        assert_eq!(live_seeders(&peers), (1, 1));
++
++        peers.mark_peer_not_needed(addr).unwrap();
++        assert_eq!(live_seeders(&peers), (0, 0));
++    }
++
++    #[test]
++    fn seeders_are_counted_per_peer() {
++        let peers = make_peer_states();
++        let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
++        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.1:1235");
++
++        peers
++            .update_bitfield(a, full_bitfield(), TOTAL_PIECES)
++            .unwrap();
++        peers
++            .update_bitfield(b, empty_bitfield(), TOTAL_PIECES)
++            .unwrap();
++        assert_eq!(live_seeders(&peers), (1, 1));
++
++        peers
++            .update_bitfield(b, full_bitfield(), TOTAL_PIECES)
++            .unwrap();
++        assert_eq!(live_seeders(&peers), (2, 2));
++
++        peers.drop_peer(a).unwrap();
++        assert_eq!(live_seeders(&peers), (1, 1));
++    }
++}
+diff --git a/src/torrent_state/live/peers/stats/mod.rs b/src/torrent_state/live/peers/stats/mod.rs
+index de83b29..05ff5f5 100644
+--- a/src/torrent_state/live/peers/stats/mod.rs
++++ b/src/torrent_state/live/peers/stats/mod.rs
+@@ -16,6 +16,7 @@ gen_stats!(AggregatePeerStatsAtomic AggregatePeerStats, [
+     live_tcp u32,
+     live_utp u32,
+     live_socks u32,
++    live_seeders u32,
+     seen u32,
+     dead u32,
+     not_needed u32,
+@@ -44,6 +45,9 @@ impl AggregatePeerStatsAtomic {
+     pub(crate) fn inc(&self, state: &PeerState) {
+         if let PeerState::Live(l) = state {
+             atomic_inc(self.live_kind_counter(l));
++            if l.seeder {
++                atomic_inc(&self.live_seeders);
++            }
+         }
+         atomic_inc(self.counter(state));
+     }
+@@ -51,10 +55,21 @@ impl AggregatePeerStatsAtomic {
+     pub(crate) fn dec(&self, state: &PeerState) {
+         if let PeerState::Live(l) = state {
+             atomic_dec(self.live_kind_counter(l));
++            if l.seeder {
++                atomic_dec(&self.live_seeders);
++            }
+         }
+         atomic_dec(self.counter(state));
+     }
+ 
++    pub(crate) fn seeder_flag_changed(&self, seeder: bool) {
++        if seeder {
++            atomic_inc(&self.live_seeders);
++        } else {
++            atomic_dec(&self.live_seeders);
++        }
++    }
++
+     pub(crate) fn incdec(&self, old: &PeerState, new: &PeerState) {
+         self.dec(old);
+         self.inc(new);
+diff --git a/src/torrent_state/mod.rs b/src/torrent_state/mod.rs
+index cfe483c..66780c3 100644
+--- a/src/torrent_state/mod.rs
++++ b/src/torrent_state/mod.rs
+@@ -112,6 +112,7 @@ pub(crate) struct ManagedTorrentOptions {
+     pub force_tracker_interval: Option<Duration>,
+     pub peer_connect_timeout: Option<Duration>,
+     pub peer_read_write_timeout: Option<Duration>,
++    pub peer_max_request_window: Option<usize>,
+     pub allow_overwrite: bool,
+     pub output_folder: PathBuf,
+     pub ratelimits: LimitsConfig,
+@@ -139,6 +140,8 @@ pub struct TorrentMetadata {
+     pub torrent_bytes: Bytes,
+     pub info_bytes: Bytes,
+     pub file_infos: FileInfos,
++    /// Top-level "comment" field from the .torrent metainfo, if present.
++    pub comment: Option<ByteBufOwned>,
+ }
+ 
+ impl TorrentMetadata {
+@@ -146,6 +149,7 @@ impl TorrentMetadata {
+         info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
+         torrent_bytes: Bytes,
+         info_bytes: Bytes,
++        comment: Option<ByteBufOwned>,
+     ) -> anyhow::Result<Self> {
+         let file_infos = info
+             .iter_file_details_ext()
+@@ -165,6 +169,7 @@ impl TorrentMetadata {
+             torrent_bytes,
+             info_bytes,
+             file_infos,
++            comment,
+         })
+     }
+ 
+diff --git a/src/torrent_state/stats.rs b/src/torrent_state/stats.rs
+index 74f0a48..161ee4d 100644
+--- a/src/torrent_state/stats.rs
++++ b/src/torrent_state/stats.rs
+@@ -190,6 +190,13 @@ fn format_seconds_to_time(seconds: u64, f: &mut core::fmt::Formatter<'_>) -> cor
+ 
+ pub struct DurationWithHumanReadable(Duration);
+ 
++impl DurationWithHumanReadable {
++    /// Returns the underlying duration in seconds.
++    pub fn as_secs(&self) -> u64 {
++        self.0.as_secs()
++    }
++}
++
+ impl core::fmt::Display for DurationWithHumanReadable {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
+         format_seconds_to_time(self.0.as_secs(), f)
+diff --git a/src/torrent_state/streaming.rs b/src/torrent_state/streaming.rs
+index 3615ed1..5326170 100644
+--- a/src/torrent_state/streaming.rs
++++ b/src/torrent_state/streaming.rs
+@@ -335,6 +335,9 @@ impl ManagedTorrent {
+     }
+ 
+     pub async fn stream(self: Arc<Self>, file_id: usize) -> anyhow::Result<FileStream> {
++        // Streams need live or paused state, so wait out the initial check
++        // of existing data instead of failing while it runs.
++        self.wait_until_initialized().await?;
+         let metadata = self
+             .metadata
+             .load_full()

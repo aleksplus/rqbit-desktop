@@ -21,6 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # librqbit is used from crates.io with local patches (cargo-patch-crate):
+      # materialize patched sources into target/patch/ before any build.
+      - name: Apply librqbit patch
+        run: |
+          cargo install patch-crate --locked
+          cargo patch-crate
+        shell: bash
+
       # The GPUI web stack needs nightly: gpui-pre-web's `multithreaded`
       # feature pulls wasm_thread, which uses `#![feature(...)]` with no
       # opt-out (see Makefile, WASM_TOOLCHAIN).

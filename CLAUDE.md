@@ -4,61 +4,52 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-rqbit is a BitTorrent client written in Rust and desktop app (GPUI). The library (`librqbit`) can also be used standalone.
+This is the **rqbit desktop client** repository: a native GPUI desktop app (plus a browser build of the same UI) on top of the rqbit BitTorrent engine. rqbit itself (`librqbit` and its sub-crates) is **not** part of this repo — it is used from crates.io, with local modifications applied as a cargo-patch-crate patch (see "rqbit dependency & patching" below).
+
+## Workspace Crates
+
+- `desktop-gpui` — the native desktop app (GPUI). Owns the librqbit session.
+- `app-daemon` — headless daemon exposing the session over a WebSocket protocol; bundled into desktop-gpui so one librqbit session serves both the native UI and the browser (it also embeds the built web client via `build.rs`).
+- `rqbit-ui` — shared UI component library (librqbit-free, tokio-free).
+- `rqbit-protocol` — wire protocol DTOs shared by UI and daemon (optional `librqbit` feature for `From<librqbit::…>` conversions).
+- `web-gpui` — the same UI compiled to wasm (browser client), served by the daemon.
 
 ## Build Commands
 
 ```bash
+# IMPORTANT: after cloning, materialize patched crate sources (see below)
+cargo patch-crate
+
 # Build (release)
 cargo build --release
 
-# Run tests
-cargo test                    # default members only
-cargo test --workspace        # all workspace members
+# Run the desktop app / headless daemon
+cargo run -p desktop-gpui     # or: make desktop
+cargo run -p app-daemon       # or: make daemon
 
-# Run a specific test
-cargo test <test_name>
-cargo test -p librqbit <test_name>   # test in specific crate
+# Build the wasm web client (nightly toolchain required, see Makefile)
+make web-client-build
+
+# Run tests
+cargo test                    # all workspace members
+cargo test -p rqbit-protocol <test_name>
 
 # Lint
 cargo fmt --all -- --check
 cargo clippy --all-targets
-
 ```
 
-### Log Files
+## rqbit dependency & patching (cargo-patch-crate)
 
-Both devserver and testserver write DEBUG-level logs to files:
-- **devserver**: `/tmp/rqbit-log` (env: `RQBIT_LOG_FILE`, `RQBIT_LOG_FILE_RUST_LOG`)
-- **testserver**: `/tmp/rqbit-simulate-traffic/testserver.log` (env: `TESTSERVER_LOG_FILE`, `TESTSERVER_LOG_FILE_RUST_LOG`)
+`librqbit = "=9.0.1"` comes from crates.io. Local API additions live in `patches/librqbit+9.0.1.patch`, applied by [cargo-patch-crate](https://github.com/mokeyish/cargo-patch-crate):
 
-**IMPORTANT:** NEVER read log files directly - they can grow to many gigabytes. ALWAYS filter with `rg` and limit output:
-```bash
-rg "192.168.1.100" /tmp/rqbit-log | head -50      # search for peer address
-rg "ERROR" /tmp/rqbit-log | tail -100             # recent errors
-rg "abc123" /tmp/rqbit-log | head -20             # search for torrent hash
-```
+- `[workspace.metadata.patch]` in the root `Cargo.toml` lists patched crates.
+- `[patch.crates-io]` points them at `./target/patch/<crate>-<version>`.
+- **`cargo patch-crate` must run once after cloning** (and after `cargo clean`, which wipes `target/patch/`) before any cargo build — it copies the pristine crate into `target/patch/` and applies `patches/*.patch`.
 
-## Architecture
+To modify librqbit: edit `target/patch/librqbit-9.0.1/` directly, then regenerate the patch file with `cargo patch-crate librqbit` and commit `patches/librqbit+9.0.1.patch`.
 
-### Core Library (`crates/librqbit`)
-The main library - the binary is just a thin CLI wrapper. Key components:
-
-- **Session** (`session.rs`): Central coordinator managing torrents, DHT, peer connections, and persistence. Entry point for the library.
-- **TorrentState** (`torrent_state/`): State machine for torrent lifecycle - initializing, live (downloading/seeding), paused
-- **Storage** (`storage/`): Pluggable storage backends (filesystem, mmap) with middleware support (caching, timing)
-
-### Supporting Crates
-- `bencode` - Bencode serialization/deserialization
-- `dht` - Distributed Hash Table (BEP-5)
-- `peer_binary_protocol` - BitTorrent peer wire protocol
-- `tracker_comms` - HTTP/UDP tracker communication
-- `upnp` - Port forwarding
-- `upnp-serve` - UPnP Media Server
-- `librqbit_core` - Shared types (magnet links, torrent metainfo, peer IDs)
-- `buffers` - Binary buffer utilities, small wrappers around bytes::Bytes and &[u8].
-- `sha1w` - SHA1 wrapper (supports crypto-hash or openssl backends)
-
+To upgrade librqbit (e.g. to 9.0.2): bump the version in the root `Cargo.toml`, extract the new source (`cargo patch-crate`), re-apply the local API diff (the fork's librqbit history lives in this repo's git history under `crates/librqbit` — see `git log -- crates/librqbit`), then `cargo patch-crate librqbit` to regenerate the patch and fix any fallout.
 
 ## Rust Development
 
@@ -67,37 +58,6 @@ The main library - the binary is just a thin CLI wrapper. Key components:
   before declaring work complete. Never claim compilation success without verifying.
 - When fixing compiler warnings, batch all related warnings together and fix them
   in a single pass. Run `cargo check 2>&1` to capture the full list before editing.
-
-## Desktop GPUI Client
-
-The `desktop-gpui` crate provides a native desktop GUI client for rqbit using GPUI (Zed's UI framework). It uses librqbit::Api to communicate with the session, without HTTP endpoints or Prometheus.
-
-### Building
-
-```bash
-# Build the desktop client
-cargo build -p desktop-gpui
-
-# Run the desktop client
-cargo run -p desktop-gpui
-```
-
-### Architecture
-
-- **librqbit::Api-only communication**: The desktop client communicates with the session via IPC, not HTTP.
-- **GPUI framework**: Uses Zed's GPUI for a native, high-performance UI.
-- **Shared state**: Configuration and session state are shared via `Arc<RwLock<SharedState>>`.
-
-### Development
-
-```bash
-# Run with hot reload (if supported)
-cargo run -p desktop-gpui
-
-# Check code
-cargo check -p desktop-gpui
-cargo clippy -p desktop-gpui
-```
 
 ## General Rules
 - Never declare a task complete until tests actually pass and compilation is verified.
@@ -112,7 +72,7 @@ cargo clippy -p desktop-gpui
   and info dicts, not v1. The spec explicitly requires BEP 52 compliance.
 
 ## Other directives
-- Use narsil mcp for code retrieval or search (do not fallback to rg/grep or find if narsil provides response value)
+- Use narsil mcp for code retrieval or search
 - Use context7 for documentation
 - Fetch https://longbridge.github.io/gpui-component/docs/ if needed.
 - If you need to resort to running shell commands, always use "rg" instead of "grep".

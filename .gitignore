@@ -1,11 +1,9 @@
 .bacon-locations
 /target
-/crates/*/target
-/crates/*/Cargo.lock
-/desktop/src-tauri/gen/
 .DS_Store
 /perf.data*
 /flamegraph.svg
 .claude
 .serena/
 node_modules
+.zcode
