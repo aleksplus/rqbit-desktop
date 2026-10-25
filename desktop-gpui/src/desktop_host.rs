@@ -10,6 +10,7 @@ use gpui::{AnyView, App, AppContext as _, Context, WeakEntity, Window};
 use rqbit_ui::host::{PickedTorrentFile, UiCapabilities, UiHost};
 use rqbit_ui::ui::add_torrent_dialog::AddTorrentEntry;
 use rqbit_ui::ui::main_panel::MainPanel;
+use tracing::warn;
 
 use crate::state::State;
 use crate::ui::settings_page::{SettingsPage, SettingsPageEvent};
@@ -43,14 +44,7 @@ impl UiHost for DesktopHost {
     }
 
     fn persist_theme(&self, mode: &str) {
-        let mut config = self.state.config();
-        config.theme = mode.to_string();
-        if let Err(e) = crate::config::write_config(&self.state.config_filename, &config) {
-            eprintln!("Error writing config for theme: {e:?}");
-        } else {
-            // Update the in-memory shared config so other views see the change.
-            self.state.shared().write().set_config(config);
-        }
+        self.state.set_theme(mode);
     }
 
     fn playlist_url(&self, torrent_id: u64) -> Option<String> {
@@ -105,7 +99,9 @@ impl UiHost for DesktopHost {
                                     bytes,
                                 });
                             }
-                            Err(e) => eprintln!("Error reading file {path:?}: {e}"),
+                            Err(e) => {
+                                warn!(path = %path.display(), error = %e, "error reading picked torrent file")
+                            }
                         }
                     }
                     Ok(files)

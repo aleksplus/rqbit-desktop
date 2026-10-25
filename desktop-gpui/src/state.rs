@@ -339,6 +339,24 @@ impl State {
         self.shared.read().config()
     }
 
+    /// Persist the theme ("light"/"dark"): update the shared config and the
+    /// config file. Theme is deliberately managed outside the settings page's
+    /// draft config (single writer): the titlebar toggle and the settings-page
+    /// switch both apply and persist immediately through this method, so they
+    /// can never clobber each other or be reverted by an Apply of a stale draft.
+    pub fn set_theme(&self, mode: &str) {
+        let mut config = self.shared.read().config();
+        if config.theme == mode {
+            return;
+        }
+        config.theme = mode.to_string();
+        if let Err(e) = write_config(&self.config_filename, &config) {
+            error!("error writing config: {:#}", e);
+            return;
+        }
+        self.shared.write().set_config(config);
+    }
+
     pub async fn configure(&self, config: RqbitDesktopConfig) -> Result<(), ApiError> {
         // Quick check under a brief read lock: if nothing changed, bail out.
         {
@@ -518,6 +536,28 @@ pub(crate) mod tests {
             Arc::ptr_eq(&before, &after),
             "unchanged config must not rebuild the session"
         );
+    }
+
+    /// `set_theme` swaps the theme in the shared config and persists the whole
+    /// config file — the single-writer path both the titlebar toggle and the
+    /// settings-page switch go through.
+    #[tokio::test]
+    async fn set_theme_updates_shared_and_file() {
+        let scratch = crate::folder_watcher::tests::TempDir::new("theme");
+        let config_filename = scratch.path().join("config.json");
+        let config_filename = config_filename.to_str().unwrap().to_owned();
+        let state = test_state(quiet_config(), config_filename.clone()).await;
+
+        assert_eq!(state.config().theme, "light");
+        state.set_theme("dark");
+        assert_eq!(state.config().theme, "dark");
+
+        let persisted = crate::config::read_config(&config_filename).unwrap();
+        assert_eq!(persisted.theme, "dark");
+
+        // Setting the same theme again is a no-op (and writes nothing).
+        state.set_theme("dark");
+        assert_eq!(state.config().theme, "dark");
     }
 
     /// Same as above but with the "full-fat" config a real user has: TCP

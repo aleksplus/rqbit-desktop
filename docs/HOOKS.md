@@ -1,7 +1,7 @@
 # Hooks — Specification of the current implementation and API contract
 
 Scope: the **Hooks** settings page built by `hook_groups`
-(`desktop-gpui/src/ui/settings_page.rs:947`), the config model it edits, the
+(`desktop-gpui/src/ui/settings_page.rs:816`), the config model it edits, the
 apply/persist lifecycle, and the outbound HTTP contract that the page's
 description points to ("see the hooks module docs for the payload contract").
 Everything below describes the code as it is today; nothing here is a proposal.
@@ -10,7 +10,7 @@ Source map:
 
 | Concern | File |
 |---|---|
-| Settings UI (`hook_groups` + field helpers) | `desktop-gpui/src/ui/settings_page.rs:658-1007`, page wiring at `:1297-1304` |
+| Settings UI (`hook_groups` + field helpers) | `desktop-gpui/src/ui/settings_page.rs:502-888`, page wiring at `:1241-1248` |
 | Config model (`HookConfig`, `HttpMethod`, `RqbitDesktopConfigHooks`) | `desktop-gpui/src/config.rs:17-61` |
 | Event enum + module docs | `desktop-gpui/src/hooks/mod.rs` |
 | JSON payloads / `file_selection` response | `desktop-gpui/src/hooks/payload.rs` |
@@ -18,22 +18,22 @@ Source map:
 | Dispatcher + completion watcher | `desktop-gpui/src/hooks/dispatcher.rs` |
 | `torrent_columns` provider (poller, store, response parsing) | `app-daemon/src/columns.rs` (`ColumnsProvider`) |
 | Custom-column wire types + push frame | `rqbit-protocol/src/types.rs` (`CustomColumnsState`), `messages.rs` (`PushUpdate::CustomColumns`) |
-| Call sites | `state.rs:241`, `local_client.rs:47,203`, `folder_watcher.rs:203`, `desktop_host.rs:117` |
+| Call sites | `state.rs:241`, `local_client.rs:47,203`, `folder_watcher.rs:203`, `desktop_host.rs:116` |
 
 ---
 
 ## 1. `hook_groups` — function contract
 
 ```rust
-type ConfigArc = Arc<parking_lot::RwLock<RqbitDesktopConfig>>;   // settings_page.rs:21
+type ConfigArc = Arc<parking_lot::RwLock<RqbitDesktopConfig>>;   // settings_page.rs:24
 
-fn hook_groups(config: ConfigArc) -> Vec<SettingGroup>           // settings_page.rs:947
+fn hook_groups(config: ConfigArc) -> Vec<SettingGroup>           // settings_page.rs:816
 ```
 
 * **Visibility**: private to `settings_page`. Its only caller is
   `SettingsPage::render`, which does
   `SettingPage::new("Hooks").description(…).groups(hook_groups(config.clone()))`
-  (`settings_page.rs:1298-1304`). It therefore runs **on every render** of the
+  (`settings_page.rs:1242-1248`). It therefore runs **on every render** of the
   settings page.
 * **Input**: the page-local config handle (not the live session config — see §4).
   The function takes a single read lock to compute
@@ -64,26 +64,28 @@ Items, in fixed order:
 | 2 | `Name` | `SettingField::input` | `h.name` | `h.name = v` | vertical |
 | 3 | `URL` | `SettingField::input` | `h.url` | `h.url = v` (no validation) | vertical; "e.g. http://127.0.0.1:8080/hook" |
 | 4 | `Method` | `SettingField::dropdown` with options `("post","POST")`, `("get","GET")` | `h.method` → `"post"`/`"get"` | `"get"` → `Get`, anything else → `Post` | horizontal |
-| 5 | `Timeout (seconds)` | `SettingField::input` | `h.timeout_secs.to_string()` | parse as `u64`; **invalid input is ignored**; valid input is clamped to `max(1)` | horizontal |
-| 6 | `Events` | `SettingField::render` → row of 4 checkboxes | `h.events.contains(e)` | toggle: remove if present, else `push` | vertical; "Which lifecycle events trigger this hook." |
-| 7 | `Headers (one per line, "Key: Value")` | `SettingField::render` → auto-growing textarea (1–6 rows) | `headers_to_text(h)` | `set_headers_text(h, text)` | vertical |
-| 8 | `""` (empty label) | `SettingField::render` → outline button **Remove Hook** | — | `remove_hook(ix)` | vertical |
+| 5 | `Timeout (seconds)` | `SettingField::number_input` (min 1, max 86400) | `h.timeout_secs as f64` | `h.timeout_secs = v as u64`; unparsable intermediates are not committed while typing, out-of-range values are clamped by the input widget on blur | horizontal |
+| 6 | `Poll (seconds)` | `SettingField::number_input` (min 2, max 86400) | `h.poll_secs as f64` | `h.poll_secs = v as u64` | horizontal; "Polling interval for the "Torrent columns" event." |
+| 7 | `Events` | `SettingField::render` → row of 4 checkboxes | `h.events.contains(e)` | toggle: remove if present, else `push` | vertical; "Which lifecycle events trigger this hook." |
+| 8 | `Headers (one per line, "Key: Value")` | `SettingField::render` → auto-growing textarea (1–6 rows) | `headers_to_text(h)` | `set_headers_text(h, text)` | vertical |
+| 9 | `""` (empty label) | `SettingField::render` → outline button **Remove Hook** | — | `remove_hook(ix)` | vertical |
 
 Field helper signatures (all in `settings_page.rs`):
 
 ```rust
-fn hook_switch_field(config, ix, get: fn(&HookConfig)->bool,   set: fn(&mut HookConfig, bool))         -> SettingField<bool>          // :705
-fn hook_input_field (config, ix, get: fn(&HookConfig)->String, set: fn(&mut HookConfig, SharedString)) -> SettingField<SharedString>  // :719
-fn hook_method_field(config, ix) -> SettingField<SharedString>                                                                        // :734
-fn hook_events_field (config, ix) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement                                      // :764
-fn hook_headers_field(config, ix) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement                                      // :798
-fn hook_remove_field (config, ix) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement                                      // :884
-fn add_hook_field    (config)     -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement                                      // :903
+fn hook_switch_field(config, ix, get: fn(&HookConfig)->bool,   set: fn(&mut HookConfig, bool))         -> SettingField<bool>          // :549
+fn hook_input_field (config, ix, get: fn(&HookConfig)->String, set: fn(&mut HookConfig, SharedString)) -> SettingField<SharedString>  // :563
+fn hook_number_field(config, ix, min: f64, max: f64, get: fn(&HookConfig)->f64, set: fn(&mut HookConfig, f64)) -> SettingField<f64>    // :577
+fn hook_method_field(config, ix) -> SettingField<SharedString>                                                                        // :599
+fn hook_events_field (config, ix) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement                                      // :629
+fn hook_headers_field(config, ix) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement                                      // :663
+fn hook_remove_field (config, ix) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement                                      // :749
+fn add_hook_field    (config)     -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement                                      // :768
 ```
 
-Getter/setter pairs passed into the generic helpers (`:918-943`):
+Getter/setter pairs passed into the generic helpers (`:783-810`):
 `get/set_hook_enabled`, `get/set_hook_name`, `get/set_hook_url`,
-`get/set_hook_timeout`.
+`get/set_hook_timeout`, `get/set_hook_poll`.
 
 ### 1.2 Events checkboxes (`hook_events_field`)
 
@@ -101,14 +103,14 @@ Getter/setter pairs passed into the generic helpers (`:918-943`):
   and holds `HookInputState { input: Entity<TextareaState>, _subscription }`.
   The subscription listens for `InputEvent::Change` and writes the parsed
   headers into the config on every change.
-* **Text → map** (`set_headers_text`, `:866`): for each line — trim; skip empty;
+* **Text → map** (`set_headers_text`, `:731`): for each line — trim; skip empty;
   `split_once(':')`; trim key and value; skip empty key; insert into a fresh
   `BTreeMap` (later duplicate keys overwrite earlier ones). Lines **without a
   colon are dropped**. An empty value is allowed (`"X-Flag:"` → `"X-Flag" = ""`).
   The whole map is replaced on each change.
-* **Map → text** (`headers_to_text`, `:858`): `"{k}: {v}"` per entry joined by
+* **Map → text** (`headers_to_text`, `:723`): `"{k}: {v}"` per entry joined by
   `"\n"`, in `BTreeMap` (sorted-key) order.
-* **Sync rule** (`:831-839`): on every render, if the textarea's current value
+* **Sync rule** (`:696-704`): on every render, if the textarea's current value
   differs from `headers_to_text(config)` the textarea is overwritten with the
   canonical text. The intent (per the comment) is to follow index shifts after
   add/remove, but the comparison is unconditional — see §7, item 1.
@@ -122,14 +124,16 @@ Getter/setter pairs passed into the generic helpers (`:918-943`):
 | Remove button | `hook-{ix}-remove` |
 | Add button | `hooks-add` |
 
-The Enabled / Name / URL / Method / Timeout fields are not given explicit IDs by
-`hook_groups`; they use whatever gpui-component assigns.
+The Enabled / Name / URL / Method fields are not given explicit IDs by
+`hook_groups`; they use whatever gpui-component assigns. Timeout / Poll are
+`NumberInput` fields (no explicit ID either; their backing state is keyed
+`number-state-{page_ix}-{group_ix}-{item_ix}` by gpui-component).
 
 ---
 
 ## 2. Page-local mutation helpers
 
-All hook edits go through four helpers (`settings_page.rs:660-703`) that make
+All hook edits go through four helpers (`settings_page.rs:506-547`) that make
 index staleness safe:
 
 ```rust
@@ -220,7 +224,7 @@ Rules:
 
 1. **Open**: `SettingsPage::new` snapshots the live config
    (`state.shared().read().config()`) into a page-local `ConfigArc`
-   (`settings_page.rs:50-59`). `hook_groups` and every field closure operate on
+   (`settings_page.rs:53-62`). `hook_groups` and every field closure operate on
    this copy only; the running session is untouched while editing.
 2. **Back** without Apply: the page-local copy is dropped; all hook edits are
    discarded.
@@ -462,7 +466,7 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
 ## 7. Observed caveats and limitations (current behavior, not proposals)
 
 1. **Headers textarea normalization.** The sync at
-   `settings_page.rs:831-839` overwrites the textarea whenever its text differs
+   `settings_page.rs:696-704` overwrites the textarea whenever its text differs
    from the canonical `headers_to_text` form. Because lines without a colon are
    dropped by the parser, any page re-render while a header line is still being
    typed (before its `:`) would canonicalize the text and discard the partial

@@ -7,7 +7,10 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     scroll::ScrollableElement,
-    setting::{RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    setting::{
+        NumberFieldOptions, RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage,
+        Settings,
+    },
     v_flex,
 };
 use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
@@ -68,16 +71,13 @@ impl SettingsPage {
         }
         self.apply_error = None;
 
-        let config = self.config.read().clone();
+        let mut config = self.config.read().clone();
 
-        // Apply the theme from config immediately so the UI updates without
-        // waiting for the session reconfigure.
-        let theme_mode = if config.theme == "dark" {
-            ThemeMode::Dark
-        } else {
-            ThemeMode::Light
-        };
-        Theme::change(theme_mode, Some(_window), cx);
+        // Theme is deliberately not owned by the draft: the switches apply and
+        // persist it immediately (see `theme_switch_field`), so take the live
+        // value here — Apply can neither clobber a concurrent toggle nor be
+        // reverted by one.
+        config.theme = self.state.config().theme;
 
         if let Err(e) = write_config(&self.state.config_filename, &config) {
             self.apply_error = Some(format!("Error writing config: {e:#}").into());
@@ -146,28 +146,74 @@ fn input_field(
     )
 }
 
-/// State backing the download-location field: the text input plus the
+fn number_field(
+    config: ConfigArc,
+    min: f64,
+    max: f64,
+    get: fn(&RqbitDesktopConfig) -> f64,
+    set: fn(&mut RqbitDesktopConfig, f64),
+) -> SettingField<f64> {
+    let cfg_get = config.clone();
+    let cfg_set = config;
+    SettingField::number_input(
+        NumberFieldOptions {
+            min,
+            max,
+            ..Default::default()
+        },
+        move |_| get(&cfg_get.read()),
+        move |val: f64, _| set(&mut cfg_set.write(), val),
+    )
+}
+
+/// A live theme switch: applies and persists the choice immediately, exactly
+/// like the titlebar toggle — the theme is not part of the page's draft
+/// config, so Apply can neither clobber a concurrent toggle nor be reverted
+/// by one (see [`State::set_theme`]).
+fn theme_switch_field(state: Arc<State>) -> SettingField<bool> {
+    let state_get = state.clone();
+    let state_set = state;
+    SettingField::switch(
+        move |_| state_get.config().theme == "dark",
+        move |dark: bool, cx: &mut App| {
+            let mode = if dark {
+                ThemeMode::Dark
+            } else {
+                ThemeMode::Light
+            };
+            Theme::change(mode, None, cx);
+            state_set.set_theme(mode.name());
+        },
+    )
+}
+
+/// State backing a folder-location field: the text input plus the
 /// subscription that writes typed changes back into the config.
-struct DlInputState {
+struct FolderInputState {
     input: Entity<InputState>,
     _subscription: gpui::Subscription,
 }
 
-/// A download-location field that pairs a text input with a **Browse…** button.
+/// A folder-location field that pairs a text input with a **Browse…** button.
 ///
 /// The button opens the native folder picker (macOS Finder / open panel).
 /// On macOS this also triggers the OS "grant access to this folder" prompt the
 /// first time, and the granted access persists for the app — so the user is
 /// only asked once.
-fn download_location_field(
+fn folder_field(
     config: ConfigArc,
+    key: &'static str,
+    input_id: &'static str,
+    button_id: &'static str,
+    get: fn(&RqbitDesktopConfig) -> String,
+    set: fn(&mut RqbitDesktopConfig, SharedString),
+    prompt: &'static str,
 ) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement {
     move |options, window, cx| {
-        let value = get_dl_location(&config.read());
-        let set = set_dl_location;
+        let value = get(&config.read());
         let cfg = config.clone();
 
-        let state_entity = window.use_keyed_state("download-location-input", cx, {
+        let state_entity = window.use_keyed_state(key, cx, {
             let value = value.clone();
             move |window, cx| {
                 let input = cx.new(|cx| InputState::new(window, cx).default_value(value.clone()));
@@ -180,7 +226,7 @@ fn download_location_field(
                         }
                     }
                 });
-                DlInputState {
+                FolderInputState {
                     input,
                     _subscription,
                 }
@@ -203,13 +249,13 @@ fn download_location_field(
             .gap_2()
             .child(
                 Input::new(&state.input)
-                    .id("download-location")
+                    .id(input_id)
                     .flex_1()
                     .disabled(options.is_disabled())
                     .with_size(options.size()),
             )
             .child(
-                Button::new("browse-download-folder")
+                Button::new(button_id)
                     .label("Browse…")
                     .disabled(options.is_disabled())
                     .on_click({
@@ -219,183 +265,7 @@ fn download_location_field(
                                 files: false,
                                 directories: true,
                                 multiple: false,
-                                prompt: Some("Select download folder".into()),
-                            });
-                            let cfg = cfg.clone();
-                            cx.spawn(async move |cx| {
-                                if let Ok(Ok(Some(paths))) = rx.await
-                                    && let Some(path) = paths.into_iter().next()
-                                {
-                                    set(
-                                        &mut cfg.write(),
-                                        path.to_string_lossy().into_owned().into(),
-                                    );
-                                    cx.update(|cx| cx.refresh_windows());
-                                }
-                            })
-                            .detach();
-                        }
-                    }),
-            )
-            .into_any_element()
-    }
-}
-
-/// State backing the load-torrents-location input.
-struct LoadTlsInputState {
-    input: Entity<InputState>,
-    _subscription: gpui::Subscription,
-}
-
-/// A load-torrents-location field that pairs a text input with a Browse button.
-fn load_torrents_location_field(
-    config: ConfigArc,
-) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement {
-    move |options, window, cx| {
-        let value = get_load_torrents_location(&config.read());
-        let set = set_load_torrents_location;
-        let cfg = config.clone();
-
-        let state_entity = window.use_keyed_state("load-torrents-location-input", cx, {
-            let value = value.clone();
-            move |window, cx| {
-                let input = cx.new(|cx| InputState::new(window, cx).default_value(value.clone()));
-                let _subscription = cx.subscribe(&input, {
-                    let cfg = cfg.clone();
-                    move |_, input, event: &InputEvent, cx| {
-                        if matches!(event, InputEvent::Change) {
-                            let v = input.read(cx).value();
-                            set(&mut cfg.write(), v);
-                        }
-                    }
-                });
-                LoadTlsInputState {
-                    input,
-                    _subscription,
-                }
-            }
-        });
-
-        // Keep the displayed text in sync when config changes externally.
-        state_entity.update(cx, |state, cx| {
-            if state.input.read(cx).value() != value {
-                state.input.update(cx, |input, cx| {
-                    input.set_value(value.clone(), window, cx);
-                });
-            }
-        });
-
-        let state = state_entity.read(cx);
-
-        h_flex()
-            .gap_2()
-            .child(
-                Input::new(&state.input)
-                    .id("load-torrents-location")
-                    .flex_1()
-                    .disabled(options.is_disabled())
-                    .with_size(options.size()),
-            )
-            .child(
-                Button::new("browse-load-torrents-folder")
-                    .label("Browse…")
-                    .disabled(options.is_disabled())
-                    .on_click({
-                        let cfg = config.clone();
-                        move |_, _window, cx| {
-                            let rx = cx.prompt_for_paths(PathPromptOptions {
-                                files: false,
-                                directories: true,
-                                multiple: false,
-                                prompt: Some("Select load torrent folder".into()),
-                            });
-                            let cfg = cfg.clone();
-                            cx.spawn(async move |cx| {
-                                if let Ok(Ok(Some(paths))) = rx.await
-                                    && let Some(path) = paths.into_iter().next()
-                                {
-                                    set(
-                                        &mut cfg.write(),
-                                        path.to_string_lossy().into_owned().into(),
-                                    );
-                                    cx.update(|cx| cx.refresh_windows());
-                                }
-                            })
-                            .detach();
-                        }
-                    }),
-            )
-            .into_any_element()
-    }
-}
-
-/// State backing the move-torrents-location input.
-struct MoveTlsInputState {
-    input: Entity<InputState>,
-    _subscription: gpui::Subscription,
-}
-
-/// A move-torrents-location field that pairs a text input with a Browse button.
-fn move_torrents_location_field(
-    config: ConfigArc,
-) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement {
-    move |options, window, cx| {
-        let value = get_move_torrents_location(&config.read());
-        let set = set_move_torrents_location;
-        let cfg = config.clone();
-
-        let state_entity = window.use_keyed_state("move-torrents-location-input", cx, {
-            let value = value.clone();
-            move |window, cx| {
-                let input = cx.new(|cx| InputState::new(window, cx).default_value(value.clone()));
-                let _subscription = cx.subscribe(&input, {
-                    let cfg = cfg.clone();
-                    move |_, input, event: &InputEvent, cx| {
-                        if matches!(event, InputEvent::Change) {
-                            let v = input.read(cx).value();
-                            set(&mut cfg.write(), v);
-                        }
-                    }
-                });
-                MoveTlsInputState {
-                    input,
-                    _subscription,
-                }
-            }
-        });
-
-        // Keep the displayed text in sync when config changes externally.
-        state_entity.update(cx, |state, cx| {
-            if state.input.read(cx).value() != value {
-                state.input.update(cx, |input, cx| {
-                    input.set_value(value.clone(), window, cx);
-                });
-            }
-        });
-
-        let state = state_entity.read(cx);
-
-        h_flex()
-            .gap_2()
-            .child(
-                Input::new(&state.input)
-                    .id("move-torrents-location")
-                    .flex_1()
-                    .disabled(options.is_disabled())
-                    .with_size(options.size()),
-            )
-            .child(
-                Button::new("browse-move-torrents-folder")
-                    .label("Browse…")
-                    .disabled(options.is_disabled())
-                    .on_click({
-                        let cfg = config.clone();
-                        move |_, _window, cx| {
-                            let rx = cx.prompt_for_paths(PathPromptOptions {
-                                files: false,
-                                directories: true,
-                                multiple: false,
-                                prompt: Some("Select move torrent folder".into()),
+                                prompt: Some(prompt.into()),
                             });
                             let cfg = cfg.clone();
                             cx.spawn(async move |cx| {
@@ -481,32 +351,25 @@ fn set_fastresume(c: &mut RqbitDesktopConfig, v: bool) {
     c.persistence.fastresume = v;
 }
 
-fn get_dl_rate(c: &RqbitDesktopConfig) -> String {
+fn get_dl_rate(c: &RqbitDesktopConfig) -> f64 {
     c.ratelimits
         .download_bps
-        .map(|v| v.to_string())
-        .unwrap_or_default()
+        .map(|v| v.get() as f64)
+        .unwrap_or(0.)
 }
-fn set_dl_rate(c: &mut RqbitDesktopConfig, v: SharedString) {
-    c.ratelimits.download_bps = v
-        .parse::<u32>()
-        .ok()
-        .filter(|&v| v > 0)
-        .and_then(NonZeroU32::new);
+fn set_dl_rate(c: &mut RqbitDesktopConfig, v: f64) {
+    // 0 = unlimited; the input widget clamps to u32::MAX before we get here.
+    c.ratelimits.download_bps = NonZeroU32::new(v as u32);
 }
 
-fn get_ul_rate(c: &RqbitDesktopConfig) -> String {
+fn get_ul_rate(c: &RqbitDesktopConfig) -> f64 {
     c.ratelimits
         .upload_bps
-        .map(|v| v.to_string())
-        .unwrap_or_default()
+        .map(|v| v.get() as f64)
+        .unwrap_or(0.)
 }
-fn set_ul_rate(c: &mut RqbitDesktopConfig, v: SharedString) {
-    c.ratelimits.upload_bps = v
-        .parse::<u32>()
-        .ok()
-        .filter(|&v| v > 0)
-        .and_then(NonZeroU32::new);
+fn set_ul_rate(c: &mut RqbitDesktopConfig, v: f64) {
+    c.ratelimits.upload_bps = NonZeroU32::new(v as u32);
 }
 
 fn get_tcp_listen(c: &RqbitDesktopConfig) -> bool {
@@ -530,13 +393,11 @@ fn set_upnp_fwd(c: &mut RqbitDesktopConfig, v: bool) {
     c.connections.enable_upnp_port_forward = v;
 }
 
-fn get_listen_port(c: &RqbitDesktopConfig) -> String {
-    c.connections.listen_port.to_string()
+fn get_listen_port(c: &RqbitDesktopConfig) -> f64 {
+    c.connections.listen_port as f64
 }
-fn set_listen_port(c: &mut RqbitDesktopConfig, v: SharedString) {
-    if let Ok(port) = v.parse::<u16>() {
-        c.connections.listen_port = port;
-    }
+fn set_listen_port(c: &mut RqbitDesktopConfig, v: f64) {
+    c.connections.listen_port = v as u16;
 }
 
 fn get_tcp_outgoing(c: &RqbitDesktopConfig) -> bool {
@@ -553,22 +414,18 @@ fn set_socks(c: &mut RqbitDesktopConfig, v: SharedString) {
     c.connections.socks_proxy = v.to_string();
 }
 
-fn get_peer_ct(c: &RqbitDesktopConfig) -> String {
-    c.connections.peer_connect_timeout.as_secs().to_string()
+fn get_peer_ct(c: &RqbitDesktopConfig) -> f64 {
+    c.connections.peer_connect_timeout.as_secs() as f64
 }
-fn set_peer_ct(c: &mut RqbitDesktopConfig, v: SharedString) {
-    if let Ok(secs) = v.parse::<u64>() {
-        c.connections.peer_connect_timeout = std::time::Duration::from_secs(secs);
-    }
+fn set_peer_ct(c: &mut RqbitDesktopConfig, v: f64) {
+    c.connections.peer_connect_timeout = std::time::Duration::from_secs(v as u64);
 }
 
-fn get_peer_rw(c: &RqbitDesktopConfig) -> String {
-    c.connections.peer_read_write_timeout.as_secs().to_string()
+fn get_peer_rw(c: &RqbitDesktopConfig) -> f64 {
+    c.connections.peer_read_write_timeout.as_secs() as f64
 }
-fn set_peer_rw(c: &mut RqbitDesktopConfig, v: SharedString) {
-    if let Ok(secs) = v.parse::<u64>() {
-        c.connections.peer_read_write_timeout = std::time::Duration::from_secs(secs);
-    }
+fn set_peer_rw(c: &mut RqbitDesktopConfig, v: f64) {
+    c.connections.peer_read_write_timeout = std::time::Duration::from_secs(v as u64);
 }
 
 fn get_http_disable(c: &RqbitDesktopConfig) -> bool {
@@ -625,13 +482,11 @@ fn set_web_view_addr(c: &mut RqbitDesktopConfig, v: SharedString) {
     }
 }
 
-fn get_web_view_port(c: &RqbitDesktopConfig) -> String {
-    c.web_view.listen_addr.port().to_string()
+fn get_web_view_port(c: &RqbitDesktopConfig) -> f64 {
+    c.web_view.listen_addr.port() as f64
 }
-fn set_web_view_port(c: &mut RqbitDesktopConfig, v: SharedString) {
-    if let Ok(port) = v.parse::<u16>() {
-        c.web_view.listen_addr.set_port(port);
-    }
+fn set_web_view_port(c: &mut RqbitDesktopConfig, v: f64) {
+    c.web_view.listen_addr.set_port(v as u16);
 }
 
 /// Get the current move-torrents-folder configuration value.
@@ -642,17 +497,6 @@ fn get_move_torrents_location(c: &RqbitDesktopConfig) -> String {
 /// Set the move-torrents-folder configuration value.
 fn set_move_torrents_location(c: &mut RqbitDesktopConfig, v: SharedString) {
     c.move_torrents_folder = v.to_string().into();
-}
-
-fn get_theme_dark(c: &RqbitDesktopConfig) -> bool {
-    c.theme == "dark"
-}
-fn set_theme_dark(c: &mut RqbitDesktopConfig, v: bool) {
-    c.theme = if v {
-        "dark".to_string()
-    } else {
-        "light".to_string()
-    };
 }
 
 // ── Hooks ──────────────────────────────────────────────────────────────────
@@ -727,6 +571,27 @@ fn hook_input_field(
     SettingField::input(
         move |_| with_hook(&cfg_get, ix, get, String::new()).into(),
         move |val, _| mutate_hook(&cfg_set, ix, |h| set(h, val)),
+    )
+}
+
+fn hook_number_field(
+    config: ConfigArc,
+    ix: usize,
+    min: f64,
+    max: f64,
+    get: fn(&HookConfig) -> f64,
+    set: fn(&mut HookConfig, f64),
+) -> SettingField<f64> {
+    let cfg_get = config.clone();
+    let cfg_set = config;
+    SettingField::number_input(
+        NumberFieldOptions {
+            min,
+            max,
+            ..Default::default()
+        },
+        move |_| with_hook(&cfg_get, ix, get, min),
+        move |val: f64, _| mutate_hook(&cfg_set, ix, |h| set(h, val)),
     )
 }
 
@@ -933,21 +798,17 @@ fn get_hook_url(h: &HookConfig) -> String {
 fn set_hook_url(h: &mut HookConfig, v: SharedString) {
     h.url = v.to_string();
 }
-fn get_hook_timeout(h: &HookConfig) -> String {
-    h.timeout_secs.to_string()
+fn get_hook_timeout(h: &HookConfig) -> f64 {
+    h.timeout_secs as f64
 }
-fn set_hook_timeout(h: &mut HookConfig, v: SharedString) {
-    if let Ok(secs) = v.parse::<u64>() {
-        h.timeout_secs = secs.max(1);
-    }
+fn set_hook_timeout(h: &mut HookConfig, v: f64) {
+    h.timeout_secs = v as u64;
 }
-fn get_hook_poll(h: &HookConfig) -> String {
-    h.poll_secs.to_string()
+fn get_hook_poll(h: &HookConfig) -> f64 {
+    h.poll_secs as f64
 }
-fn set_hook_poll(h: &mut HookConfig, v: SharedString) {
-    if let Ok(secs) = v.parse::<u64>() {
-        h.poll_secs = secs.max(2);
-    }
+fn set_hook_poll(h: &mut HookConfig, v: f64) {
+    h.poll_secs = v as u64;
 }
 
 /// Build the groups of the Hooks settings page: one per configured hook,
@@ -982,11 +843,18 @@ fn hook_groups(config: ConfigArc) -> Vec<SettingGroup> {
                 SettingItem::new("Method", hook_method_field(config.clone(), ix)),
                 SettingItem::new(
                     "Timeout (seconds)",
-                    hook_input_field(config.clone(), ix, get_hook_timeout, set_hook_timeout),
+                    hook_number_field(
+                        config.clone(),
+                        ix,
+                        1.,
+                        86400.,
+                        get_hook_timeout,
+                        set_hook_timeout,
+                    ),
                 ),
                 SettingItem::new(
                     "Poll (seconds)",
-                    hook_input_field(config.clone(), ix, get_hook_poll, set_hook_poll),
+                    hook_number_field(config.clone(), ix, 2., 86400., get_hook_poll, set_hook_poll),
                 )
                 .description("Polling interval for the \"Torrent columns\" event."),
                 SettingItem::new(
@@ -1100,12 +968,28 @@ impl Render for SettingsPage {
                                     .group(SettingGroup::new().title("Download").items(vec![
                                         SettingItem::new(
                                             "Default download folder",
-                                            SettingField::render(download_location_field(config.clone())),
+                                            SettingField::render(folder_field(
+                                                config.clone(),
+                                                "download-location-input",
+                                                "download-location",
+                                                "browse-download-folder",
+                                                get_dl_location,
+                                                set_dl_location,
+                                                "Select download folder",
+                                            )),
                                         )
                                         .layout(Axis::Vertical),
                                         SettingItem::new(
                                             "Autoload torrents from folder",
-                                            SettingField::render(load_torrents_location_field(config.clone())),
+                                            SettingField::render(folder_field(
+                                                config.clone(),
+                                                "load-torrents-location-input",
+                                                "load-torrents-location",
+                                                "browse-load-torrents-folder",
+                                                get_load_torrents_location,
+                                                set_load_torrents_location,
+                                                "Select load torrent folder",
+                                            )),
                                         )
                                         .layout(Axis::Vertical)
                                         .description(
@@ -1120,7 +1004,15 @@ impl Render for SettingsPage {
                                         ),
                                         SettingItem::new(
                                             "Move added torrents to folder",
-                                            SettingField::render(move_torrents_location_field(config.clone())),
+                                            SettingField::render(folder_field(
+                                                config.clone(),
+                                                "move-torrents-location-input",
+                                                "move-torrents-location",
+                                                "browse-move-torrents-folder",
+                                                get_move_torrents_location,
+                                                set_move_torrents_location,
+                                                "Select move torrent folder",
+                                            )),
                                         )
                                         .layout(Axis::Vertical)
                                         .description(
@@ -1131,9 +1023,12 @@ impl Render for SettingsPage {
                                         SettingGroup::new().title("Appearance").items(vec![
                                             SettingItem::new(
                                                 "Dark theme",
-                                                switch_field(config.clone(), get_theme_dark, set_theme_dark),
+                                                theme_switch_field(self.state.clone()),
                                             )
-                                            .description("Use a dark color scheme for the application UI."),
+                                            .description(
+                                                "Use a dark color scheme for the application UI. \
+                                                 Applies and persists immediately.",
+                                            ),
                                         ]),
                                     ),
                                 // ── DHT ──
@@ -1180,12 +1075,24 @@ impl Render for SettingsPage {
                                         SettingGroup::new().title("Rate Limits").items(vec![
                                             SettingItem::new(
                                                 "Download rate limit (bytes/sec, 0 = unlimited)",
-                                                input_field(config.clone(), get_dl_rate, set_dl_rate),
+                                                number_field(
+                                                    config.clone(),
+                                                    0.,
+                                                    u32::MAX as f64,
+                                                    get_dl_rate,
+                                                    set_dl_rate,
+                                                ),
                                             )
                                             .layout(Axis::Vertical),
                                             SettingItem::new(
                                                 "Upload rate limit (bytes/sec, 0 = unlimited)",
-                                                input_field(config.clone(), get_ul_rate, set_ul_rate),
+                                                number_field(
+                                                    config.clone(),
+                                                    0.,
+                                                    u32::MAX as f64,
+                                                    get_ul_rate,
+                                                    set_ul_rate,
+                                                ),
                                             )
                                             .layout(Axis::Vertical),
                                         ]),
@@ -1208,7 +1115,13 @@ impl Render for SettingsPage {
                                             ),
                                             SettingItem::new(
                                                 "Listen port",
-                                                input_field(config.clone(), get_listen_port, set_listen_port),
+                                                number_field(
+                                                    config.clone(),
+                                                    0.,
+                                                    u16::MAX as f64,
+                                                    get_listen_port,
+                                                    set_listen_port,
+                                                ),
                                             )
                                             .layout(Axis::Vertical),
                                         ]),
@@ -1226,12 +1139,24 @@ impl Render for SettingsPage {
                                             .layout(Axis::Vertical),
                                             SettingItem::new(
                                                 "Peer connect timeout (seconds)",
-                                                input_field(config.clone(), get_peer_ct, set_peer_ct),
+                                                number_field(
+                                                    config.clone(),
+                                                    0.,
+                                                    u32::MAX as f64,
+                                                    get_peer_ct,
+                                                    set_peer_ct,
+                                                ),
                                             )
                                             .layout(Axis::Vertical),
                                             SettingItem::new(
                                                 "Peer read/write timeout (seconds)",
-                                                input_field(config.clone(), get_peer_rw, set_peer_rw),
+                                                number_field(
+                                                    config.clone(),
+                                                    0.,
+                                                    u32::MAX as f64,
+                                                    get_peer_rw,
+                                                    set_peer_rw,
+                                                ),
                                             )
                                             .layout(Axis::Vertical),
                                         ]),
@@ -1271,7 +1196,13 @@ impl Render for SettingsPage {
                                         ),
                                         SettingItem::new(
                                             "Web view port",
-                                            input_field(config.clone(), get_web_view_port, set_web_view_port),
+                                            number_field(
+                                                config.clone(),
+                                                0.,
+                                                u16::MAX as f64,
+                                                get_web_view_port,
+                                                set_web_view_port,
+                                            ),
                                         )
                                         .layout(Axis::Vertical)
                                         .description(
@@ -1344,18 +1275,19 @@ mod tests {
         use crate::config::RqbitDesktopConfig;
 
         let mut cfg = RqbitDesktopConfig::default();
-        assert_eq!(get_web_view_port(&cfg), "3081");
+        assert_eq!(get_web_view_port(&cfg), 3081.);
 
-        set_web_view_port(&mut cfg, "4000".into());
+        set_web_view_port(&mut cfg, 4000.);
         assert_eq!(get_web_view_addr(&cfg), "127.0.0.1:4000");
 
-        // Invalid input is ignored, not written.
-        set_web_view_port(&mut cfg, "not-a-port".into());
-        assert_eq!(get_web_view_addr(&cfg), "127.0.0.1:4000");
+        // Out-of-range values are clamped by the input widget; the setter
+        // saturates the cast to u16.
+        set_web_view_port(&mut cfg, 70_000.);
+        assert_eq!(get_web_view_addr(&cfg), "127.0.0.1:65535");
 
         // Changing the full address is reflected by the port getter.
         set_web_view_addr(&mut cfg, "0.0.0.0:5000".into());
-        assert_eq!(get_web_view_port(&cfg), "5000");
+        assert_eq!(get_web_view_port(&cfg), 5000.);
     }
 
     /// End-to-end reproduction of the reported bug: open settings, click the
