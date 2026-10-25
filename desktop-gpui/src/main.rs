@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use gpui::*;
+use gpui_kit::base::input as input_actions;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
@@ -17,8 +18,36 @@ use crate::{
     desktop_host::DesktopHost, events::hold_to_quit_view::HoldToQuitView,
     local_client::LocalClient, state::State,
 };
+use rqbit_ui::ui::dialogs::AboutInfo;
 use rqbit_ui::ui::main_panel::MainPanel;
 impl gpui::Global for State {}
+
+// App-menu actions, dispatched by the native macOS menu bar (see `set_menus`
+// below) and handled by the global listeners registered after the window
+// opens.
+gpui_kit::actions!(rqbit_desktop, [About, Settings, Quit]);
+
+/// Author of the rqbit engine (librqbit crate metadata). The crate exposes no
+/// runtime accessor for it, so it is pinned here.
+const RQBIT_AUTHOR: &str = "Igor Katson";
+
+/// The About-dialog payload, resolved from the desktop crate's own metadata
+/// and the librqbit engine crate.
+fn about_info() -> AboutInfo {
+    AboutInfo {
+        app_name: "Rqbit Desktop".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        description: "A native desktop client for the rqbit BitTorrent engine, \
+                      built with GPUI. Bundles a local daemon so the same \
+                      session also serves a web UI in the browser."
+            .into(),
+        engine_name: "rqbit".into(),
+        engine_version: librqbit::version().into(),
+        engine_author: RQBIT_AUTHOR.into(),
+        desktop_name: "rqbit-desktop".into(),
+        desktop_author: env!("CARGO_PKG_AUTHORS").into(),
+    }
+}
 
 use librqbit::tracing_subscriber_config_utils::{InitLoggingOptions, init_logging};
 
@@ -89,7 +118,7 @@ async fn main() {
         // frame.
         let quit_countdown: Arc<Mutex<Option<Task<()>>>> = Arc::new(Mutex::new(None));
 
-        gpui_kit::open_window(window_options, cx, |window, cx| {
+        let (_, root) = gpui_kit::open_window(window_options, cx, |window, cx| {
             let client = Arc::new(LocalClient::new(
                 shared_state.shared(),
                 shared_state.hooks(),
@@ -102,6 +131,48 @@ async fn main() {
             })
         })
         .expect("Failed to open window");
+
+        // Native macOS menu bar (the "top panel"). Menu items dispatch GPUI
+        // actions to the active window; anything the views don't handle falls
+        // through to the global handlers registered below. The Edit menu
+        // reuses the gpui-base input actions that gpui-component's text
+        // inputs already handle, so the items work on the focused input.
+        cx.set_menus(vec![
+            Menu::new("Rqbit Desktop").items(vec![
+                MenuItem::action("About Rqbit Desktop", About),
+                MenuItem::separator(),
+                MenuItem::action("Settings…", Settings),
+                MenuItem::separator(),
+                MenuItem::action("Quit Rqbit Desktop", Quit),
+            ]),
+            Menu::new("Edit").items(vec![
+                MenuItem::action("Cut", input_actions::Cut),
+                MenuItem::action("Copy", input_actions::Copy),
+                MenuItem::action("Paste", input_actions::Paste),
+                MenuItem::separator(),
+                MenuItem::action("Select All", input_actions::SelectAll),
+            ]),
+        ]);
+
+        let main_panel = root.read(cx).main_panel.downgrade();
+
+        cx.on_action({
+            let main_panel = main_panel.clone();
+            move |_: &About, cx| {
+                main_panel
+                    .update(cx, |panel, cx| panel.open_about(about_info(), cx))
+                    .ok();
+            }
+        });
+        cx.on_action({
+            let main_panel = main_panel.clone();
+            move |_: &Settings, cx| {
+                main_panel
+                    .update(cx, |panel, cx| panel.open_settings_page(cx))
+                    .ok();
+            }
+        });
+        cx.on_action(|_: &Quit, cx| cx.quit());
 
         // Quit the app when the window is closed (native close button).
         cx.on_window_closed(move |cx: &mut App, _window_id| {

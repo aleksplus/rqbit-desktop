@@ -31,7 +31,10 @@ use crate::client::{AddTorrentRequest, ClientResult, TorrentClient, UiAddSource}
 use crate::host::UiHost;
 use crate::ui::add_torrent_dialog::{AddTorrentDialog, AddTorrentDialogEvent, AddTorrentEntry};
 
-use crate::ui::dialogs::{DeleteDialog, DeleteDialogEvent, MagnetDialog, MagnetDialogEvent};
+use crate::ui::dialogs::{
+    AboutDialog, AboutDialogEvent, AboutInfo, DeleteDialog, DeleteDialogEvent, MagnetDialog,
+    MagnetDialogEvent,
+};
 use crate::ui::log_page::{LogPage, LogPageEvent};
 use crate::ui::torrent_detail_panel::{TorrentDetailPanel, TorrentDetailPanelEvent};
 use crate::ui::torrent_table::{TorrentRow, TorrentTableDelegate};
@@ -83,6 +86,7 @@ enum ActiveDialog {
     Magnet(Entity<MagnetDialog>),
     Delete(Entity<DeleteDialog>),
     Add(Entity<AddTorrentDialog>),
+    About(Entity<AboutDialog>),
 }
 
 /// The title bar's action-button cluster (add / settings / logs / theme).
@@ -130,6 +134,13 @@ pub struct MainPanel {
     /// Torrent IDs + resolved names waiting for delete-dialog creation
     /// (deferred until window is available in render).
     pending_delete_dialog: Option<(Vec<usize>, Vec<String>)>,
+    /// About info waiting for About-dialog creation (deferred until window is
+    /// available in render). Queued by the native menu's About action, which
+    /// arrives without a `&mut Window`.
+    pending_about: Option<AboutInfo>,
+    /// Whether the settings page should open on the next render (queued the
+    /// same way as `pending_about`, via the native menu's Settings action).
+    pending_settings: bool,
     /// Latest session-wide stats for the footer (download/upload speed, uptime).
     footer_stats: Option<SessionStats>,
     /// Latest DHT health for the footer (None until the first poll completes).
@@ -187,6 +198,8 @@ impl MainPanel {
             dialog: None,
             pending_add_entries: None,
             pending_delete_dialog: None,
+            pending_about: None,
+            pending_settings: false,
             footer_stats: None,
             dht_status: None,
             custom_columns: None,
@@ -599,6 +612,20 @@ impl MainPanel {
         cx.notify();
     }
 
+    /// Queue the About dialog (triggered by the native menu). The dialog is
+    /// created on the next render, where a `Window` is available.
+    pub fn open_about(&mut self, info: AboutInfo, cx: &mut Context<Self>) {
+        self.pending_about = Some(info);
+        cx.notify();
+    }
+
+    /// Queue the settings page (triggered by the native menu). The page is
+    /// opened on the next render, where a `Window` is available.
+    pub fn open_settings_page(&mut self, cx: &mut Context<Self>) {
+        self.pending_settings = true;
+        cx.notify();
+    }
+
     /// Close the currently open full page (settings/logs), if any. Called by
     /// the host when its own page emits "Back".
     pub fn close_page(&mut self, cx: &mut Context<Self>) {
@@ -866,6 +893,17 @@ impl Render for MainPanel {
             self.create_delete_dialog(ids, names, _window, cx);
         }
 
+        // Create pending About dialog now that window is available.
+        if let Some(info) = self.pending_about.take() {
+            self.create_about_dialog(info, _window, cx);
+        }
+
+        // Open the pending settings page now that window is available.
+        if self.pending_settings {
+            self.pending_settings = false;
+            self.on_settings(_window, cx);
+        }
+
         v_flex()
             .size_full()
             .gap_0()
@@ -1066,8 +1104,8 @@ impl MainPanel {
         })
     }
 
-    /// Render the modal overlay for the open dialog (magnet, delete, or add),
-    /// if any.
+    /// Render the modal overlay for the open dialog (magnet, delete, add, or
+    /// about), if any.
     fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut overlays = Vec::new();
         match &self.dialog {
@@ -1080,6 +1118,9 @@ impl MainPanel {
             Some(ActiveDialog::Add(dialog)) => overlays.push(
                 render_modal_overlay(dialog, MainPanel::close_dialog, Some(px(600.)), cx)
                     .into_any_element(),
+            ),
+            Some(ActiveDialog::About(dialog)) => overlays.push(
+                render_modal_overlay(dialog, MainPanel::close_dialog, None, cx).into_any_element(),
             ),
             None => {}
         }
@@ -1229,6 +1270,26 @@ impl MainPanel {
         )
         .detach();
         self.dialog = Some(ActiveDialog::Delete(dialog));
+        cx.notify();
+    }
+
+    /// Create the About dialog for pending info — called from render, where a
+    /// `Window` is available.
+    fn create_about_dialog(
+        &mut self,
+        info: AboutInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dialog = cx.new(|cx| AboutDialog::new(info, window, cx));
+        cx.subscribe(
+            &dialog,
+            |this, _entity, event: &AboutDialogEvent, cx| match event {
+                AboutDialogEvent::Closed => this.close_dialog(cx),
+            },
+        )
+        .detach();
+        self.dialog = Some(ActiveDialog::About(dialog));
         cx.notify();
     }
 }

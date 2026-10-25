@@ -1,17 +1,20 @@
 [package]
 name = "desktop-gpui"
-version.workspace = true
+# The desktop app carries its own version, independent of the librqbit engine
+# version (the workspace default).
+version = "0.0.10"
+authors = ["aleksplus"]
 edition = "2024"
 description = "Native desktop for rqbit"
 license = "MIT"
-repository = "https://github.com/anthropics/rqbit"
+repository = "https://github.com/aleksplus/rqbit"
 publish = false
 
 [package.metadata.bundle]
 name = "rqbit-gpui-desktop"
 identifier = "com.rqbit.gpui-desktop"
 icon = ["icons/icon.ico", "icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns"]
-version = "1.0.0"
+version = "0.0.10"
 short_description = "Native desktop for rqbit"
 long_description = """https://github.com/aleksplus/rqbit"""
 

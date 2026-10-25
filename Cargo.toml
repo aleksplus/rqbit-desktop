@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "9.0.1"
+version = "0.0.10"
 
 [profile.dev]
 panic = "abort"
@@ -29,8 +29,8 @@ debug = true
 
 [workspace.dependencies]
 # Internal crates - keys are import names used in source code, package is the actual crate name
-rqbit-protocol = { path = "rqbit-protocol", version = "9.0.1" }
-rqbit-ui = { path = "rqbit-ui", version = "9.0.1" }
+rqbit-protocol = { path = "rqbit-protocol", version = "0.0.10" }
+rqbit-ui = { path = "rqbit-ui", version = "0.0.10" }
 
 # rqbit (librqbit) comes from crates.io. Local modifications are kept as a
 # cargo-patch-crate patch in patches/ - run `cargo patch-crate` before the

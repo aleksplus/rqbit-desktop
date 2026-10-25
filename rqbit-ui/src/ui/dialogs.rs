@@ -1,6 +1,7 @@
 use gpui::{FocusHandle, *};
 use gpui_kit::component::{
     ActiveTheme as _,
+    StyledExt as _,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
@@ -212,6 +213,137 @@ impl Render for MagnetDialog {
 }
 
 impl Focusable for MagnetDialog {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+/// Events emitted by [`AboutDialog`].
+#[derive(Clone, Debug)]
+pub enum AboutDialogEvent {
+    /// User clicked **Close**.
+    Closed,
+}
+
+/// Everything the About dialog shows, supplied by the host (the desktop build
+/// resolves the values from its own crate metadata and the engine crate; the
+/// web build never opens this dialog).
+pub struct AboutInfo {
+    /// App name, e.g. "Rqbit Desktop".
+    pub app_name: SharedString,
+    /// The desktop app's own version.
+    pub version: SharedString,
+    /// One-paragraph project description.
+    pub description: SharedString,
+    /// The BitTorrent engine's name ("rqbit") and its version.
+    pub engine_name: SharedString,
+    pub engine_version: SharedString,
+    pub engine_author: SharedString,
+    /// The desktop app's crate name ("rqbit-desktop") and its author. The
+    /// version is shared with [`AboutInfo::version`].
+    pub desktop_name: SharedString,
+    pub desktop_author: SharedString,
+}
+
+/// A modal About dialog: app identity + short description, then version and
+/// author rows for the rqbit engine and the desktop app itself.
+pub struct AboutDialog {
+    info: AboutInfo,
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<AboutDialogEvent> for AboutDialog {}
+
+impl AboutDialog {
+    pub fn new(info: AboutInfo, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
+            info,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl Render for AboutDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let info = &self.info;
+
+        v_flex()
+            .gap_3()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(info.app_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(format!("Version {}", info.version)),
+                    ),
+            )
+            .child(div().text_color(theme.muted_foreground).child(info.description.clone()))
+            .child(div().h(px(1.)).w_full().bg(theme.border))
+            .child(
+                // Version/author rows: name + version on the left, author on
+                // the right.
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(div().font_medium().child(info.engine_name.clone()))
+                                    .child(
+                                        div()
+                                            .text_color(theme.muted_foreground)
+                                            .child(info.engine_version.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(info.engine_author.clone()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(div().font_medium().child(info.desktop_name.clone()))
+                                    .child(
+                                        div()
+                                            .text_color(theme.muted_foreground)
+                                            .child(info.version.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(info.desktop_author.clone()),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex().gap_2().justify_end().child(
+                    Button::new("about-close")
+                        .outline()
+                        .label("Close")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(AboutDialogEvent::Closed))),
+                ),
+            )
+    }
+}
+
+impl Focusable for AboutDialog {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }

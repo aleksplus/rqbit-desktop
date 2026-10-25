@@ -234,7 +234,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-daemon"
-version = "9.0.1"
+version = "0.0.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-gpui"
-version = "9.0.1"
+version = "0.0.10"
 dependencies = [
  "anyhow",
  "app-daemon",
@@ -7099,7 +7099,7 @@ dependencies = [
 
 [[package]]
 name = "rqbit-protocol"
-version = "9.0.1"
+version = "0.0.10"
 dependencies = [
  "librqbit",
  "librqbit-core",
@@ -7109,7 +7109,7 @@ dependencies = [
 
 [[package]]
 name = "rqbit-ui"
-version = "9.0.1"
+version = "0.0.10"
 dependencies = [
  "async-trait",
  "futures",
@@ -9405,7 +9405,7 @@ dependencies = [
 
 [[package]]
 name = "web-gpui"
-version = "9.0.1"
+version = "0.0.10"
 dependencies = [
  "async-trait",
  "futures",

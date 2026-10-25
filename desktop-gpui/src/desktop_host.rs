@@ -30,7 +30,8 @@ impl UiHost for DesktopHost {
     }
 
     fn version(&self) -> String {
-        format!("v{}", librqbit::version())
+        // The desktop app's own version, not the librqbit engine's.
+        env!("CARGO_PKG_VERSION").to_string()
     }
 
     fn open_folder(&self, path: &str) {

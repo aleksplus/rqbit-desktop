@@ -7,3 +7,4 @@
 .serena/
 node_modules
 .zcode
+web-gpui/dist/
