@@ -34,8 +34,10 @@ impl UiHost for DesktopHost {
     }
 
     fn open_folder(&self, path: &str) {
-        if !path.is_empty() {
-            let _ = std::process::Command::new("open").arg(path).spawn();
+        if !path.is_empty()
+            && let Err(e) = open::that(path)
+        {
+            tracing::warn!(path = %path, error = %e, "error opening folder");
         }
     }
 

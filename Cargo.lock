@@ -2069,6 +2069,7 @@ dependencies = [
  "librqbit-dualstack-sockets",
  "metrics-exporter-prometheus",
  "notify",
+ "open",
  "parking_lot",
  "reqwest",
  "ring",

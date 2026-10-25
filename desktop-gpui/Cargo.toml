@@ -26,7 +26,7 @@ extended-description = "rqbit desktop client: native GPUI interface plus an embe
 # Hard-linked libs beyond libc/libssl are declared explicitly (dpkg-shlibdeps
 # adds those when available); dlopen'd ones need to be listed here.
 depends = "libfontconfig1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0"
-recommends = "libvulkan1"
+recommends = "libvulkan1, xdg-utils"
 assets = [
     ["target/release/desktop-gpui", "usr/bin/desktop-gpui", "755"],
     ["assets/rqbit-gpui-desktop.desktop", "usr/share/applications/rqbit-gpui-desktop.desktop", "644"],
@@ -80,6 +80,9 @@ walkdir = { workspace = true }
 ring = "0.17"
 hex = "0.4"
 toml = "0.8"
+# Cross-platform "open folder / URL" (macOS `open`, Linux `xdg-open`, Windows).
+# Already a transitive dep of gpui-pre-linux; declared here for `DesktopHost::open_folder`.
+open = "5"
 
 [dev-dependencies]
 # Headless UI tests (gpui_kit::test) need the kit's test-support feature.
