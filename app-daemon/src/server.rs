@@ -33,11 +33,13 @@ const PUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Execute one request against the Api, decorating list/details responses
 /// with hook-provided custom column values when a provider is present.
+/// `settings` (when present) answers the session settings requests.
 /// Public so integration tests can exercise the mapping without a socket.
 pub async fn handle_request(
     api: &Api,
     req: Request,
     columns: Option<&ColumnsProvider>,
+    settings: Option<&dyn SessionSettingsBackend>,
 ) -> Result<ResponsePayload, proto::ProtoError> {
     use proto::ProtoErrorKind;
     Ok(match req {
@@ -157,7 +159,27 @@ pub async fn handle_request(
                 .map_err(|e| conv::proto_error_from_api_error(&e, ProtoErrorKind::Internal))?;
             ResponsePayload::Empty
         }
+        Request::GetSessionSettings => {
+            let backend = settings.ok_or_else(settings_unsupported)?;
+            ResponsePayload::SessionSettings(Box::new(backend.get()))
+        }
+        Request::SetSessionSettings(boxed) => {
+            let backend = settings.ok_or_else(settings_unsupported)?;
+            backend
+                .set(*boxed)
+                .await
+                .map_err(|e| proto::ProtoError::new(ProtoErrorKind::Internal, e))?;
+            ResponsePayload::Empty
+        }
     })
+}
+
+/// The error answered when a host provides no settings backend.
+fn settings_unsupported() -> proto::ProtoError {
+    proto::ProtoError::bad_request(
+        "session settings are not supported by this server \
+         (no settings backend configured)",
+    )
 }
 
 fn add_source_to_add(source: &AddSource) -> librqbit::AddTorrent<'static> {
@@ -166,6 +188,49 @@ fn add_source_to_add(source: &AddSource) -> librqbit::AddTorrent<'static> {
         // desktop dialog uses).
         AddSource::Magnet(s) => librqbit::AddTorrent::from_url(s.clone()),
         AddSource::Url(s) => librqbit::AddTorrent::from_url(s.clone()),
+        // Picked .torrent files travel the wire whole (the browser client
+        // reads them through a file picker).
+        AddSource::Bytes(bytes) => librqbit::AddTorrent::from_bytes(bytes.clone()),
+    }
+}
+
+/// Applies session settings on behalf of the process hosting the session.
+/// `app-daemon` rebuilds its own session; the desktop's bundled web view maps
+/// the settings onto its config and reconfigures like the native settings
+/// page does. `None` where a host doesn't support this (Get/Set answer with
+/// an error).
+pub trait SessionSettingsBackend: Send + Sync + 'static {
+    /// The currently effective session settings.
+    fn get(&self) -> proto::SessionSettings;
+    /// Apply new settings (rebuilding the session). Resolves `Err` with a
+    /// user-facing message when the settings are rejected.
+    fn set(
+        &self,
+        settings: proto::SessionSettings,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>>;
+}
+
+/// A swappable Api handle. The connection actor and the push samplers read
+/// the current Api through it per request/tick, so a settings-driven session
+/// rebuild takes effect for live connections without dropping them. Hosts
+/// that never rebuild (or rebuild by restarting the whole server, like the
+/// desktop's bundled web view) simply never call [`ApiSlot::set`].
+#[derive(Clone)]
+pub struct ApiSlot(Arc<parking_lot::RwLock<Arc<Api>>>);
+
+impl ApiSlot {
+    pub fn new(api: Arc<Api>) -> Self {
+        Self(Arc::new(parking_lot::RwLock::new(api)))
+    }
+
+    /// The current Api.
+    pub fn get(&self) -> Arc<Api> {
+        self.0.read().clone()
+    }
+
+    /// Swap in a rebuilt Api.
+    pub fn set(&self, api: Arc<Api>) {
+        *self.0.write() = api;
     }
 }
 
@@ -185,11 +250,14 @@ struct ConnState {
 }
 
 /// Serve one WebSocket connection until the client or the socket goes away.
+/// The Api is read through `api` (a slot) per request so a settings-driven
+/// session rebuild is picked up by live connections.
 pub async fn run_connection(
     socket: WebSocket,
-    api: Arc<Api>,
+    api: ApiSlot,
     line_broadcast: Option<LineBroadcast>,
     columns: Option<Arc<ColumnsProvider>>,
+    settings: Option<Arc<dyn SessionSettingsBackend>>,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
@@ -222,6 +290,9 @@ pub async fn run_connection(
                 if !state.lock().session_level {
                     continue;
                 }
+                // Read the Api through the slot so a session rebuild is
+                // picked up by live connections.
+                let api = api.get();
                 let mut list = TorrentList::from(
                     &api.api_torrent_list_ext(ApiTorrentListOpts { with_stats: true }),
                 );
@@ -323,7 +394,8 @@ pub async fn run_connection(
         };
         match msg {
             ClientMessage::Request { id, req } => {
-                let result = handle_request(&api, req, columns.as_deref()).await;
+                let result =
+                    handle_request(&api.get(), req, columns.as_deref(), settings.as_deref()).await;
                 let frame = codec::encode_server(&ServerMessage::Response { id, result })
                     .unwrap_or_else(|e| {
                         codec::encode_server(&ServerMessage::Response {
@@ -370,24 +442,28 @@ pub async fn run_connection(
 /// port at `/` — the same port and path the classic React webui occupies
 /// in the upstream `rqbit server`. `columns` (when present) provides
 /// hook-declared custom columns: the sampler pushes their state and
-/// list/details responses are decorated with their values.
+/// list/details responses are decorated with their values. `settings`
+/// (when present) answers the session settings requests. `api` must be the
+/// same slot a settings backend swaps, so rebuilds reach live connections.
 pub fn router(
-    api: Arc<Api>,
+    api: ApiSlot,
     line_broadcast: Option<LineBroadcast>,
     columns: Option<Arc<ColumnsProvider>>,
+    settings: Option<Arc<dyn SessionSettingsBackend>>,
 ) -> axum::Router {
     use axum::routing::get;
 
     axum::Router::new()
         .route("/ws", get(ws_route))
         .fallback(serve_static)
-        .with_state((api, line_broadcast, columns))
+        .with_state((api, line_broadcast, columns, settings))
 }
 
 type RouterState = (
-    Arc<Api>,
+    ApiSlot,
     Option<LineBroadcast>,
     Option<Arc<ColumnsProvider>>,
+    Option<Arc<dyn SessionSettingsBackend>>,
 );
 
 /// Serve the embedded web client under `/` (upstream-webui convention):
@@ -426,8 +502,10 @@ async fn serve_static(uri: axum::http::Uri) -> axum::response::Response {
 }
 
 async fn ws_route(
-    axum::extract::State((api, line_broadcast, columns)): axum::extract::State<RouterState>,
+    axum::extract::State((api, line_broadcast, columns, settings)): axum::extract::State<
+        RouterState,
+    >,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> axum::response::Response {
-    upgrade.on_upgrade(move |socket| run_connection(socket, api, line_broadcast, columns))
+    upgrade.on_upgrade(move |socket| run_connection(socket, api, line_broadcast, columns, settings))
 }

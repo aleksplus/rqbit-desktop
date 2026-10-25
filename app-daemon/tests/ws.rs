@@ -38,13 +38,13 @@ async fn handle_request_maps_api_surface() {
     let api = quiet_api().await;
 
     // Session stats: an empty session still reports speeds/uptime.
-    let resp = server::handle_request(&api, proto::Request::SessionStats, None)
+    let resp = server::handle_request(&api, proto::Request::SessionStats, None, None)
         .await
         .unwrap();
     assert!(matches!(resp, proto::ResponsePayload::SessionStats(_)));
 
     // List: empty session → empty list.
-    let resp = server::handle_request(&api, proto::Request::List { with_stats: true }, None)
+    let resp = server::handle_request(&api, proto::Request::List { with_stats: true }, None, None)
         .await
         .unwrap();
     match resp {
@@ -53,7 +53,7 @@ async fn handle_request_maps_api_surface() {
     }
 
     // DHT is disabled in this session → DhtDisabled error kind.
-    let err = server::handle_request(&api, proto::Request::DhtStats, None)
+    let err = server::handle_request(&api, proto::Request::DhtStats, None, None)
         .await
         .unwrap_err();
     assert_eq!(err.kind, proto::ProtoErrorKind::DhtDisabled);
@@ -65,6 +65,7 @@ async fn handle_request_maps_api_surface() {
         proto::Request::Details {
             torrent: bogus.clone(),
         },
+        None,
         None,
     )
     .await
@@ -79,6 +80,7 @@ async fn handle_request_maps_api_surface() {
             action: proto::TorrentAction::Pause,
         },
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -90,6 +92,7 @@ async fn handle_request_maps_api_surface() {
         proto::Request::Stats {
             torrent: proto::TorrentId::Hash("nope".into()),
         },
+        None,
         None,
     )
     .await
@@ -106,7 +109,7 @@ async fn spawn_server_addr() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
     let api = quiet_api().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = app_daemon::server::router(api, None, None);
+    let app = app_daemon::server::router(app_daemon::server::ApiSlot::new(api), None, None, None);
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (addr, handle)
 }
@@ -265,3 +268,127 @@ async fn websocket_roundtrip() {
 }
 
 use app_daemon::server;
+
+/// Session settings requests: without a backend they answer BadRequest; with
+/// one, Get/Set route through it unchanged.
+#[tokio::test]
+async fn session_settings_flow_through_backend() {
+    let api = quiet_api().await;
+
+    // No backend configured → BadRequest.
+    let err = server::handle_request(&api, proto::Request::GetSessionSettings, None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, proto::ProtoErrorKind::BadRequest);
+
+    let err = server::handle_request(
+        &api,
+        proto::Request::SetSessionSettings(Box::default()),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, proto::ProtoErrorKind::BadRequest);
+
+    struct StubBackend;
+    impl server::SessionSettingsBackend for StubBackend {
+        fn get(&self) -> proto::SessionSettings {
+            proto::SessionSettings {
+                listen_port: 4242,
+                ..Default::default()
+            }
+        }
+        fn set(
+            &self,
+            _settings: proto::SessionSettings,
+        ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let backend = StubBackend;
+
+    let resp = server::handle_request(
+        &api,
+        proto::Request::GetSessionSettings,
+        None,
+        Some(&backend),
+    )
+    .await
+    .unwrap();
+    match resp {
+        proto::ResponsePayload::SessionSettings(s) => assert_eq!(s.listen_port, 4242),
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    let resp = server::handle_request(
+        &api,
+        proto::Request::SetSessionSettings(Box::default()),
+        None,
+        Some(&backend),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(resp, proto::ResponsePayload::Empty));
+}
+
+/// The standalone daemon's settings backend: Set stops the old session,
+/// rebuilds it from the new settings and swaps the shared Api slot, so
+/// `get` afterwards reflects the change and the slot hands out the new Api.
+#[tokio::test]
+async fn daemon_settings_backend_rebuilds_session() {
+    use app_daemon::server::SessionSettingsBackend as _;
+    use app_daemon::{DaemonSettingsBackend, start_session};
+    use librqbit::tracing_subscriber_config_utils::{InitLoggingOptions, init_logging};
+
+    let init_logging = Arc::new(
+        init_logging(InitLoggingOptions {
+            default_rust_log_value: Some("warn"),
+            log_file: None,
+            log_file_rust_log: None,
+            log_file_json: false,
+        })
+        .unwrap(),
+    );
+
+    let download_folder = std::env::temp_dir().join("rqbit-ws-settings-original");
+    let daemon = start_session(download_folder.clone(), None, true, init_logging.clone())
+        .await
+        .unwrap();
+
+    let backend =
+        DaemonSettingsBackend::new(daemon.api.clone(), daemon.settings.clone(), init_logging);
+
+    // Get mirrors the settings the session was started from.
+    let current = backend.get();
+    assert_eq!(
+        current.default_download_folder,
+        download_folder.to_string_lossy()
+    );
+    assert!(!current.dht_enabled);
+
+    // Set with a new download folder rebuilds the session in place.
+    let new_folder = std::env::temp_dir().join("rqbit-ws-settings-changed");
+    let mut updated = current.clone();
+    updated.default_download_folder = new_folder.to_string_lossy().into_owned();
+    backend.set(updated).await.unwrap();
+
+    let api = daemon.api.get();
+    assert_eq!(
+        api.session().default_output_folder(),
+        new_folder,
+        "the slot must hand out the rebuilt session"
+    );
+    assert_eq!(
+        backend.get().default_download_folder,
+        new_folder.to_string_lossy()
+    );
+
+    // Reject an empty download folder without touching the session.
+    let mut bad = backend.get();
+    bad.default_download_folder = "  ".into();
+    assert!(backend.set(bad).await.is_err());
+    assert_eq!(api.session().default_output_folder(), new_folder);
+
+    daemon.api.get().session().stop().await;
+}

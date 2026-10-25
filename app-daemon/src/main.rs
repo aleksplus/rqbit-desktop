@@ -12,7 +12,7 @@ use clap::Parser;
 
 use app_daemon::columns::{ColumnsHook, ColumnsMethod, ColumnsProvider};
 use app_daemon::server;
-use app_daemon::start_session;
+use app_daemon::{DaemonSettingsBackend, start_session};
 
 #[derive(Parser)]
 #[command(
@@ -55,21 +55,24 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Logging: the returned broadcast carries every formatted log line; the
-    // WS server forwards it to clients that subscribe to logs.
-    let init_logging = librqbit::tracing_subscriber_config_utils::init_logging(
-        librqbit::tracing_subscriber_config_utils::InitLoggingOptions {
-            default_rust_log_value: Some("info"),
-            log_file: None,
-            log_file_rust_log: None,
-            log_file_json: false,
-        },
-    )?;
+    // WS server forwards it to clients that subscribe to logs. Kept in an
+    // Arc so the settings backend can rebuild sessions against the same
+    // reload/broadcast plumbing.
+    let init_logging =
+        std::sync::Arc::new(librqbit::tracing_subscriber_config_utils::init_logging(
+            librqbit::tracing_subscriber_config_utils::InitLoggingOptions {
+                default_rust_log_value: Some("info"),
+                log_file: None,
+                log_file_rust_log: None,
+                log_file_json: false,
+            },
+        )?);
 
     let daemon = start_session(
         args.download_folder,
         args.persistence_folder,
         args.disable_dht,
-        init_logging,
+        init_logging.clone(),
     )
     .await?;
 
@@ -94,7 +97,18 @@ async fn main() -> anyhow::Result<()> {
         Some(provider)
     };
 
-    let app = server::router(daemon.api.clone(), daemon.line_broadcast.clone(), columns);
+    // Session settings: Get mirrors the running session's settings, Set
+    // rebuilds it in place (connections keep working via the shared slot).
+    let settings_backend: std::sync::Arc<dyn server::SessionSettingsBackend> = std::sync::Arc::new(
+        DaemonSettingsBackend::new(daemon.api.clone(), daemon.settings.clone(), init_logging),
+    );
+
+    let app = server::router(
+        daemon.api.clone(),
+        daemon.line_broadcast.clone(),
+        columns,
+        Some(settings_backend),
+    );
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

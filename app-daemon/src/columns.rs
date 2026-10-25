@@ -47,12 +47,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use librqbit::Api;
 use librqbit::api::{ApiTorrentListOpts, TorrentIdOrHash};
 use parking_lot::Mutex;
 use rqbit_protocol as proto;
 use rqbit_protocol::{CustomColumnKind, CustomColumnSpec, CustomColumnsState};
 use serde::{Deserialize, Serialize};
+
+use crate::server::ApiSlot;
 
 /// Hard cap on columns a single hook may declare (layout protection).
 const MAX_COLUMNS: usize = 8;
@@ -405,9 +406,10 @@ impl Store {
 /// Polls the configured hooks and caches the winning response. One provider
 /// serves one session: it is constructed (and started) wherever the session
 /// is built — the desktop's bundled web view and the standalone daemon's
-/// main — and dies with that session.
+/// main — and dies with that session. The Api is read through a slot per
+/// poll, so a settings-driven session rebuild is picked up by the next tick.
 pub struct ColumnsProvider {
-    api: Arc<Api>,
+    api: ApiSlot,
     hooks: Vec<ColumnsHook>,
     client: reqwest::Client,
     store: Mutex<Store>,
@@ -417,7 +419,7 @@ impl ColumnsProvider {
     /// Build a provider for the given hooks. With an empty list the provider
     /// is inert (and `start` spawns nothing); callers usually pass `None`
     /// around instead.
-    pub fn new(api: Arc<Api>, hooks: Vec<ColumnsHook>) -> Arc<Self> {
+    pub fn new(api: ApiSlot, hooks: Vec<ColumnsHook>) -> Arc<Self> {
         let store = Store::new(hooks.len());
         Arc::new(Self {
             api,
@@ -508,16 +510,15 @@ impl ColumnsProvider {
     /// Build the `torrent_columns` request payload from the current session
     /// state. Per-torrent file lists are resolved only when `needs_files`.
     fn request_payload(&self, needs_files: bool) -> serde_json::Value {
-        let list = self
-            .api
-            .api_torrent_list_ext(ApiTorrentListOpts { with_stats: false });
+        let api = self.api.get();
+        let list = api.api_torrent_list_ext(ApiTorrentListOpts { with_stats: false });
         let torrents: Vec<serde_json::Value> = list
             .torrents
             .iter()
             .map(|t| {
                 let files = if needs_files {
                     t.id.and_then(|id| {
-                        let details = self.api.api_torrent_details(TorrentIdOrHash::Id(id)).ok()?;
+                        let details = api.api_torrent_details(TorrentIdOrHash::Id(id)).ok()?;
                         let files = details.files?;
                         Some(
                             files

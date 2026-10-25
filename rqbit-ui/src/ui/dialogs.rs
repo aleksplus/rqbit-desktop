@@ -1,7 +1,6 @@
 use gpui::{FocusHandle, *};
 use gpui_kit::component::{
-    ActiveTheme as _,
-    StyledExt as _,
+    ActiveTheme as _, StyledExt as _,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
@@ -286,7 +285,11 @@ impl Render for AboutDialog {
                             .child(format!("Version {}", info.version)),
                     ),
             )
-            .child(div().text_color(theme.muted_foreground).child(info.description.clone()))
+            .child(
+                div()
+                    .text_color(theme.muted_foreground)
+                    .child(info.description.clone()),
+            )
             .child(div().h(px(1.)).w_full().bg(theme.border))
             .child(
                 // Version/author rows: name + version on the left, author on

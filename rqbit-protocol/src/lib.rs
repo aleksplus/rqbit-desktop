@@ -8,9 +8,10 @@
 //! *wire DTOs*: self-contained serde
 //! types carrying exactly the fields the shared UI renders, shaped for a
 //! binary non-self-describing codec (postcard) rather than librqbit's
-//! JSON representation. Types that only native code needs (settings, hooks,
-//! folder watching, the remaining Api surface) are imported from librqbit
-//! directly and deliberately have no counterpart here.
+//! JSON representation. Types that only native code needs (the full desktop
+//! config, hooks, folder watching, the remaining Api surface) are imported
+//! from librqbit directly; only the remote-editable session subset
+//! ([`types::SessionSettings`]) has a counterpart here.
 //!
 //! Layout:
 //! - [`types`]: the wire DTOs.
@@ -39,6 +40,6 @@ pub use messages::{
 };
 pub use types::{
     ApiAddTorrent, ConnKind, CustomColumnKind, CustomColumnSpec, CustomColumnsState, DhtStats,
-    LiveStats, PeerEntry, PeerStats, PeerStatsSnapshot, SessionInfo, SessionStats, Speed,
-    TorrentDetails, TorrentFile, TorrentList, TorrentState, TorrentStats,
+    LiveStats, PeerEntry, PeerStats, PeerStatsSnapshot, SessionInfo, SessionSettings, SessionStats,
+    Speed, TorrentDetails, TorrentFile, TorrentList, TorrentState, TorrentStats,
 };

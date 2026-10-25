@@ -6,7 +6,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use gpui::{AnyView, App, AppContext as _, Context, WeakEntity, Window};
+use gpui::{AnyView, App, AppContext as _, Context, Window};
+use rqbit_ui::client::TorrentClient;
 use rqbit_ui::host::{PickedTorrentFile, UiCapabilities, UiHost};
 use rqbit_ui::ui::add_torrent_dialog::AddTorrentEntry;
 use rqbit_ui::ui::main_panel::MainPanel;
@@ -57,7 +58,7 @@ impl UiHost for DesktopHost {
 
     fn open_settings(
         &self,
-        _main: WeakEntity<MainPanel>,
+        _client: Arc<dyn TorrentClient>,
         window: &mut Window,
         cx: &mut Context<MainPanel>,
     ) -> Option<AnyView> {

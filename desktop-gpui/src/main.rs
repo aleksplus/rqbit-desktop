@@ -12,6 +12,7 @@ mod folder_watcher;
 mod hooks;
 mod local_client;
 mod ui;
+mod web_settings;
 
 mod state;
 use crate::{
@@ -71,6 +72,10 @@ async fn main() {
     let shared_state = State::new(init_logging_result)
         .await
         .expect("failed to create state");
+    // One Arc<State> for the whole app: the web settings backend resolves the
+    // session through it, so it must outlive the app (DesktopHost holds it).
+    let state_arc = Arc::new(shared_state.clone());
+    shared_state.web_settings.attach(&state_arc);
 
     info!("GPUI application started – state ready");
 
@@ -123,7 +128,7 @@ async fn main() {
                 shared_state.shared(),
                 shared_state.hooks(),
             ));
-            let host = Arc::new(DesktopHost::new(Arc::new(shared_state.clone())));
+            let host = Arc::new(DesktopHost::new(state_arc.clone()));
             let main_panel = cx.new(|cx| MainPanel::new(client, host, window, cx));
             cx.new(|_cx| HoldToQuitView {
                 main_panel,

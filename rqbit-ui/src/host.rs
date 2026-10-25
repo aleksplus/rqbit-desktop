@@ -5,9 +5,11 @@
 
 use std::future::Future;
 
-use gpui::{AnyView, Context, WeakEntity, Window};
+use std::sync::Arc;
 
-use crate::client::UiAddSource;
+use gpui::{AnyView, Context, Window};
+
+use crate::client::{TorrentClient, UiAddSource};
 use crate::ui::add_torrent_dialog::AddTorrentEntry;
 use crate::ui::main_panel::MainPanel;
 
@@ -76,12 +78,15 @@ pub trait UiHost: 'static {
     }
 
     /// Open the host's settings page (rendered full-page inside MainPanel).
-    /// The host subscribes its own "Back" event and must call
-    /// `MainPanel::close_page` through `main` when it fires. `None` = the
-    /// capability is advertised but the page could not open.
+    /// The client is the same transport the panel talks to. The host
+    /// subscribes its own "Back" event (via `cx.subscribe`) and must call
+    /// `MainPanel::close_page` when it fires. `None` = the capability is
+    /// advertised but the page could not open. The panel is leased for the
+    /// duration of this call (it is invoked from inside the panel's update),
+    /// so the entity itself must not be read here.
     fn open_settings(
         &self,
-        _main: WeakEntity<MainPanel>,
+        _client: Arc<dyn TorrentClient>,
         _window: &mut Window,
         _cx: &mut Context<MainPanel>,
     ) -> Option<AnyView> {

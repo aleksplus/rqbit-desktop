@@ -16,16 +16,16 @@ use futures::stream::LocalBoxStream;
 
 use rqbit_protocol::{
     AddSource, ApiAddTorrent, ClientMessage, CustomColumnsState, DhtStats, PeerStatsSnapshot,
-    ProtoError, PushUpdate, SessionStats, TorrentAction, TorrentDetails, TorrentId, TorrentList,
-    TorrentStats,
+    ProtoError, PushUpdate, SessionSettings, SessionStats, TorrentAction, TorrentDetails,
+    TorrentId, TorrentList, TorrentStats,
 };
 
 /// Result type all client methods return.
 pub type ClientResult<T> = Result<T, ProtoError>;
 
-/// Where a torrent to add comes from, in UI terms. `Bytes` is desktop-only
-/// (picked .torrent files); it has no wire representation and remote clients
-/// reject it.
+/// Where a torrent to add comes from, in UI terms. All three travel the
+/// wire (picked-file bytes included, so the browser client can add .torrent
+/// files through its file picker).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiAddSource {
     /// A `magnet:?…` URI (or a bare 40-char info hash, same as the desktop
@@ -38,14 +38,12 @@ pub enum UiAddSource {
 }
 
 impl UiAddSource {
-    /// The wire form, when this source can travel to a remote daemon.
+    /// The wire form.
     pub fn to_wire(&self) -> Result<AddSource, ProtoError> {
         match self {
             UiAddSource::Magnet(s) => Ok(AddSource::Magnet(s.clone())),
             UiAddSource::Url(s) => Ok(AddSource::Url(s.clone())),
-            UiAddSource::Bytes(_) => Err(ProtoError::bad_request(
-                "adding picked .torrent files requires the desktop app",
-            )),
+            UiAddSource::Bytes(bytes) => Ok(AddSource::Bytes(bytes.clone())),
         }
     }
 }
@@ -103,6 +101,22 @@ pub trait TorrentClient: 'static {
     async fn add_torrent(&self, req: &AddTorrentRequest) -> ClientResult<ApiAddTorrent>;
     /// `Api::api_set_rust_log`.
     async fn set_rust_log(&self, value: String) -> ClientResult<()>;
+    /// Read the session settings the host manages
+    /// ([`SessionSettings`]). Errors when the transport or the host has no
+    /// settings backend (e.g. the desktop's in-process client — the desktop
+    /// keeps its own full settings page).
+    async fn get_session_settings(&self) -> ClientResult<SessionSettings> {
+        Err(ProtoError::bad_request(
+            "session settings are not supported by this client",
+        ))
+    }
+    /// Replace the session settings. The host rebuilds its session; the
+    /// connection may drop and reconnect as part of this.
+    async fn set_session_settings(&self, _settings: &SessionSettings) -> ClientResult<()> {
+        Err(ProtoError::bad_request(
+            "session settings are not supported by this client",
+        ))
+    }
     /// `Api::api_log_lines_stream` — raw log line bytes. Errors when the
     /// stream is unavailable (e.g. not wired up on the daemon).
     fn log_lines(&self) -> ClientResult<LocalBoxStream<'static, Vec<u8>>>;

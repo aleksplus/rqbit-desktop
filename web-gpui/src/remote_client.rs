@@ -139,6 +139,7 @@ fn unexpected(payload: ResponsePayload, expected: &'static str) -> ProtoError {
         ResponsePayload::PeerStats(_) => "PeerStats",
         ResponsePayload::SessionStats(_) => "SessionStats",
         ResponsePayload::SessionInfo(_) => "SessionInfo",
+        ResponsePayload::SessionSettings(_) => "SessionSettings",
         ResponsePayload::DhtStats(_) => "DhtStats",
         ResponsePayload::Added(_) => "Added",
         ResponsePayload::Empty => "Empty",
@@ -380,7 +381,6 @@ impl TorrentClient for RemoteClient {
     }
 
     async fn add_torrent(&self, req: &AddTorrentRequest) -> ClientResult<ApiAddTorrent> {
-        // Bytes never travel the wire; `to_wire` rejects them up front.
         let source = req.source.to_wire()?;
         match self
             .request(Request::AddTorrent {
@@ -394,6 +394,23 @@ impl TorrentClient for RemoteClient {
         {
             ResponsePayload::Added(added) => Ok(*added),
             other => Err(unexpected(other, "Added")),
+        }
+    }
+
+    async fn get_session_settings(&self) -> ClientResult<proto::SessionSettings> {
+        match self.request(Request::GetSessionSettings).await? {
+            ResponsePayload::SessionSettings(settings) => Ok(*settings),
+            other => Err(unexpected(other, "SessionSettings")),
+        }
+    }
+
+    async fn set_session_settings(&self, settings: &proto::SessionSettings) -> ClientResult<()> {
+        match self
+            .request(Request::SetSessionSettings(Box::new(settings.clone())))
+            .await?
+        {
+            ResponsePayload::Empty => Ok(()),
+            other => Err(unexpected(other, "Empty")),
         }
     }
 

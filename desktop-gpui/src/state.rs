@@ -1,7 +1,9 @@
 use crate::config::{HttpMethod, RqbitDesktopConfig, read_config, write_config};
 use crate::folder_watcher::start_folder_watcher;
 use crate::hooks::{HookDispatcher, HookEvent};
+use crate::web_settings::WebViewSettingsBackend;
 use app_daemon::columns::{ColumnsHook, ColumnsMethod, ColumnsProvider};
+use app_daemon::server::ApiSlot;
 use librqbit::{api::Api, tracing_subscriber_config_utils::InitLoggingResult};
 use librqbit_dualstack_sockets::TcpListener;
 use std::{path::Path, sync::Arc};
@@ -61,6 +63,9 @@ pub struct State {
     shared: Arc<RwLock<SharedState>>,
     init_logging: Arc<InitLoggingResult>,
     hooks: Arc<HookDispatcher>,
+    /// Session-settings backend served to the bundled web view; survives
+    /// session reconfigures (the web view server re-binds with it).
+    pub web_settings: Arc<WebViewSettingsBackend>,
 }
 
 impl Clone for State {
@@ -70,6 +75,7 @@ impl Clone for State {
             shared: self.shared.clone(),
             init_logging: self.init_logging.clone(),
             hooks: self.hooks.clone(),
+            web_settings: self.web_settings.clone(),
         }
     }
 }
@@ -107,6 +113,7 @@ fn column_hooks(config: &RqbitDesktopConfig) -> Vec<ColumnsHook> {
 async fn api_from_config(
     init_logging: &InitLoggingResult,
     config: &RqbitDesktopConfig,
+    web_settings: Option<Arc<WebViewSettingsBackend>>,
 ) -> anyhow::Result<SessionApi> {
     config
         .validate()
@@ -231,7 +238,7 @@ async fn api_from_config(
     let columns = if column_hooks.is_empty() {
         None
     } else {
-        let provider = ColumnsProvider::new(Arc::new(api.clone()), column_hooks);
+        let provider = ColumnsProvider::new(ApiSlot::new(Arc::new(api.clone())), column_hooks);
         let poller = provider.clone();
         session.spawn(debug_span!("hook_columns"), "hook_columns", async move {
             poller.run().await;
@@ -257,8 +264,15 @@ async fn api_from_config(
         let line_broadcast = init_logging.line_broadcast.clone();
         let columns_for_router = columns.clone();
         let web_view_task = async move {
-            let router =
-                app_daemon::server::router(Arc::new(api), Some(line_broadcast), columns_for_router);
+            let settings_backend: Option<Arc<dyn app_daemon::server::SessionSettingsBackend>> =
+                web_settings
+                    .map(|b| Arc::clone(&b) as Arc<dyn app_daemon::server::SessionSettingsBackend>);
+            let router = app_daemon::server::router(
+                ApiSlot::new(Arc::new(api)),
+                Some(line_broadcast),
+                columns_for_router,
+                settings_backend,
+            );
             let listener = tokio::net::TcpListener::bind(listen_addr)
                 .await
                 .with_context(|| format!("error listening on {listen_addr}"))?;
@@ -284,7 +298,8 @@ impl State {
 
         let config = read_config(&config_filename).unwrap_or_default();
 
-        let session_api = api_from_config(&init_logging, &config)
+        let web_settings = Arc::new(WebViewSettingsBackend::new());
+        let session_api = api_from_config(&init_logging, &config, Some(web_settings.clone()))
             .await
             .map_err(|e| {
                 warn!(error=?e, "error reading configuration");
@@ -316,6 +331,7 @@ impl State {
             shared,
             init_logging: Arc::new(init_logging),
             hooks,
+            web_settings,
         })
     }
 
@@ -376,21 +392,24 @@ impl State {
         old_api.session().stop().await;
 
         // Build the replacement API without holding any lock across the await.
-        let session_api = match api_from_config(&self.init_logging, &config).await {
-            Ok(api) => api,
-            Err(e) => {
-                // The config file was already written by the caller; adopt the
-                // new config here too so the UI does not silently roll the
-                // user's changes back (the old session is stopped either way,
-                // and no folder watcher is started for it — restart the app
-                // or fix the config and re-apply). The old session's column
-                // poller died with it, so drop the stale provider.
-                let mut shared = self.shared.write();
-                shared.config = config;
-                shared.columns = None;
-                return Err(e.into());
-            }
-        };
+        let session_api =
+            match api_from_config(&self.init_logging, &config, Some(self.web_settings.clone()))
+                .await
+            {
+                Ok(api) => api,
+                Err(e) => {
+                    // The config file was already written by the caller; adopt the
+                    // new config here too so the UI does not silently roll the
+                    // user's changes back (the old session is stopped either way,
+                    // and no folder watcher is started for it — restart the app
+                    // or fix the config and re-apply). The old session's column
+                    // poller died with it, so drop the stale provider.
+                    let mut shared = self.shared.write();
+                    shared.config = config;
+                    shared.columns = None;
+                    return Err(e.into());
+                }
+            };
         if let Err(e) = write_config(&self.config_filename, &config) {
             error!("error writing config: {:#}", e);
         }
@@ -433,7 +452,7 @@ pub(crate) mod tests {
                 )
             })
             .clone();
-        let session_api = api_from_config(&init_logging, &config).await.unwrap();
+        let session_api = api_from_config(&init_logging, &config, None).await.unwrap();
         let shared = Arc::new(RwLock::new(SharedState {
             config,
             api: Arc::new(session_api.api),
@@ -448,6 +467,7 @@ pub(crate) mod tests {
             shared,
             init_logging,
             hooks,
+            web_settings: Arc::new(WebViewSettingsBackend::new()),
         }
     }
 

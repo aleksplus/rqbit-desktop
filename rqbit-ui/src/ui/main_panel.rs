@@ -833,8 +833,7 @@ impl MainPanel {
     }
 
     fn on_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let main = cx.entity().downgrade();
-        if let Some(page) = self.host.open_settings(main, _window, cx) {
+        if let Some(page) = self.host.open_settings(self.client.clone(), _window, cx) {
             self.active_page = Some(page);
             cx.notify();
         }

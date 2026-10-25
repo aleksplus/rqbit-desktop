@@ -275,6 +275,70 @@ pub struct SessionInfo {
     pub default_download_folder: String,
 }
 
+/// The session-level settings a remote client can read and change via
+/// `GetSessionSettings` / `SetSessionSettings`. Covers the startup options of
+/// the engine session (`SessionOptions`) — applying them means the host
+/// rebuilds its session, which is the client's cue to expect a reconnect.
+///
+/// Folder paths are plain strings: remote clients have no filesystem, so
+/// there is nothing to pick from (the UI renders them as text inputs).
+/// Empty folder strings mean "host default".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionSettings {
+    /// Where downloaded data is stored.
+    pub default_download_folder: String,
+    // ── DHT ──
+    pub dht_enabled: bool,
+    pub dht_persistence_enabled: bool,
+    /// Empty = host default filename.
+    pub dht_persistence_filename: String,
+    // ── Session persistence ──
+    pub persistence_enabled: bool,
+    /// Empty = host default folder.
+    pub persistence_folder: String,
+    pub fastresume: bool,
+    // ── Rate limits ──
+    /// Bytes per second; 0 = unlimited.
+    pub download_rate_limit_bps: u32,
+    /// Bytes per second; 0 = unlimited.
+    pub upload_rate_limit_bps: u32,
+    // ── Connection ──
+    pub enable_tcp_listen: bool,
+    pub enable_utp: bool,
+    pub enable_upnp_port_forward: bool,
+    pub listen_port: u16,
+    pub enable_tcp_outgoing: bool,
+    /// Empty = no proxy.
+    pub socks_proxy: String,
+    pub peer_connect_timeout_secs: u32,
+    pub peer_read_write_timeout_secs: u32,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            default_download_folder: String::new(),
+            dht_enabled: true,
+            dht_persistence_enabled: true,
+            dht_persistence_filename: String::new(),
+            persistence_enabled: true,
+            persistence_folder: String::new(),
+            fastresume: false,
+            download_rate_limit_bps: 0,
+            upload_rate_limit_bps: 0,
+            enable_tcp_listen: true,
+            enable_utp: false,
+            enable_upnp_port_forward: true,
+            listen_port: 4240,
+            enable_tcp_outgoing: true,
+            socks_proxy: String::new(),
+            peer_connect_timeout_secs: 2,
+            peer_read_write_timeout_secs: 10,
+        }
+    }
+}
+
 /// Response of `Api::api_add_torrent`. `id: None` means list-only
 /// (the add dialog's file-list preview).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

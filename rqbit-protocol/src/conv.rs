@@ -246,6 +246,9 @@ impl From<&AddSource> for librqbit::AddTorrent<'static> {
             // resolves them identically (same path the desktop dialog uses).
             AddSource::Magnet(s) => librqbit::AddTorrent::from_url(s.clone()),
             AddSource::Url(s) => librqbit::AddTorrent::from_url(s.clone()),
+            // Picked .torrent files travel the wire whole (the browser
+            // client reads them through a file picker).
+            AddSource::Bytes(bytes) => librqbit::AddTorrent::from_bytes(bytes.clone()),
         }
     }
 }

@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::ProtoError;
 pub use crate::types::TorrentId;
 use crate::types::{
-    ApiAddTorrent, CustomColumnsState, DhtStats, PeerStatsSnapshot, SessionInfo, SessionStats,
-    TorrentDetails, TorrentList, TorrentStats,
+    ApiAddTorrent, CustomColumnsState, DhtStats, PeerStatsSnapshot, SessionInfo, SessionSettings,
+    SessionStats, TorrentDetails, TorrentList, TorrentStats,
 };
 
 pub type RequestId = u64;
@@ -76,6 +76,14 @@ pub enum Request {
     },
     /// `Api::api_set_rust_log`.
     SetRustLog(String),
+    /// Read the session-level settings the host manages (see
+    /// [`crate::types::SessionSettings`]). Errors when the host has no
+    /// settings backend.
+    GetSessionSettings,
+    /// Replace the session-level settings. The host applies them by
+    /// rebuilding its session; for the client this usually means the
+    /// connection drops and the auto-reconnect lands on the new session.
+    SetSessionSettings(Box<SessionSettings>),
 }
 
 /// The torrent actions the UI dispatches (mirrors the
@@ -94,16 +102,18 @@ pub enum TorrentAction {
     UpdateOnlyFiles(Vec<u64>),
 }
 
-/// Where a torrent comes from. File bytes are intentionally absent — the
-/// browser client cannot yet hand over picked files; magnet/URL covers the
-/// agreed first scope and maps to `AddTorrent::from_url` (librqbit resolves
+/// Where a torrent comes from. `Bytes` carries a picked .torrent file's
+/// contents across the wire (the browser client reads them through a file
+/// picker); magnet/URL map to `AddTorrent::from_url` (librqbit resolves
 /// magnet and http(s) URLs identically).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddSource {
-    /// A `magnet:?…` URI.
+    /// A `magnet:?…` URI (or a bare info hash).
     Magnet(String),
     /// An `http(s)://…` URL pointing at a .torrent file.
     Url(String),
+    /// Raw .torrent file bytes.
+    Bytes(Vec<u8>),
 }
 
 /// Daemon → client frames.
@@ -129,6 +139,7 @@ pub enum ResponsePayload {
     PeerStats(PeerStatsSnapshot),
     SessionStats(Box<SessionStats>),
     SessionInfo(Box<SessionInfo>),
+    SessionSettings(Box<SessionSettings>),
     DhtStats(DhtStats),
     Added(Box<ApiAddTorrent>),
     /// Action succeeded, nothing to return.
