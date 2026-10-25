@@ -1,21 +1,5 @@
 # Development guide
 
-## Rust
-
-Nothing special here. I run with
-
-    make devserver
-
-## Web UI
-
-Start the server
-
-    make devserver
-
-Run Web UI dev
-
-    make webui-dev
-
 ## Desktop app (desktop-gpui)
 
 Build the browser payload once (embedded at compile time into both the
