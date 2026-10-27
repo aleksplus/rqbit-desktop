@@ -86,6 +86,8 @@ toml = "0.8"
 # Cross-platform "open folder / URL" (macOS `open`, Linux `xdg-open`, Windows).
 # Already a transitive dep of gpui-pre-linux; declared here for `DesktopHost::open_folder`.
 open = "5"
+# URL-encoding of stream-URL filename segments.
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 # Headless UI tests (gpui_kit::test) need the kit's test-support feature.

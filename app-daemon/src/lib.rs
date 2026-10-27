@@ -10,6 +10,7 @@
 
 pub mod columns;
 pub mod embed;
+pub mod media;
 pub mod server;
 
 use anyhow::Context as _;

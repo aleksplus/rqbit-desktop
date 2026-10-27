@@ -123,6 +123,23 @@ pub fn render_custom_cell(value: &str, kind: CustomColumnKind, theme: &Theme) ->
     div().child(value.to_string())
 }
 
+/// File extensions treated as playable media (video and audio), matching
+/// what the media endpoints consider playable.
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "mpg", "mpeg", "ts", "wmv", "flv", //
+    "mp3", "flac", "m4a", "aac", "ogg", "oga", "opus", "wav", "wma",
+];
+
+/// Whether a file name (bare name or path) looks like playable media, i.e.
+/// gets Play buttons in the file list.
+pub fn is_media_file(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .is_some_and(|ext| MEDIA_EXTENSIONS.contains(&ext.as_str()))
+}
+
 /// Build a context-menu item that runs a pause/start action on a torrent.
 pub fn torrent_action_menu_item(
     label: String,
@@ -293,5 +310,16 @@ mod tests {
         assert_eq!(status_tone(""), None);
         assert_eq!(status_tone("some bespoke state"), None);
         assert_eq!(status_tone("42"), None);
+    }
+
+    #[test]
+    fn media_files_detected_by_extension() {
+        assert!(is_media_file("movie.mkv"));
+        assert!(is_media_file("SOME_DIR/Track 02.Flac"));
+        assert!(is_media_file("episode.webm"));
+        assert!(!is_media_file("notes.txt"));
+        assert!(!is_media_file("archive.rar"));
+        // An extension is required at all.
+        assert!(!is_media_file("noext"));
     }
 }

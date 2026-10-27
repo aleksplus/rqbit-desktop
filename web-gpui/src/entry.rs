@@ -33,8 +33,8 @@ pub fn run(daemon_url: String) -> Result<(), JsValue> {
     // Panic hooks + console logging for the web platform.
     gpui_platform::web_init();
 
-    let client = Arc::new(RemoteClient::new(daemon_url));
-    let host = Arc::new(WebHost);
+    let client = Arc::new(RemoteClient::new(daemon_url.clone()));
+    let host = Arc::new(WebHost::new(&daemon_url));
 
     let app = gpui_platform::single_threaded_web().with_assets(IconAssets);
     app.run(move |cx: &mut App| {

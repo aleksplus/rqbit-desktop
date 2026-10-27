@@ -68,12 +68,31 @@ pub trait UiHost: 'static {
     /// Reveal a folder in the OS file manager.
     fn open_folder(&self, _path: &str) {}
 
+    /// Open a URL with the host's default handler (desktop: the OS opener;
+    /// browser: a new tab).
+    fn open_url(&self, _url: &str) {}
+
+    /// Play a media stream URL. Hosts may wrap the URL to control playback
+    /// UX: browsers start bare media documents (a directly-opened
+    /// `video/mp4` URL) muted under their autoplay policy, so the web host
+    /// opens a minimal HTML player instead. Copy actions should keep using
+    /// the raw [`UiHost::stream_url`].
+    fn open_media(&self, _url: &str) {}
+
     /// Persist the theme choice ("dark"/"light").
     fn persist_theme(&self, _mode: &str) {}
 
     /// The playlist (M3U8) URL served for a torrent, when the host knows a
-    /// usable HTTP API base. `None` renders the row as "Unavailable".
+    /// usable HTTP media base. `None` renders the row as "Unavailable".
     fn playlist_url(&self, _torrent_id: u64) -> Option<String> {
+        None
+    }
+
+    /// The HTTP streaming URL of one torrent file, when the host knows a
+    /// usable media base. Works for downloading files too (the server
+    /// streams from piece availability). Play actions are only rendered
+    /// when this returns `Some`.
+    fn stream_url(&self, _torrent_id: u64, _file_idx: usize, _filename: &str) -> Option<String> {
         None
     }
 

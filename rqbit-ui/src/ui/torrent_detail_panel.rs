@@ -59,6 +59,8 @@ pub struct TorrentDetailPanel {
 /// Marker type so repeated "playlist copied" notifications replace each other
 /// instead of stacking up.
 struct PlaylistCopiedNotice;
+/// Ditto for "stream URL copied" notifications.
+struct StreamUrlCopiedNotice;
 
 impl EventEmitter<TorrentDetailPanelEvent> for TorrentDetailPanel {}
 
@@ -74,6 +76,7 @@ impl TorrentDetailPanel {
         let file_table_state = cx.new(|cx| {
             let mut delegate = FileTableDelegate::new();
             delegate.show_progress();
+            delegate.show_media_actions();
             delegate.set_table(cx.entity().downgrade());
             delegate.on_toggle = Some(Arc::new({
                 let panel = panel_weak.clone();
@@ -91,6 +94,26 @@ impl TorrentDetailPanel {
                     if let Some(panel) = panel.upgrade() {
                         panel.update(cx, |panel, cx| {
                             panel.set_all_files_included(included, cx);
+                        });
+                    }
+                }
+            }));
+            delegate.on_media_play = Some(Arc::new({
+                let panel = panel_weak.clone();
+                move |file_index, name, window, cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |panel, cx| {
+                            panel.play_file(file_index, name, window, cx);
+                        });
+                    }
+                }
+            }));
+            delegate.on_copy_stream_url = Some(Arc::new({
+                let panel = panel_weak.clone();
+                move |file_index, name, window, cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |panel, cx| {
+                            panel.copy_stream_url(file_index, name, window, cx);
                         });
                     }
                 }
@@ -373,9 +396,54 @@ impl TorrentDetailPanel {
         );
     }
 
+    /// Open one file's HTTP stream URL with the host's media handler
+    /// (desktop: the OS opener — browser tab or media player; browser: a
+    /// new tab with an HTML player, so autoplay isn't muted). Works while
+    /// the file is still downloading.
+    fn play_file(
+        &mut self,
+        file_index: usize,
+        name: String,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some(url) = self
+            .host
+            .stream_url(self.torrent_id as u64, file_index, &name)
+        else {
+            return;
+        };
+        self.host.open_media(&url);
+    }
+
+    /// Copy one file's HTTP stream URL to the clipboard (paste into an
+    /// external player, e.g. VLC or mpv).
+    fn copy_stream_url(
+        &mut self,
+        file_index: usize,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(url) = self
+            .host
+            .stream_url(self.torrent_id as u64, file_index, &name)
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(url));
+        window.push_notification(
+            Notification::success("Stream URL copied. Paste into e.g. VLC to play.")
+                .title("Copied")
+                .id::<StreamUrlCopiedNotice>(),
+            cx,
+        );
+    }
+
     /// The "Playlist" row in the General section, mirroring the webui's
-    /// `PlaylistLink`: a link that copies the playlist URL to the clipboard
-    /// (paste into e.g. VLC to play), or "Unavailable" when there is none.
+    /// `PlaylistLink`: open the playlist with the default handler (a new tab
+    /// in the browser; VLC or whatever is associated with M3U8 files on the
+    /// desktop) and/or copy the URL, or "Unavailable" when there is none.
     fn render_playlist_row(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
 
@@ -384,12 +452,26 @@ impl TorrentDetailPanel {
                 .text_color(theme.muted_foreground)
                 .child("Unavailable")
                 .into_any_element(),
-            Some(_) => Button::new("playlist-copy-link")
-                .link()
-                .label("Copy playlist URL")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.copy_playlist_url_to_clipboard(window, cx);
-                }))
+            Some(_) => h_flex()
+                .gap_3()
+                .child(
+                    Button::new("playlist-open-link")
+                        .link()
+                        .label("Open playlist")
+                        .on_click(cx.listener(|this, _, _, _| {
+                            if let Some(url) = this.playlist_url() {
+                                this.host.open_url(&url);
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("playlist-copy-link")
+                        .link()
+                        .label("Copy playlist URL")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.copy_playlist_url_to_clipboard(window, cx);
+                        })),
+                )
                 .into_any_element(),
         };
 

@@ -1,7 +1,8 @@
 //! Desktop implementation of the shared UI's [`UiHost`]: everything that
 //! needs a real OS — the file dialog for .torrent picking, "Open Folder",
-//! config-backed theme persistence, the settings page, and the playlist URL
-//! derived from the embedded HTTP API.
+//! opening URLs with the default handler, config-backed theme persistence,
+//! the settings page, and the playlist/stream URLs derived from the
+//! embedded HTTP API.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -44,6 +45,19 @@ impl UiHost for DesktopHost {
         }
     }
 
+    fn open_url(&self, url: &str) {
+        // Detached: opening a browser/player must not block the UI thread.
+        if let Err(e) = open::that_detached(url) {
+            tracing::warn!(url = %url, error = %e, "error opening url");
+        }
+    }
+
+    fn open_media(&self, url: &str) {
+        // No in-app player: hand the stream URL to the OS default handler
+        // (browser tab, VLC, …) which manages its own audio.
+        self.open_url(url)
+    }
+
     fn persist_theme(&self, mode: &str) {
         self.state.set_theme(mode);
     }
@@ -53,7 +67,20 @@ impl UiHost for DesktopHost {
         if http_api.disable {
             return None;
         }
-        Some(playlist_http_url(http_api.listen_addr, torrent_id as usize))
+        Some(playlist_http_url(http_api.listen_addr, torrent_id))
+    }
+
+    fn stream_url(&self, torrent_id: u64, file_idx: usize, filename: &str) -> Option<String> {
+        let http_api = &self.state.config().http_api;
+        if http_api.disable {
+            return None;
+        }
+        Some(stream_http_url(
+            http_api.listen_addr,
+            torrent_id,
+            file_idx,
+            filename,
+        ))
     }
 
     fn open_settings(
@@ -122,12 +149,10 @@ impl UiHost for DesktopHost {
     }
 }
 
-/// Build the playlist URL served by the embedded HTTP API for a torrent,
-/// mirroring the webui's `getPlaylistUrl`:
-/// `{http-api-base}/torrents/{id}/playlist`. An unspecified listen address
-/// (0.0.0.0 / ::) is replaced with the loopback address so the URL works from
-/// the local machine.
-fn playlist_http_url(listen_addr: std::net::SocketAddr, torrent_id: usize) -> String {
+/// Build the embedded HTTP API's base URL: an unspecified listen address
+/// (0.0.0.0 / ::) is replaced with the loopback address so the URL works
+/// from the local machine.
+fn http_api_base_url(listen_addr: std::net::SocketAddr) -> String {
     let host = match listen_addr.ip() {
         std::net::IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
         std::net::IpAddr::V6(v6) => {
@@ -140,15 +165,36 @@ fn playlist_http_url(listen_addr: std::net::SocketAddr, torrent_id: usize) -> St
         }
         ip => ip.to_string(),
     };
+    format!("http://{host}:{}", listen_addr.port())
+}
+
+/// The playlist (M3U8) URL served by the embedded HTTP API for a torrent,
+/// mirroring the webui's `getPlaylistUrl`.
+fn playlist_http_url(listen_addr: std::net::SocketAddr, torrent_id: u64) -> String {
     format!(
-        "http://{host}:{}/torrents/{torrent_id}/playlist",
-        listen_addr.port()
+        "{}/torrents/{torrent_id}/playlist",
+        http_api_base_url(listen_addr)
+    )
+}
+
+/// The streaming URL of one torrent file (Range-capable; plays while the
+/// torrent is still downloading). The filename segment is decorative.
+fn stream_http_url(
+    listen_addr: std::net::SocketAddr,
+    torrent_id: u64,
+    file_idx: usize,
+    filename: &str,
+) -> String {
+    let filename = urlencoding::encode(filename);
+    format!(
+        "{}/torrents/{torrent_id}/stream/{file_idx}/{filename}",
+        http_api_base_url(listen_addr)
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::playlist_http_url;
+    use super::{http_api_base_url, playlist_http_url, stream_http_url};
 
     fn addr(s: &str) -> std::net::SocketAddr {
         s.parse().unwrap()
@@ -183,6 +229,18 @@ mod tests {
         assert_eq!(
             playlist_http_url(addr("[::]:1234"), 7),
             "http://[::1]:1234/torrents/7/playlist"
+        );
+    }
+
+    #[test]
+    fn base_url_and_stream_url_shape() {
+        assert_eq!(
+            http_api_base_url(addr("0.0.0.0:3030")),
+            "http://127.0.0.1:3030"
+        );
+        assert_eq!(
+            stream_http_url(addr("0.0.0.0:3030"), 7, 2, "some dir/movie (2024).mkv"),
+            "http://127.0.0.1:3030/torrents/7/stream/2/some%20dir%2Fmovie%20%282024%29.mkv"
         );
     }
 }

@@ -455,11 +455,14 @@ pub fn router(
 
     axum::Router::new()
         .route("/ws", get(ws_route))
+        .merge(crate::media::router())
         .fallback(serve_static)
         .with_state((api, line_broadcast, columns, settings))
 }
 
-type RouterState = (
+/// Shared router state: the Api slot plus the optional services. Also the
+/// state the media routes (`media.rs`) extract the Api slot from.
+pub(crate) type RouterState = (
     ApiSlot,
     Option<LineBroadcast>,
     Option<Arc<ColumnsProvider>>,

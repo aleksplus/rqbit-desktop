@@ -4,8 +4,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, checkbox::Checkbox, h_flex,
-    menu::PopupMenuItem, progress::Progress,
+    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, checkbox::Checkbox, h_flex,
+    menu::PopupMenuItem, notification::Notification, progress::Progress,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -18,9 +18,13 @@ use crate::client::TorrentClient;
 use crate::host::UiHost;
 use crate::ui::main_panel::MainPanel;
 use crate::ui::utils::{
-    format_bytes, format_eta, format_speed, render_custom_cell, torrent_action_menu_item,
-    torrent_bulk_action_menu_item,
+    format_bytes, format_eta, format_speed, is_media_file, render_custom_cell,
+    torrent_action_menu_item, torrent_bulk_action_menu_item,
 };
+
+/// Marker type so repeated context-menu "playlist copied" notifications
+/// replace each other instead of stacking up.
+struct MenuPlaylistCopiedNotice;
 
 /// Visual tone for a torrent row, derived from the torrent state. Drives
 /// row-level styling: paused rows render with dimmed text, and the progress
@@ -1008,6 +1012,70 @@ impl TableDelegate for TorrentTableDelegate {
             ))
             .separator()
         };
+
+        // Media playback: offered when the host has a media base at all
+        // (the same condition that fills the detail panel's playlist row).
+        // Single-torrent by nature — like Open Folder, always the
+        // right-clicked torrent. Placed before Open Folder, whose closure
+        // consumes the `client`/`host` handles.
+        if host.playlist_url(torrent_id).is_some() {
+            // Play streams the torrent's first media file in name order (the
+            // same order the playlist endpoint uses); the file list is
+            // resolved lazily like Open Folder's output folder.
+            m = m
+                .item(
+                    PopupMenuItem::new(format!("Play: {torrent_name}")).on_click({
+                        let client = client.clone();
+                        let host = host.clone();
+                        move |_, _, cx: &mut App| {
+                            let client = client.clone();
+                            let host = host.clone();
+                            cx.spawn(async move |cx| {
+                                let Ok(details) = client
+                                    .details(&rqbit_protocol::TorrentId::Id(torrent_id))
+                                    .await
+                                else {
+                                    return;
+                                };
+                                let first = details
+                                    .files
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter(|(_, f)| is_media_file(&f.name))
+                                    .min_by(|l, r| l.1.name.cmp(&r.1.name));
+                                let Some((file_idx, file)) = first else {
+                                    return;
+                                };
+                                let Some(url) = host.stream_url(torrent_id, file_idx, &file.name)
+                                else {
+                                    return;
+                                };
+                                cx.update(|_| host.open_media(&url));
+                            })
+                            .detach();
+                        }
+                    }),
+                )
+                .item(PopupMenuItem::new("Copy playlist URL").on_click({
+                    let host = host.clone();
+                    move |_, window, cx: &mut App| {
+                        let Some(url) = host.playlist_url(torrent_id) else {
+                            return;
+                        };
+                        cx.write_to_clipboard(ClipboardItem::new_string(url));
+                        window.push_notification(
+                            Notification::success(
+                                "Playlist URL copied to clipboard. Paste into e.g. VLC to play.",
+                            )
+                            .title("Copied")
+                            .id::<MenuPlaylistCopiedNotice>(),
+                            cx,
+                        );
+                    }
+                }))
+                .separator();
+        }
 
         if self.host.capabilities().open_folder {
             // Resolve the output folder lazily (async round-trip; may be a

@@ -242,6 +242,7 @@ dependencies = [
  "clap",
  "futures",
  "librqbit",
+ "mime_guess",
  "parking_lot",
  "reqwest",
  "rqbit-protocol",
@@ -249,7 +250,9 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tokio-util",
  "tracing",
+ "urlencoding",
 ]
 
 [[package]]
@@ -1860,6 +1863,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "urlencoding",
  "walkdir",
 ]
 
@@ -9415,6 +9419,7 @@ dependencies = [
  "js-sys",
  "rqbit-protocol",
  "rqbit-ui",
+ "urlencoding",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

@@ -1,6 +1,7 @@
 use gpui::*;
 use gpui_kit::component::{
-    ActiveTheme as _,
+    ActiveTheme as _, IconName, Sizable as _,
+    button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     progress::Progress,
@@ -11,7 +12,7 @@ use std::sync::Arc;
 
 use rqbit_protocol::{CustomColumnKind, CustomColumnSpec, CustomColumnsState};
 
-use crate::ui::utils::render_custom_cell;
+use crate::ui::utils::{is_media_file, render_custom_cell};
 
 /// A single row in a file-selection table.
 #[derive(Clone)]
@@ -33,6 +34,11 @@ pub struct FileRow {
 pub type OnFileToggle = Arc<dyn Fn(usize, bool, &mut App) + Send + Sync>;
 /// Callback invoked when the "select all" checkbox is toggled.
 pub type OnToggleAll = Arc<dyn Fn(bool, &mut App) + Send + Sync>;
+/// Callback invoked when a media file's Play button is clicked:
+/// `(file_index, file_name, window, cx)`.
+pub type OnMediaPlay = Arc<dyn Fn(usize, String, &mut Window, &mut App) + Send + Sync>;
+/// Callback invoked when a media file's "copy stream URL" button is clicked.
+pub type OnCopyStreamUrl = Arc<dyn Fn(usize, String, &mut Window, &mut App) + Send + Sync>;
 
 /// Reusable table delegate for selecting which files of a torrent to download.
 ///
@@ -47,10 +53,18 @@ pub struct FileTableDelegate {
     table: WeakEntity<TableState<FileTableDelegate>>,
     pub on_toggle: Option<OnFileToggle>,
     pub on_toggle_all: Option<OnToggleAll>,
+    /// Invoked when the user hits Play on a media file row.
+    pub on_media_play: Option<OnMediaPlay>,
+    /// Invoked when the user copies a media file's stream URL.
+    pub on_copy_stream_url: Option<OnCopyStreamUrl>,
     /// Whether to show the per-file Progress column. Only enabled in the
     /// torrent detail panel (where live stats are available); the add-torrent
     /// dialog leaves this off.
     show_progress: bool,
+    /// Whether to show the Play / copy-URL actions for media files. Only
+    /// enabled in the torrent detail panel, where the host can build
+    /// streaming URLs.
+    show_media_actions: bool,
     /// Hook-provided dynamic columns (only those with `files: true`),
     /// appended after the static ones. Empty when no hook provides columns
     /// or the providing hook is unreachable.
@@ -76,19 +90,22 @@ impl FileTableDelegate {
             table: WeakEntity::new_invalid(),
             on_toggle: None,
             on_toggle_all: None,
+            on_media_play: None,
+            on_copy_stream_url: None,
             show_progress: false,
+            show_media_actions: false,
             custom_specs: Vec::new(),
             custom_kinds: HashMap::new(),
-            columns: Self::base_columns(false),
+            columns: Self::base_columns(false, false),
             // Default sort by file name (ascending).
             sort_col_ix: Some(1),
             sort_dir: ColumnSort::Ascending,
         }
     }
 
-    /// The static columns (plus Progress when enabled), before any
-    /// hook-provided dynamic ones.
-    fn base_columns(show_progress: bool) -> Vec<Column> {
+    /// The static columns (plus Progress / media actions when enabled),
+    /// before any hook-provided dynamic ones.
+    fn base_columns(show_progress: bool, show_media_actions: bool) -> Vec<Column> {
         let mut columns = vec![
             Column::new("included", "Included")
                 .width(35.)
@@ -100,13 +117,16 @@ impl FileTableDelegate {
         if show_progress {
             columns.push(Column::new("progress", "Progress").width(140.).sortable());
         }
+        if show_media_actions {
+            columns.push(Column::new("media", "Play").width(70.).selectable(false));
+        }
         columns
     }
 
     /// Rebuild `columns` from the base plus dynamic specs, re-mirroring the
     /// active sort so the header arrow survives a `refresh()`.
     fn rebuild_columns(&mut self) {
-        let mut columns = Self::base_columns(self.show_progress);
+        let mut columns = Self::base_columns(self.show_progress, self.show_media_actions);
         for spec in &self.custom_specs {
             let mut col = Column::new(spec.key.clone(), spec.name.clone()).sortable();
             if let Some(width) = spec.width {
@@ -131,6 +151,16 @@ impl FileTableDelegate {
             return;
         }
         self.show_progress = true;
+        self.rebuild_columns();
+    }
+
+    /// Enable the Play / copy-URL actions for media files. Call before the
+    /// table is first rendered so the column list is stable.
+    pub fn show_media_actions(&mut self) {
+        if self.show_media_actions {
+            return;
+        }
+        self.show_media_actions = true;
         self.rebuild_columns();
     }
 
@@ -321,6 +351,47 @@ impl TableDelegate for FileTableDelegate {
                             cb(row_ix, new_included, cx);
                         }
                     })
+                    .into_any_element()
+            }
+            // Play / copy-stream-URL for playable media files (detail panel
+            // only). Non-media rows render nothing.
+            "media" => {
+                if !is_media_file(&row.name) {
+                    return div().into_any_element();
+                }
+                let file_index = row.file_index;
+                let on_play = self.on_media_play.clone();
+                let on_copy = self.on_copy_stream_url.clone();
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new(("file-play", row_ix))
+                            .icon(IconName::Play)
+                            .ghost()
+                            .xsmall()
+                            .on_click({
+                                let name = row.name.clone();
+                                move |_, window, cx| {
+                                    if let Some(cb) = &on_play {
+                                        cb(file_index, name.clone(), window, cx);
+                                    }
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new(("file-copy-stream-url", row_ix))
+                            .icon(IconName::Copy)
+                            .ghost()
+                            .xsmall()
+                            .on_click({
+                                let name = row.name.clone();
+                                move |_, window, cx| {
+                                    if let Some(cb) = &on_copy {
+                                        cb(file_index, name.clone(), window, cx);
+                                    }
+                                }
+                            }),
+                    )
                     .into_any_element()
             }
             // Hook-provided dynamic columns: text or a tinted status badge.
