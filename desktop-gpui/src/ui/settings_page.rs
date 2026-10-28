@@ -6,6 +6,7 @@ use gpui_kit::component::{
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    label::Label,
     scroll::ScrollableElement,
     setting::{
         NumberFieldOptions, RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage,
@@ -780,19 +781,20 @@ fn hook_remove_field(
     }
 }
 
-/// "Add Hook" button shown in the last group of the Hooks page.
-fn add_hook_field(
-    config: ConfigArc,
-) -> impl Fn(&RenderOptions, &mut Window, &mut App) -> AnyElement {
-    move |_options, _window, _cx| {
+/// The **Add Hook** button pinned in the Hooks page header. It appends a new
+/// hook with a default configuration. Living in the header — outside the
+/// scrolling list of hook groups — it stays visible no matter how many hooks
+/// are configured, and no hook group needs to carry a duplicated manage row.
+fn add_hook_button(config: ConfigArc) -> impl Fn(&mut Window, &mut App) -> Button {
+    move |_window, _cx| {
         let cfg = config.clone();
         Button::new("hooks-add")
             .label("Add Hook")
-            .on_click(move |_, _, cx: &mut App| {
+            .small()
+            .on_click(move |_, _, cx| {
                 add_hook(&cfg);
                 cx.refresh_windows();
             })
-            .into_any_element()
     }
 }
 
@@ -827,11 +829,25 @@ fn set_hook_poll(h: &mut HookConfig, v: f64) {
     h.poll_secs = v as u64;
 }
 
-/// Build the groups of the Hooks settings page: one per configured hook,
-/// plus a trailing group with the add button.
+/// Build the groups of the Hooks settings page: exactly one group per
+/// configured hook. The **Add Hook** action is not a group — it is pinned in
+/// the page header (see [`add_hook_button`]), so nothing here duplicates it.
 fn hook_groups(config: ConfigArc) -> Vec<SettingGroup> {
     let count = config.read().hooks.hooks.len();
-    let mut groups: Vec<SettingGroup> = (0..count)
+    if count == 0 {
+        return vec![SettingGroup::new().items(vec![SettingItem::render(
+            move |_options, _window, cx| {
+                div()
+                    .py_2()
+                    .child(
+                        Label::new("No hooks configured. Click Add Hook to create one.")
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .into_any_element()
+            },
+        )])];
+    }
+    (0..count)
         .map(|ix| {
             let title = with_hook(&config, ix, |h| h.name.clone(), String::new());
             let title = if title.trim().is_empty() {
@@ -891,16 +907,7 @@ fn hook_groups(config: ConfigArc) -> Vec<SettingGroup> {
                 .layout(Axis::Vertical),
             ])
         })
-        .collect();
-    groups.push(
-        SettingGroup::new()
-            .title("Manage")
-            .items(vec![SettingItem::new(
-                "",
-                SettingField::render(add_hook_field(config)),
-            )]),
-    );
-    groups
+        .collect()
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────
@@ -1256,6 +1263,9 @@ impl Render for SettingsPage {
                                          delivered as JSON over HTTP. See the hooks module docs \
                                          for the payload contract.",
                                     )
+                                    // The add button lives in the page header so it
+                                    // stays fixed on top while the hook groups scroll.
+                                    .title_suffix(add_hook_button(config.clone()))
                                     .groups(hook_groups(config.clone())),
                             ]),
                     ),
