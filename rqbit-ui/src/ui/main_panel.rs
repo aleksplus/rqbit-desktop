@@ -1286,12 +1286,18 @@ impl MainPanel {
     ) {
         let dialog = cx.new(|cx| DeleteDialog::new(ids, names, window, cx));
         let panel = cx.entity();
-        window.open_dialog(cx, {
+        window.open_alert_dialog(cx, {
             let dialog = dialog.clone();
             move |d, _, cx| {
                 let title = dialog.read(cx).title();
                 let ok_label = dialog.read(cx).ok_label();
+                let question = dialog.read(cx).question();
                 d.title(title)
+                    .description(question)
+                    .confirm()
+                    .ok_text(ok_label)
+                    .ok_variant(ButtonVariant::Danger)
+                    .width(px(450.))
                     .button_props(DialogButtonProps::default().on_ok({
                         let dialog = dialog.clone();
                         let panel = panel.clone();
@@ -1303,15 +1309,6 @@ impl MainPanel {
                             true
                         }
                     }))
-                    .footer(
-                        DialogFooter::new()
-                            .child(dialog_cancel_button("delete-cancel"))
-                            .child(dialog_confirm_button(
-                                "delete-ok",
-                                ok_label,
-                                ButtonVariant::Danger,
-                            )),
-                    )
                     .child(dialog.clone())
             }
         });
@@ -1593,5 +1590,128 @@ mod tests {
             .expect("test window open");
         assert_eq!(confirmed.get(), 1, "OK runs the confirm handler");
         assert_eq!(cancelled.get(), 1);
+    }
+
+    /// The delete dialog is an `AlertDialog` with the library's default
+    /// footer (`.confirm()`'s Cancel plus OK), customized through
+    /// `button_props` alone. This pins that wiring the way
+    /// `dialog_footer_buttons_dispatch_confirm_and_cancel` pins the custom
+    /// footer: both default buttons are painted, clicking them dispatches the
+    /// dialog's Cancel/Confirm actions into the `button_props` handlers (the
+    /// single decision point), and a `true` return closes the dialog.
+    #[gpui_kit::test]
+    fn delete_alert_dialog_footer_dispatches_confirm_and_cancel(cx: &mut TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::button::ButtonVariant;
+        use gpui_kit::component::dialog::DialogButtonProps;
+        use gpui_kit::{AppContext as _, IntoElement, ParentElement as _, Render, Window, div};
+
+        use super::DeleteDialog;
+
+        struct Blank;
+        impl Render for Blank {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let window = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(800.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| cx.new(|_| Blank),
+            )
+            .expect("open test window")
+            .0
+        });
+
+        let cancelled = Rc::new(Cell::new(0));
+        let confirmed = Rc::new(Cell::new(0));
+
+        let draw_frame = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .expect("test window open");
+        };
+
+        // A frame mounts the dialog layer, the next paints it at rest.
+        let open_alert = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                let dialog =
+                    cx.new(|cx| DeleteDialog::new(vec![1], vec!["t".to_string()], window, cx));
+                window.open_alert_dialog(cx, {
+                    let cancelled = cancelled.clone();
+                    let confirmed = confirmed.clone();
+                    move |d, _, cx| {
+                        let title = dialog.read(cx).title();
+                        let ok_label = dialog.read(cx).ok_label();
+                        let question = dialog.read(cx).question();
+                        d.title(title)
+                            .description(question)
+                            .confirm()
+                            .ok_text(ok_label)
+                            .ok_variant(ButtonVariant::Danger)
+                            .width(px(450.))
+                            .button_props(
+                                DialogButtonProps::default()
+                                    .on_ok({
+                                        let confirmed = confirmed.clone();
+                                        move |_, _, _| {
+                                            confirmed.set(confirmed.get() + 1);
+                                            true
+                                        }
+                                    })
+                                    .on_cancel({
+                                        let cancelled = cancelled.clone();
+                                        move |_, _, _| {
+                                            cancelled.set(cancelled.get() + 1);
+                                            true
+                                        }
+                                    }),
+                            )
+                            .child(dialog.clone())
+                    }
+                });
+            })
+            .expect("test window open");
+        };
+
+        let dialog_open = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| window.has_active_dialog(cx))
+                .expect("test window open")
+        };
+
+        open_alert(cx);
+        draw_frame(cx);
+        draw_frame(cx);
+        assert!(dialog_open(cx), "the alert dialog is up before the click");
+
+        cx.update_window(window, |_, window, cx| window.click("cancel", cx))
+            .expect("test window open");
+        assert_eq!(cancelled.get(), 1, "Cancel runs the cancel handler");
+        assert_eq!(confirmed.get(), 0);
+        assert!(!dialog_open(cx), "a `true` cancel closes the dialog");
+
+        open_alert(cx);
+        draw_frame(cx);
+        draw_frame(cx);
+        assert!(dialog_open(cx));
+
+        cx.update_window(window, |_, window, cx| window.click("ok", cx))
+            .expect("test window open");
+        assert_eq!(confirmed.get(), 1, "OK runs the confirm handler");
+        assert_eq!(cancelled.get(), 1);
+        assert!(!dialog_open(cx), "a `true` confirm closes the dialog");
     }
 }

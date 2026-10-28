@@ -7,11 +7,12 @@ use gpui_kit::component::{
     v_flex,
 };
 
-/// A modal dialog body for confirming torrent deletion.
+/// A modal alert body for confirming torrent deletion.
 ///
 /// This is only the content of the dialog: the surrounding modal (backdrop,
-/// title, footer buttons, close handling) is provided by the gpui-kit
-/// `Dialog` component that hosts it (see `MainPanel::create_delete_dialog`).
+/// title, description, footer buttons, close handling) is provided by the
+/// gpui-kit `AlertDialog` component that hosts it (see
+/// `MainPanel::create_delete_dialog`).
 pub struct DeleteDialog {
     ids: Vec<usize>,
     names: Vec<String>,
@@ -61,6 +62,15 @@ impl DeleteDialog {
             "Delete Torrent".to_string()
         }
     }
+
+    /// The question shown under the title, in the alert's description slot.
+    pub fn question(&self) -> String {
+        if self.is_bulk() {
+            "Are you sure you want to delete the following torrents?".to_string()
+        } else {
+            "Are you sure you want to delete this torrent?".to_string()
+        }
+    }
 }
 
 impl Render for DeleteDialog {
@@ -69,11 +79,6 @@ impl Render for DeleteDialog {
 
         v_flex()
             .gap_3()
-            .child(div().child(if self.is_bulk() {
-                "Are you sure you want to delete the following torrents?"
-            } else {
-                "Are you sure you want to delete this torrent?"
-            }))
             .child(
                 div()
                     .rounded_md()
