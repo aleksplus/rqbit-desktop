@@ -2,10 +2,11 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{WeakEntity, *};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::status_bar::StatusBar;
-use gpui_kit::component::{ActiveTheme, Sizable};
+use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
 use gpui_kit::component::{
     Icon, IconName, Size, StyledExt, TitleBar,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
+    dialog::{Cancel, Confirm, DialogButtonProps, DialogFooter},
     h_flex,
     input::{Input, InputEvent, InputState},
     resizable::{ResizableState, resizable_panel, v_resizable},
@@ -31,16 +32,11 @@ use crate::client::{AddTorrentRequest, ClientResult, TorrentClient, UiAddSource}
 use crate::host::UiHost;
 use crate::ui::add_torrent_dialog::{AddTorrentDialog, AddTorrentDialogEvent, AddTorrentEntry};
 
-use crate::ui::dialogs::{
-    AboutDialog, AboutDialogEvent, AboutInfo, DeleteDialog, DeleteDialogEvent, MagnetDialog,
-    MagnetDialogEvent,
-};
+use crate::ui::dialogs::{AboutDialog, AboutInfo, DeleteDialog, MagnetDialog};
 use crate::ui::log_page::{LogPage, LogPageEvent};
 use crate::ui::torrent_detail_panel::{TorrentDetailPanel, TorrentDetailPanelEvent};
 use crate::ui::torrent_table::{TorrentRow, TorrentTableDelegate};
-use crate::ui::utils::{
-    build_entry, format_bytes, format_speed, format_uptime, render_modal_overlay,
-};
+use crate::ui::utils::{build_entry, format_bytes, format_speed, format_uptime};
 
 /// Future returned by a per-torrent action dispatched by
 /// [`MainPanel::run_action_for_ids`].
@@ -80,15 +76,6 @@ fn dht_footer_status(res: &ClientResult<DhtStats>) -> DhtFooterStatus {
 /// builds can tint it without registering an asset source.
 const PLUG_SVG: &[u8] = include_bytes!("../../assets/plug.svg");
 
-/// The modal dialog currently open, if any. At most one dialog can be open at
-/// a time; opening a new one replaces the previous.
-enum ActiveDialog {
-    Magnet(Entity<MagnetDialog>),
-    Delete(Entity<DeleteDialog>),
-    Add(Entity<AddTorrentDialog>),
-    About(Entity<AboutDialog>),
-}
-
 /// The title bar's action-button cluster (add / settings / logs / theme).
 ///
 /// `Button` lets mouse events bubble up, and `TitleBar` zooms the window on a
@@ -116,6 +103,31 @@ async fn apply_file_selection_host(host: &Arc<dyn UiHost>, entry: &mut AddTorren
     }
 }
 
+/// A dialog footer button that dispatches the hosting dialog's `Confirm`
+/// action — the same action Enter activates — so the `button_props` `on_ok`
+/// handler stays the single decision point for what confirming does and
+/// whether the dialog closes.
+fn dialog_confirm_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    variant: ButtonVariant,
+) -> Button {
+    Button::new(id)
+        .label(label)
+        .with_variant(variant)
+        .on_click(|_, window, cx| {
+            window.dispatch_action(Box::new(Confirm { secondary: false }), cx);
+        })
+}
+
+/// A dialog footer button that dispatches the hosting dialog's `Cancel`
+/// action (the same action Escape activates).
+fn dialog_cancel_button(id: &'static str) -> Button {
+    Button::new(id)
+        .label("Cancel")
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx))
+}
+
 /// Main panel that displays the list of torrents.
 pub struct MainPanel {
     client: Arc<dyn TorrentClient>,
@@ -127,7 +139,6 @@ pub struct MainPanel {
     detail_panel: Option<Entity<TorrentDetailPanel>>,
     /// Torrent ID waiting for detail panel creation (deferred until window is available in render).
     pending_detail_id: Option<usize>,
-    dialog: Option<ActiveDialog>,
     /// Torrent entries waiting for add-dialog creation (deferred until window is
     /// available in render, mirroring `pending_detail_id`).
     pending_add_entries: Option<Vec<AddTorrentEntry>>,
@@ -195,7 +206,6 @@ impl MainPanel {
             active_page: None,
             detail_panel: None,
             pending_detail_id: None,
-            dialog: None,
             pending_add_entries: None,
             pending_delete_dialog: None,
             pending_about: None,
@@ -606,12 +616,6 @@ impl MainPanel {
         .detach();
     }
 
-    /// Close the currently open modal dialog, if any.
-    fn close_dialog(&mut self, cx: &mut Context<Self>) {
-        self.dialog = None;
-        cx.notify();
-    }
-
     /// Queue the About dialog (triggered by the native menu). The dialog is
     /// created on the next render, where a `Window` is available.
     pub fn open_about(&mut self, info: AboutInfo, cx: &mut Context<Self>) {
@@ -698,19 +702,35 @@ impl MainPanel {
 
     fn on_add_magnet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = cx.new(|cx| MagnetDialog::new(window, cx));
-        cx.subscribe(
-            &dialog,
-            |this, _entity, event: &MagnetDialogEvent, cx| match event {
-                MagnetDialogEvent::Cancelled => this.close_dialog(cx),
-                MagnetDialogEvent::Submitted(magnet) => {
-                    this.close_dialog(cx);
-                    this.add_magnet(magnet.clone(), cx);
-                }
-            },
-        )
-        .detach();
-        self.dialog = Some(ActiveDialog::Magnet(dialog));
-        cx.notify();
+        let panel = cx.entity();
+        window.open_dialog(cx, {
+            let dialog = dialog.clone();
+            move |d, _, _| {
+                d.title("Add Magnet Link")
+                    .button_props(DialogButtonProps::default().on_ok({
+                        let dialog = dialog.clone();
+                        let panel = panel.clone();
+                        move |_, _, cx| match dialog.read(cx).magnet(cx) {
+                            Some(magnet) => {
+                                panel.update(cx, |panel, cx| panel.add_magnet(magnet, cx));
+                                true
+                            }
+                            // Empty input: keep the dialog open.
+                            None => false,
+                        }
+                    }))
+                    .footer(
+                        DialogFooter::new()
+                            .child(dialog_cancel_button("magnet-cancel"))
+                            .child(dialog_confirm_button(
+                                "magnet-add",
+                                "Add",
+                                ButtonVariant::Primary,
+                            )),
+                    )
+                    .child(dialog.clone())
+            }
+        });
     }
 
     fn add_magnet(&mut self, magnet: String, cx: &mut Context<Self>) {
@@ -748,7 +768,6 @@ impl MainPanel {
         cx.subscribe(
             &dialog,
             |this, _entity, event: &AddTorrentDialogEvent, cx| match event {
-                AddTorrentDialogEvent::Cancelled => this.close_dialog(cx),
                 AddTorrentDialogEvent::AddOne(source, selection, overwrite, source_path) => {
                     this.confirm_add(
                         source.clone(),
@@ -758,12 +777,45 @@ impl MainPanel {
                         cx,
                     );
                 }
-                AddTorrentDialogEvent::Finished => this.close_dialog(cx),
             },
         )
         .detach();
-        self.dialog = Some(ActiveDialog::Add(dialog));
-        cx.notify();
+        window.open_dialog(cx, {
+            let dialog = dialog.clone();
+            move |d, _, cx| {
+                let title = dialog.read(cx).title();
+                let ok_label = dialog.read(cx).ok_label();
+                d.title(title)
+                    .w(px(600.))
+                    .button_props(
+                        DialogButtonProps::default()
+                            // Returns whether the queue is drained: the
+                            // dialog stays open while more torrents await.
+                            // `refresh` re-runs the dialog builder so the
+                            // chrome title and button label follow the
+                            // advance (only the body entity is notified by
+                            // the update itself).
+                            .on_ok({
+                                let dialog = dialog.clone();
+                                move |_, window, cx| {
+                                    let drained = dialog.update(cx, |d, cx| d.add_current(cx));
+                                    window.refresh();
+                                    drained
+                                }
+                            }),
+                    )
+                    .footer(
+                        DialogFooter::new()
+                            .child(dialog_cancel_button("add-cancel"))
+                            .child(dialog_confirm_button(
+                                "add-ok",
+                                ok_label,
+                                ButtonVariant::Primary,
+                            )),
+                    )
+                    .child(dialog.clone())
+            }
+        });
     }
 
     /// Actually add a torrent with the selected file indices (if any), then
@@ -911,7 +963,6 @@ impl Render for MainPanel {
                 this.child(self.render_toolbar(cx))
             })
             .child(self.render_content(cx))
-            .children(self.render_overlays(cx))
             .child(self.render_footer(cx))
     }
 }
@@ -1103,29 +1154,6 @@ impl MainPanel {
         })
     }
 
-    /// Render the modal overlay for the open dialog (magnet, delete, add, or
-    /// about), if any.
-    fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut overlays = Vec::new();
-        match &self.dialog {
-            Some(ActiveDialog::Magnet(dialog)) => overlays.push(
-                render_modal_overlay(dialog, MainPanel::close_dialog, None, cx).into_any_element(),
-            ),
-            Some(ActiveDialog::Delete(dialog)) => overlays.push(
-                render_modal_overlay(dialog, MainPanel::close_dialog, None, cx).into_any_element(),
-            ),
-            Some(ActiveDialog::Add(dialog)) => overlays.push(
-                render_modal_overlay(dialog, MainPanel::close_dialog, Some(px(600.)), cx)
-                    .into_any_element(),
-            ),
-            Some(ActiveDialog::About(dialog)) => overlays.push(
-                render_modal_overlay(dialog, MainPanel::close_dialog, None, cx).into_any_element(),
-            ),
-            None => {}
-        }
-        overlays
-    }
-
     /// Render the footer showing session-wide download/upload speed, DHT
     /// health, and uptime.
     ///
@@ -1257,19 +1285,36 @@ impl MainPanel {
         cx: &mut Context<Self>,
     ) {
         let dialog = cx.new(|cx| DeleteDialog::new(ids, names, window, cx));
-        cx.subscribe(
-            &dialog,
-            |this, _entity, event: &DeleteDialogEvent, cx| match event {
-                DeleteDialogEvent::Cancelled => this.close_dialog(cx),
-                DeleteDialogEvent::Confirmed(ids, delete_files) => {
-                    this.close_dialog(cx);
-                    this.confirm_delete(ids.clone(), *delete_files, cx);
-                }
-            },
-        )
-        .detach();
-        self.dialog = Some(ActiveDialog::Delete(dialog));
-        cx.notify();
+        let panel = cx.entity();
+        window.open_dialog(cx, {
+            let dialog = dialog.clone();
+            move |d, _, cx| {
+                let title = dialog.read(cx).title();
+                let ok_label = dialog.read(cx).ok_label();
+                d.title(title)
+                    .button_props(DialogButtonProps::default().on_ok({
+                        let dialog = dialog.clone();
+                        let panel = panel.clone();
+                        move |_, _, cx| {
+                            let (ids, delete_files) = dialog.read(cx).confirmation();
+                            panel.update(cx, |panel, cx| {
+                                panel.confirm_delete(ids, delete_files, cx)
+                            });
+                            true
+                        }
+                    }))
+                    .footer(
+                        DialogFooter::new()
+                            .child(dialog_cancel_button("delete-cancel"))
+                            .child(dialog_confirm_button(
+                                "delete-ok",
+                                ok_label,
+                                ButtonVariant::Danger,
+                            )),
+                    )
+                    .child(dialog.clone())
+            }
+        });
     }
 
     /// Create the About dialog for pending info — called from render, where a
@@ -1281,15 +1326,19 @@ impl MainPanel {
         cx: &mut Context<Self>,
     ) {
         let dialog = cx.new(|cx| AboutDialog::new(info, window, cx));
-        cx.subscribe(
-            &dialog,
-            |this, _entity, event: &AboutDialogEvent, cx| match event {
-                AboutDialogEvent::Closed => this.close_dialog(cx),
-            },
-        )
-        .detach();
-        self.dialog = Some(ActiveDialog::About(dialog));
-        cx.notify();
+        window.open_dialog(cx, {
+            let dialog = dialog.clone();
+            move |d, _, cx| {
+                let app_name = dialog.read(cx).info().app_name.clone();
+                d.title(app_name)
+                    .footer(DialogFooter::new().child(dialog_confirm_button(
+                        "about-close",
+                        "Close",
+                        ButtonVariant::Secondary,
+                    )))
+                    .child(dialog.clone())
+            }
+        });
     }
 }
 
@@ -1434,5 +1483,115 @@ mod tests {
 
         assert_eq!(button_clicks.get(), 2);
         assert_eq!(ancestor_clicks.get(), 2);
+    }
+
+    /// A plain `Dialog` renders no buttons from `button_props` alone — the
+    /// footer must be built explicitly. This pins the full footer wiring used
+    /// by the app's dialogs: both footer buttons are painted, clicking them
+    /// dispatches the dialog's Cancel/Confirm actions (so the `button_props`
+    /// handlers stay the single decision point), and a `true` return closes
+    /// the dialog.
+    #[gpui_kit::test]
+    fn dialog_footer_buttons_dispatch_confirm_and_cancel(cx: &mut TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::button::ButtonVariant;
+        use gpui_kit::component::dialog::{DialogButtonProps, DialogFooter};
+        use gpui_kit::{AppContext as _, IntoElement, ParentElement as _, Render, Window, div};
+
+        use super::{dialog_cancel_button, dialog_confirm_button};
+
+        struct Blank;
+        impl Render for Blank {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let window = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(800.), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| cx.new(|_| Blank),
+            )
+            .expect("open test window")
+            .0
+        });
+
+        let cancelled = Rc::new(Cell::new(0));
+        let confirmed = Rc::new(Cell::new(0));
+
+        let draw_frame = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .expect("test window open");
+        };
+
+        // A frame mounts the dialog layer, the next paints it at rest.
+        let open_dialog = |cx: &mut TestAppContext| {
+            let cancelled = cancelled.clone();
+            let confirmed = confirmed.clone();
+            cx.update_window(window, |_, window, cx| {
+                window.open_dialog(cx, {
+                    let cancelled = cancelled.clone();
+                    let confirmed = confirmed.clone();
+                    move |d, _, _| {
+                        d.title("Test")
+                            .button_props(DialogButtonProps::default().on_ok({
+                                let confirmed = confirmed.clone();
+                                move |_, _, _| {
+                                    confirmed.set(confirmed.get() + 1);
+                                    true
+                                }
+                            }))
+                            .on_cancel({
+                                let cancelled = cancelled.clone();
+                                move |_, _, _| {
+                                    cancelled.set(cancelled.get() + 1);
+                                    true
+                                }
+                            })
+                            .footer(
+                                DialogFooter::new()
+                                    .child(dialog_cancel_button("test-cancel"))
+                                    .child(dialog_confirm_button(
+                                        "test-ok",
+                                        "OK",
+                                        ButtonVariant::Primary,
+                                    )),
+                            )
+                    }
+                });
+            })
+            .expect("test window open");
+        };
+
+        open_dialog(cx);
+        draw_frame(cx);
+        draw_frame(cx);
+
+        cx.update_window(window, |_, window, cx| window.click("test-cancel", cx))
+            .expect("test window open");
+        assert_eq!(cancelled.get(), 1, "Cancel runs the cancel handler");
+        assert_eq!(confirmed.get(), 0);
+
+        open_dialog(cx);
+        draw_frame(cx);
+        draw_frame(cx);
+
+        cx.update_window(window, |_, window, cx| window.click("test-ok", cx))
+            .expect("test window open");
+        assert_eq!(confirmed.get(), 1, "OK runs the confirm handler");
+        assert_eq!(cancelled.get(), 1);
     }
 }

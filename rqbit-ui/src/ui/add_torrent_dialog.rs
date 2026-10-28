@@ -2,9 +2,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_kit::component::{
     ActiveTheme as _,
-    button::{Button, ButtonVariants},
     checkbox::Checkbox,
-    h_flex,
     table::{DataTable, TableState},
     v_flex,
 };
@@ -15,16 +13,12 @@ use crate::ui::file_table::{FileRow, FileTableDelegate};
 /// Events emitted by [`AddTorrentDialog`].
 #[derive(Clone, Debug)]
 pub enum AddTorrentDialogEvent {
-    /// User cancelled the dialog.
-    Cancelled,
     /// A single torrent should be added with the given selected file indices.
     /// `None` means "all files" (no selection restriction). The bool is whether
     /// to overwrite existing files on disk. The trailing string is the local
     /// source file the torrent came from, if any (used for move-after-add on
     /// the desktop).
     AddOne(UiAddSource, Option<Vec<u64>>, bool, Option<String>),
-    /// All torrents have been processed; the dialog can close.
-    Finished,
 }
 
 /// A single torrent queued for addition, with its (already resolved) file list.
@@ -45,15 +39,17 @@ pub struct AddTorrentEntry {
     pub hook_note: Option<String>,
 }
 
-/// A modal dialog that lets the user pick which files of one or more torrents
-/// to download before actually adding them.
+/// The body of a modal dialog that lets the user pick which files of one or
+/// more torrents to download before actually adding them. The surrounding
+/// modal (backdrop, title, footer buttons, close handling) is provided by the
+/// gpui-kit `Dialog` component that hosts it (see
+/// `MainPanel::create_add_dialog`).
 pub struct AddTorrentDialog {
     entries: Vec<AddTorrentEntry>,
     current: usize,
     table_state: Entity<TableState<FileTableDelegate>>,
     /// Whether to overwrite existing files (required to resume/seed into them).
     overwrite: bool,
-    focus_handle: FocusHandle,
 }
 
 impl EventEmitter<AddTorrentDialogEvent> for AddTorrentDialog {}
@@ -71,7 +67,6 @@ impl AddTorrentDialog {
             current: 0,
             table_state,
             overwrite: true,
-            focus_handle: cx.focus_handle(),
         };
         this.load_current(cx);
         this
@@ -111,15 +106,32 @@ impl AddTorrentDialog {
         self.current + 1 < self.entries.len()
     }
 
-    fn on_cancel(&mut self, cx: &mut Context<Self>) {
-        cx.emit(AddTorrentDialogEvent::Cancelled);
+    /// Dialog title text ("Add Torrent" or "Add Torrent (i/n)").
+    pub fn title(&self) -> String {
+        if self.entries.len() > 1 {
+            format!("Add Torrent ({}/{})", self.current + 1, self.entries.len())
+        } else {
+            "Add Torrent".to_string()
+        }
+    }
+
+    /// Confirm-button label ("Add & Next" while more entries are queued).
+    pub fn ok_label(&self) -> &'static str {
+        if self.has_more() {
+            "Add & Next"
+        } else {
+            "Add Torrent"
+        }
     }
 
     /// Add the current torrent with the selected files and advance.
-    fn on_add_current(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Emits [`AddTorrentDialogEvent::AddOne`] for the current entry. Returns
+    /// `true` when the queue is drained and the hosting dialog should close,
+    /// `false` when the next queued torrent has been loaded into the body.
+    pub fn add_current(&mut self, cx: &mut Context<Self>) -> bool {
         if self.current >= self.entries.len() {
-            cx.emit(AddTorrentDialogEvent::Finished);
-            return;
+            return true;
         }
 
         // Take ownership of the current entry (UiAddSource is Clone, but we
@@ -146,10 +158,11 @@ impl AddTorrentDialog {
         ));
 
         if self.entries.is_empty() {
-            cx.emit(AddTorrentDialogEvent::Finished);
+            true
         } else {
             // `remove` shifted the next entry into `self.current`.
             self.load_current(cx);
+            false
         }
     }
 
@@ -164,7 +177,6 @@ impl Render for AddTorrentDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let name = self.current_name();
-        let total = self.entries.len();
         let has_files = self
             .entries
             .get(self.current)
@@ -178,16 +190,6 @@ impl Render for AddTorrentDialog {
 
         v_flex()
             .gap_3()
-            .child(
-                div()
-                    .text_size(px(16.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(if total > 1 {
-                        format!("Add Torrent ({}/{})", self.current + 1, total)
-                    } else {
-                        "Add Torrent".to_string()
-                    }),
-            )
             .child(
                 div()
                     .text_size(px(13.))
@@ -238,45 +240,10 @@ impl Render for AddTorrentDialog {
                     .into_any_element()
             })
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
-                    .child(
-                        Checkbox::new("overwrite-existing")
-                            .checked(self.overwrite)
-                            .label("Overwrite existing files")
-                            .on_click(
-                                cx.listener(|this, _checked, _, cx| this.on_toggle_overwrite(cx)),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("add-cancel")
-                                    .outline()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| this.on_cancel(cx))),
-                            )
-                            .child(
-                                Button::new("add-ok")
-                                    .primary()
-                                    .label(if self.has_more() {
-                                        "Add & Next"
-                                    } else {
-                                        "Add Torrent"
-                                    })
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.on_add_current(cx)),
-                                    ),
-                            ),
-                    ),
+                Checkbox::new("overwrite-existing")
+                    .checked(self.overwrite)
+                    .label("Overwrite existing files")
+                    .on_click(cx.listener(|this, _checked, _, cx| this.on_toggle_overwrite(cx))),
             )
-    }
-}
-
-impl Focusable for AddTorrentDialog {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
     }
 }

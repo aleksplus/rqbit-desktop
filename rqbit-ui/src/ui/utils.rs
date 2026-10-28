@@ -2,16 +2,13 @@
 
 use std::sync::Arc;
 
-use gpui::{
-    App, Context, Div, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
-    Render, Styled, div, px,
-};
-use gpui_kit::component::{ActiveTheme, Theme, menu::PopupMenuItem, v_flex};
+use gpui::{App, Div, ParentElement as _, Styled, div};
+use gpui_kit::component::{Theme, menu::PopupMenuItem};
 
 use rqbit_protocol::{ApiAddTorrent, CustomColumnKind, TorrentAction, TorrentId};
 
 use crate::client::{AddTorrentRequest, TorrentClient, UiAddSource};
-use crate::ui::{add_torrent_dialog::AddTorrentEntry, file_table::FileRow, main_panel::MainPanel};
+use crate::ui::{add_torrent_dialog::AddTorrentEntry, file_table::FileRow};
 
 /// Binary unit multipliers (powers of 1024), computed once and reused.
 const KIB: f64 = 1024.0;
@@ -180,47 +177,6 @@ pub fn torrent_bulk_action_menu_item(
         })
         .detach();
     })
-}
-
-/// Render a centered modal overlay (dimmed backdrop + panel) for a dialog
-/// entity. Clicking the backdrop invokes `close`. `max_height`, when set, caps
-/// the panel height (used for the file-selection dialog).
-pub fn render_modal_overlay<E: Render + 'static>(
-    dialog: &Entity<E>,
-    close: fn(&mut MainPanel, &mut Context<MainPanel>),
-    max_height: Option<Pixels>,
-    cx: &mut Context<MainPanel>,
-) -> impl IntoElement {
-    let theme = cx.theme();
-    let mut panel = v_flex()
-        .absolute()
-        .top(px(80.))
-        .left(px(80.))
-        .right(px(80.))
-        .bg(theme.background)
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .shadow_lg()
-        .p_4()
-        .overflow_hidden()
-        .child(dialog.clone())
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-    if let Some(h) = max_height {
-        panel = panel.max_h(h);
-    }
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .bg(theme.muted)
-        .opacity(0.8)
-        .child(panel)
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| close(this, cx)),
-        )
 }
 
 /// Build an [`AddTorrentEntry`] by resolving the torrent's file list via a

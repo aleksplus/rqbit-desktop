@@ -1,62 +1,65 @@
-use gpui::{FocusHandle, *};
+use gpui::*;
 use gpui_kit::component::{
     ActiveTheme as _, StyledExt as _,
-    button::{Button, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputState},
     v_flex,
 };
 
-/// Events emitted by [`DeleteDialog`].
-#[derive(Clone, Debug)]
-pub enum DeleteDialogEvent {
-    /// User cancelled.
-    Cancelled,
-    /// User confirmed deletion with (ids, delete_files).
-    Confirmed(Vec<usize>, bool),
-}
-
-/// A modal dialog for confirming torrent deletion.
+/// A modal dialog body for confirming torrent deletion.
+///
+/// This is only the content of the dialog: the surrounding modal (backdrop,
+/// title, footer buttons, close handling) is provided by the gpui-kit
+/// `Dialog` component that hosts it (see `MainPanel::create_delete_dialog`).
 pub struct DeleteDialog {
     ids: Vec<usize>,
     names: Vec<String>,
     delete_files: bool,
-    focus_handle: FocusHandle,
 }
-
-impl EventEmitter<DeleteDialogEvent> for DeleteDialog {}
 
 impl DeleteDialog {
     pub fn new(
         ids: Vec<usize>,
         names: Vec<String>,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> Self {
         Self {
             ids,
             names,
             delete_files: true,
-            focus_handle: cx.focus_handle(),
         }
     }
 
     /// Whether this dialog confirms deletion of multiple torrents. Derived
     /// from `ids` so it can never drift out of sync with the actual set.
-    fn is_bulk(&self) -> bool {
+    pub fn is_bulk(&self) -> bool {
         self.ids.len() > 1
     }
 
-    fn on_cancel(&mut self, cx: &mut Context<Self>) {
-        cx.emit(DeleteDialogEvent::Cancelled);
+    /// What a confirmation means: the torrent ids and whether downloaded
+    /// files should be deleted along with the torrent entries.
+    pub fn confirmation(&self) -> (Vec<usize>, bool) {
+        (self.ids.clone(), self.delete_files)
     }
 
-    fn on_confirm(&mut self, cx: &mut Context<Self>) {
-        cx.emit(DeleteDialogEvent::Confirmed(
-            self.ids.clone(),
-            self.delete_files,
-        ));
+    /// Dialog title text.
+    pub fn title(&self) -> String {
+        if self.is_bulk() {
+            format!("Delete {} torrents", self.ids.len())
+        } else {
+            "Delete torrent".to_string()
+        }
+    }
+
+    /// Confirm-button label.
+    pub fn ok_label(&self) -> String {
+        if self.is_bulk() {
+            format!("Delete {} Torrents", self.ids.len())
+        } else {
+            "Delete Torrent".to_string()
+        }
     }
 }
 
@@ -66,16 +69,6 @@ impl Render for DeleteDialog {
 
         v_flex()
             .gap_3()
-            .child(
-                div()
-                    .text_size(px(16.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(if self.is_bulk() {
-                        format!("Delete {} torrents", self.ids.len())
-                    } else {
-                        "Delete torrent".to_string()
-                    }),
-            )
             .child(div().child(if self.is_bulk() {
                 "Are you sure you want to delete the following torrents?"
             } else {
@@ -104,71 +97,30 @@ impl Render for DeleteDialog {
                         }),
                     ),
             )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
-                    .child(
-                        Button::new("del-cancel")
-                            .outline()
-                            .label("Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| this.on_cancel(cx))),
-                    )
-                    .child(
-                        Button::new("del-ok")
-                            .danger()
-                            .label(if self.is_bulk() {
-                                format!("Delete {} Torrents", self.ids.len())
-                            } else {
-                                "Delete Torrent".to_string()
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.on_confirm(cx))),
-                    ),
-            )
     }
 }
 
-impl Focusable for DeleteDialog {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-/// Events emitted by [`MagnetDialog`].
-#[derive(Clone, Debug)]
-pub enum MagnetDialogEvent {
-    /// User clicked **Cancel**.
-    Cancelled,
-    /// User clicked **Add** and provided a magnet URL.
-    Submitted(String),
-}
-
-/// A small dialog for entering a magnet link URL.
+/// A small dialog body for entering a magnet link URL.
+///
+/// Content-only; the modal chrome comes from the hosting `Dialog` component
+/// (see `MainPanel::on_add_magnet`).
 pub struct MagnetDialog {
     input_state: Entity<InputState>,
-    focus_handle: FocusHandle,
 }
-
-impl EventEmitter<MagnetDialogEvent> for MagnetDialog {}
 
 impl MagnetDialog {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             input_state: cx
                 .new(|cx| InputState::new(window, cx).placeholder("magnet:?xt=urn:btih:...")),
-            focus_handle: cx.focus_handle(),
         }
     }
 
-    fn on_cancel(&mut self, cx: &mut Context<Self>) {
-        cx.emit(MagnetDialogEvent::Cancelled);
-    }
-
-    fn on_submit(&mut self, cx: &mut Context<Self>) {
-        let value = self.input_state.read(cx).value().to_string();
-        if !value.trim().is_empty() {
-            cx.emit(MagnetDialogEvent::Submitted(value.trim().to_string()));
-        }
+    /// The trimmed magnet URL entered so far, or `None` when the field is
+    /// empty (the hosting dialog treats that as "don't close").
+    pub fn magnet(&self, cx: &App) -> Option<String> {
+        let value = self.input_state.read(cx).value().trim().to_string();
+        (!value.is_empty()).then_some(value)
     }
 }
 
@@ -176,52 +128,13 @@ impl Render for MagnetDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        v_flex()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(px(16.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Add Magnet Link"),
-            )
-            .child(Input::new(&self.input_state))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
-                    .child(
-                        Button::new("magnet-cancel")
-                            .outline()
-                            .label("Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| this.on_cancel(cx))),
-                    )
-                    .child(
-                        Button::new("magnet-add")
-                            .primary()
-                            .label("Add")
-                            .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(theme.muted_foreground)
-                    .child("Tip: paste a magnet link or a 40-char info hash."),
-            )
+        v_flex().gap_3().child(Input::new(&self.input_state)).child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child("Tip: paste a magnet link or a 40-char info hash."),
+        )
     }
-}
-
-impl Focusable for MagnetDialog {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-/// Events emitted by [`AboutDialog`].
-#[derive(Clone, Debug)]
-pub enum AboutDialogEvent {
-    /// User clicked **Close**.
-    Closed,
 }
 
 /// Everything the About dialog shows, supplied by the host (the desktop build
@@ -244,21 +157,21 @@ pub struct AboutInfo {
     pub desktop_author: SharedString,
 }
 
-/// A modal About dialog: app identity + short description, then version and
-/// author rows for the rqbit engine and the desktop app itself.
+/// A modal About dialog body: app version + short description, then version
+/// and author rows for the rqbit engine and the desktop app itself. The app
+/// name shown in the title comes from [`AboutInfo::app_name`] via the hosting
+/// `Dialog` component (see `MainPanel::create_about_dialog`).
 pub struct AboutDialog {
     info: AboutInfo,
-    focus_handle: FocusHandle,
 }
 
-impl EventEmitter<AboutDialogEvent> for AboutDialog {}
-
 impl AboutDialog {
-    pub fn new(info: AboutInfo, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self {
-            info,
-            focus_handle: cx.focus_handle(),
-        }
+    pub fn new(info: AboutInfo, _window: &mut Window, _cx: &mut Context<Self>) -> Self {
+        Self { info }
+    }
+
+    pub fn info(&self) -> &AboutInfo {
+        &self.info
     }
 }
 
@@ -270,20 +183,10 @@ impl Render for AboutDialog {
         v_flex()
             .gap_3()
             .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(16.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(info.app_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(theme.muted_foreground)
-                            .child(format!("Version {}", info.version)),
-                    ),
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(format!("Version {}", info.version)),
             )
             .child(
                 div()
@@ -335,19 +238,5 @@ impl Render for AboutDialog {
                             ),
                     ),
             )
-            .child(
-                h_flex().gap_2().justify_end().child(
-                    Button::new("about-close")
-                        .outline()
-                        .label("Close")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(AboutDialogEvent::Closed))),
-                ),
-            )
-    }
-}
-
-impl Focusable for AboutDialog {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
     }
 }
