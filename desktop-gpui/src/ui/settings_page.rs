@@ -473,12 +473,12 @@ fn set_web_view_enable(c: &mut RqbitDesktopConfig, v: bool) {
     c.web_view.disable = !v;
 }
 
-fn get_web_view_addr(c: &RqbitDesktopConfig) -> String {
-    c.web_view.listen_addr.to_string()
+fn get_web_view_ip(c: &RqbitDesktopConfig) -> String {
+    c.web_view.listen_addr.ip().to_string()
 }
-fn set_web_view_addr(c: &mut RqbitDesktopConfig, v: SharedString) {
-    if let Ok(addr) = v.parse() {
-        c.web_view.listen_addr = addr;
+fn set_web_view_ip(c: &mut RqbitDesktopConfig, v: SharedString) {
+    if let Ok(ip) = v.parse() {
+        c.web_view.listen_addr.set_ip(ip);
     }
 }
 
@@ -1206,18 +1206,19 @@ impl Render for SettingsPage {
                                         )
                                         .layout(Axis::Vertical)
                                         .description(
-                                            "TCP port of the browser UI. Editing it only changes \
-                                             the port part of the listen address below.",
+                                            "TCP port of the browser UI. The IP address to bind \
+                                             is configured below.",
                                         ),
                                         SettingItem::new(
-                                            "Web view listen address",
-                                            input_field(config.clone(), get_web_view_addr, set_web_view_addr),
+                                            "Web view IP address",
+                                            input_field(config.clone(), get_web_view_ip, set_web_view_ip),
                                         )
                                         .layout(Axis::Vertical)
                                         .description(
-                                            "Full ip:port to bind. Defaults to 127.0.0.1:3081 — \
-                                             a different port than app-daemon's 3080, so both \
-                                             can run at the same time.",
+                                            "IP address to bind; the port is configured above. \
+                                             Defaults to 127.0.0.1 with port 3081 — a different \
+                                             port than app-daemon's 3080, so both can run at \
+                                             the same time.",
                                         ),
                                     ]),
                                 ),
@@ -1268,26 +1269,34 @@ mod tests {
     use gpui_kit::{AppContext as _, TestAppContext, px, size};
 
     /// The port field must only rewrite the port of the web view listen
-    /// address, and stay in sync with the full-address field.
+    /// address, and the IP field must only rewrite the IP — neither
+    /// duplicates the other.
     #[test]
-    fn web_view_port_updates_only_port() {
-        use super::{get_web_view_addr, get_web_view_port, set_web_view_addr, set_web_view_port};
+    fn web_view_ip_and_port_edit_only_their_own_part() {
+        use super::{get_web_view_ip, get_web_view_port, set_web_view_ip, set_web_view_port};
         use crate::config::RqbitDesktopConfig;
 
         let mut cfg = RqbitDesktopConfig::default();
         assert_eq!(get_web_view_port(&cfg), 3081.);
+        assert_eq!(get_web_view_ip(&cfg), "127.0.0.1");
 
         set_web_view_port(&mut cfg, 4000.);
-        assert_eq!(get_web_view_addr(&cfg), "127.0.0.1:4000");
+        assert_eq!(get_web_view_ip(&cfg), "127.0.0.1");
+        assert_eq!(cfg.web_view.listen_addr.to_string(), "127.0.0.1:4000");
 
         // Out-of-range values are clamped by the input widget; the setter
         // saturates the cast to u16.
         set_web_view_port(&mut cfg, 70_000.);
-        assert_eq!(get_web_view_addr(&cfg), "127.0.0.1:65535");
+        assert_eq!(cfg.web_view.listen_addr.to_string(), "127.0.0.1:65535");
 
-        // Changing the full address is reflected by the port getter.
-        set_web_view_addr(&mut cfg, "0.0.0.0:5000".into());
-        assert_eq!(get_web_view_port(&cfg), 5000.);
+        // Changing the IP keeps the port.
+        set_web_view_ip(&mut cfg, "0.0.0.0".into());
+        assert_eq!(get_web_view_port(&cfg), 65535.);
+        assert_eq!(cfg.web_view.listen_addr.to_string(), "0.0.0.0:65535");
+
+        // Unparseable input is ignored.
+        set_web_view_ip(&mut cfg, "not an ip".into());
+        assert_eq!(get_web_view_ip(&cfg), "0.0.0.0");
     }
 
     /// End-to-end reproduction of the reported bug: open settings, click the
