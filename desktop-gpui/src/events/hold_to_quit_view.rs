@@ -24,7 +24,7 @@ impl Render for HoldToQuitView {
                 move |event: &KeyDownEvent, _window, cx| {
                     // The gesture is "hold Cmd-Q / Ctrl-C": require the
                     // secondary modifier (Cmd on macOS, Ctrl elsewhere) plus q or c.
-                    if !event.keystroke.modifiers.secondary()
+                    if !event.keystroke.modifiers.secondary(cx)
                         || (event.keystroke.key != "q" && event.keystroke.key != "c")
                     {
                         return;
@@ -65,10 +65,10 @@ impl Render for HoldToQuitView {
             })
             .on_modifiers_changed({
                 let quit_countdown = quit_countdown.clone();
-                move |event: &ModifiersChangedEvent, _window, _cx| {
+                move |event: &ModifiersChangedEvent, _window, cx| {
                     // Releasing the modifier (Cmd/Ctrl) first also breaks the
                     // gesture and must cancel the pending quit.
-                    if event.modifiers.secondary() {
+                    if event.modifiers.secondary(cx) {
                         return;
                     }
                     let mut lock = quit_countdown.lock().unwrap();

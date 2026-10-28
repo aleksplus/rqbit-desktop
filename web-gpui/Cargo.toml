@@ -14,9 +14,9 @@ crate-type = ["cdylib"]
 [target.'cfg(target_family = "wasm")'.dependencies]
 # gpui-kit pins the matching GPUI release (gpui-pre); same exact versions as
 # the desktop so the shared views see identical GPUI types.
-gpui = { package = "gpui-pre", version = "=0.3.8" }
-gpui-kit = "0.7.1"
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8" }
+gpui = { package = "gpui-pre", version = "=0.3.10" }
+gpui-kit = "0.8.1"
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10" }
 rqbit-ui = { workspace = true }
 rqbit-protocol = { workspace = true }
 urlencoding = { workspace = true }
