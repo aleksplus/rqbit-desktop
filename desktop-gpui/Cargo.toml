@@ -44,7 +44,6 @@ assets = [
 gpui-kit = "0.8.1"
 gpui = { package = "gpui-pre", version = "=0.3.10" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }
-url.workspace = true
 async-trait = { workspace = true }
 # The desktop app bundles the daemon's server (WS protocol + embedded web
 # client) so its own session is reachable from the browser — one librqbit
@@ -65,14 +64,11 @@ notify = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["json", "query"] }
-base64 = { workspace = true }
 http = { workspace = true }
 directories = { workspace = true }
 futures = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 tracing = { workspace = true }
 serde = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
 parking_lot = { workspace = true }
@@ -80,9 +76,6 @@ gethostname = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 librqbit-dualstack-sockets = { workspace = true }
 walkdir = { workspace = true }
-ring = "0.17"
-hex = "0.4"
-toml = "0.8"
 # Cross-platform "open folder / URL" (macOS `open`, Linux `xdg-open`, Windows).
 # Already a transitive dep of gpui-pre-linux; declared here for `DesktopHost::open_folder`.
 open = "5"
