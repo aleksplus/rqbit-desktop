@@ -146,6 +146,28 @@ fn input_field(
     )
 }
 
+/// A bounded `f64` number input, the one constructor for every numeric
+/// setting value. gpui-component stretches number inputs to the full item
+/// width when the item is laid out vertically; pin the compact width
+/// horizontal rows use instead.
+fn number_input_field(
+    min: f64,
+    max: f64,
+    value: impl Fn(&App) -> f64 + 'static,
+    set_value: impl Fn(f64, &mut App) + 'static,
+) -> SettingField<f64> {
+    SettingField::number_input(
+        NumberFieldOptions {
+            min,
+            max,
+            ..Default::default()
+        },
+        value,
+        set_value,
+    )
+    .w_32()
+}
+
 fn number_field(
     config: ConfigArc,
     min: f64,
@@ -155,12 +177,9 @@ fn number_field(
 ) -> SettingField<f64> {
     let cfg_get = config.clone();
     let cfg_set = config;
-    SettingField::number_input(
-        NumberFieldOptions {
-            min,
-            max,
-            ..Default::default()
-        },
+    number_input_field(
+        min,
+        max,
         move |_| get(&cfg_get.read()),
         move |val: f64, _| set(&mut cfg_set.write(), val),
     )
@@ -584,12 +603,9 @@ fn hook_number_field(
 ) -> SettingField<f64> {
     let cfg_get = config.clone();
     let cfg_set = config;
-    SettingField::number_input(
-        NumberFieldOptions {
-            min,
-            max,
-            ..Default::default()
-        },
+    number_input_field(
+        min,
+        max,
         move |_| with_hook(&cfg_get, ix, get, min),
         move |val: f64, _| mutate_hook(&cfg_set, ix, |h| set(h, val)),
     )
@@ -1082,8 +1098,7 @@ impl Render for SettingsPage {
                                                     get_dl_rate,
                                                     set_dl_rate,
                                                 ),
-                                            )
-                                            .layout(Axis::Vertical),
+                                            ),
                                             SettingItem::new(
                                                 "Upload rate limit (bytes/sec, 0 = unlimited)",
                                                 number_field(
@@ -1093,8 +1108,7 @@ impl Render for SettingsPage {
                                                     get_ul_rate,
                                                     set_ul_rate,
                                                 ),
-                                            )
-                                            .layout(Axis::Vertical),
+                                            ),
                                         ]),
                                     ),
                                 // ── Connection ──
@@ -1122,8 +1136,7 @@ impl Render for SettingsPage {
                                                     get_listen_port,
                                                     set_listen_port,
                                                 ),
-                                            )
-                                            .layout(Axis::Vertical),
+                                            ),
                                         ]),
                                     )
                                     .group(
@@ -1146,8 +1159,7 @@ impl Render for SettingsPage {
                                                     get_peer_ct,
                                                     set_peer_ct,
                                                 ),
-                                            )
-                                            .layout(Axis::Vertical),
+                                            ),
                                             SettingItem::new(
                                                 "Peer read/write timeout (seconds)",
                                                 number_field(
@@ -1157,8 +1169,7 @@ impl Render for SettingsPage {
                                                     get_peer_rw,
                                                     set_peer_rw,
                                                 ),
-                                            )
-                                            .layout(Axis::Vertical),
+                                            ),
                                         ]),
                                     ),
                                 // ── HTTP API ──
@@ -1204,7 +1215,6 @@ impl Render for SettingsPage {
                                                 set_web_view_port,
                                             ),
                                         )
-                                        .layout(Axis::Vertical)
                                         .description(
                                             "TCP port of the browser UI. The IP address to bind \
                                              is configured below.",

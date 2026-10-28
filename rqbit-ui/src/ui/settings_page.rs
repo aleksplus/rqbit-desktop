@@ -264,6 +264,9 @@ fn number_field(
         move |_| get(&dget.read().unwrap()),
         move |val: f64, _| set(&mut dset.write().unwrap(), val),
     )
+    // gpui-component stretches number inputs to the full item width when the
+    // item is laid out vertically; pin the compact width horizontal rows use.
+    .w_32()
 }
 
 // ── Accessors (field closures are fn pointers) ──────────────────────────────
@@ -538,66 +541,55 @@ impl Render for SessionSettingsPage {
                                             ),
                                         ]))
                                 .group(SettingGroup::new().title("Rate Limits").items(vec![
-                                            SettingItem::new(
-                                                "Download rate limit (bytes/sec, \
+                                    SettingItem::new(
+                                        "Download rate limit (bytes/sec, \
                                                  0 = unlimited)",
-                                                number_field(
-                                                    draft.clone(),
-                                                    0.,
-                                                    u32::MAX as f64,
-                                                    get_dl_rate,
-                                                    set_dl_rate,
-                                                ),
-                                            )
-                                            .layout(Axis::Vertical),
-                                            SettingItem::new(
-                                                "Upload rate limit (bytes/sec, \
+                                        number_field(
+                                            draft.clone(),
+                                            0.,
+                                            u32::MAX as f64,
+                                            get_dl_rate,
+                                            set_dl_rate,
+                                        ),
+                                    ),
+                                    SettingItem::new(
+                                        "Upload rate limit (bytes/sec, \
                                                  0 = unlimited)",
-                                                number_field(
-                                                    draft.clone(),
-                                                    0.,
-                                                    u32::MAX as f64,
-                                                    get_ul_rate,
-                                                    set_ul_rate,
-                                                ),
-                                            )
-                                            .layout(Axis::Vertical),
-                                        ])),
+                                        number_field(
+                                            draft.clone(),
+                                            0.,
+                                            u32::MAX as f64,
+                                            get_ul_rate,
+                                            set_ul_rate,
+                                        ),
+                                    ),
+                                ])),
                             // ── Connection ──
                             SettingPage::new("Connection")
                                 .group(SettingGroup::new().title("Listening").items(vec![
-                                            SettingItem::new(
-                                                "Listen on TCP",
-                                                switch_field(
-                                                    draft.clone(),
-                                                    get_tcp_listen,
-                                                    set_tcp_listen,
-                                                ),
-                                            ),
-                                            SettingItem::new(
-                                                "Listen on uTP (over UDP)",
-                                                switch_field(draft.clone(), get_utp, set_utp),
-                                            ),
-                                            SettingItem::new(
-                                                "Advertise port over UPnP",
-                                                switch_field(
-                                                    draft.clone(),
-                                                    get_upnp_fwd,
-                                                    set_upnp_fwd,
-                                                ),
-                                            ),
-                                            SettingItem::new(
-                                                "Listen port",
-                                                number_field(
-                                                    draft.clone(),
-                                                    0.,
-                                                    u16::MAX as f64,
-                                                    get_listen_port,
-                                                    set_listen_port,
-                                                ),
-                                            )
-                                            .layout(Axis::Vertical),
-                                        ]))
+                                    SettingItem::new(
+                                        "Listen on TCP",
+                                        switch_field(draft.clone(), get_tcp_listen, set_tcp_listen),
+                                    ),
+                                    SettingItem::new(
+                                        "Listen on uTP (over UDP)",
+                                        switch_field(draft.clone(), get_utp, set_utp),
+                                    ),
+                                    SettingItem::new(
+                                        "Advertise port over UPnP",
+                                        switch_field(draft.clone(), get_upnp_fwd, set_upnp_fwd),
+                                    ),
+                                    SettingItem::new(
+                                        "Listen port",
+                                        number_field(
+                                            draft.clone(),
+                                            0.,
+                                            u16::MAX as f64,
+                                            get_listen_port,
+                                            set_listen_port,
+                                        ),
+                                    ),
+                                ]))
                                 .group(SettingGroup::new().title("Outgoing").items(vec![
                                             SettingItem::new(
                                                 "Enable outgoing TCP",
@@ -621,8 +613,7 @@ impl Render for SessionSettingsPage {
                                                     get_peer_ct,
                                                     set_peer_ct,
                                                 ),
-                                            )
-                                            .layout(Axis::Vertical),
+                                            ),
                                             SettingItem::new(
                                                 "Peer read/write timeout (seconds)",
                                                 number_field(
@@ -632,8 +623,7 @@ impl Render for SessionSettingsPage {
                                                     get_peer_rw,
                                                     set_peer_rw,
                                                 ),
-                                            )
-                                            .layout(Axis::Vertical),
+                                            ),
                                         ])),
                         ]),
                 ),
