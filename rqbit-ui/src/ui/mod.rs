@@ -1,5 +1,6 @@
 pub mod add_torrent_dialog;
 pub mod dialogs;
+pub mod explorer;
 pub mod file_table;
 pub mod log_page;
 pub mod main_panel;

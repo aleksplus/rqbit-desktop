@@ -1,8 +1,12 @@
 use gpui::prelude::FluentBuilder as _;
-use gpui::{WeakEntity, *};
+use gpui::*;
+use gpui_kit::component::dock::{
+    BasePanel, DockArea, DockLayout, DockPlacement, DockSkin, DockToggleEvent, NodeId, PaneRef,
+    Panel as DockPanel, PanelControl, PanelEvent, PanelId, PanelStyle, panel_handle,
+};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::status_bar::StatusBar;
-use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
+use gpui_kit::component::{ActiveTheme, Selectable as _, Sizable, WindowExt as _};
 use gpui_kit::component::{
     Icon, IconName, Size, StyledExt, TitleBar,
     button::{Button, ButtonVariant, ButtonVariants},
@@ -33,6 +37,7 @@ use crate::host::UiHost;
 use crate::ui::add_torrent_dialog::{AddTorrentDialog, AddTorrentDialogEvent, AddTorrentEntry};
 
 use crate::ui::dialogs::{AboutDialog, AboutInfo, DeleteDialog, MagnetDialog};
+use crate::ui::explorer::{ExplorerEvent, ExplorerPanel};
 use crate::ui::log_page::{LogPage, LogPageEvent};
 use crate::ui::torrent_detail_panel::{TorrentDetailPanel, TorrentDetailPanelEvent};
 use crate::ui::torrent_table::{TorrentRow, TorrentTableDelegate};
@@ -128,12 +133,130 @@ fn dialog_cancel_button(id: &'static str) -> Button {
         .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx))
 }
 
+/// The dock's center panel: the torrent table + detail split, exactly the
+/// pre-dock main layout. Lives inside a [`DockArea`] so the Explorer can be
+/// a left dock next to it.
+struct TorrentsPanel {
+    table_state: Entity<TableState<TorrentTableDelegate>>,
+    resizable_state: Entity<ResizableState>,
+    /// Mirrored from `MainPanel::detail_panel` (created/closed there).
+    detail_panel: Option<Entity<TorrentDetailPanel>>,
+    focus_handle: FocusHandle,
+}
+
+impl TorrentsPanel {
+    fn new(
+        table_state: Entity<TableState<TorrentTableDelegate>>,
+        resizable_state: Entity<ResizableState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            table_state,
+            resizable_state,
+            detail_panel: None,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn set_detail_panel(&mut self, detail_panel: Option<Entity<TorrentDetailPanel>>) {
+        self.detail_panel = detail_panel;
+    }
+}
+
+impl BasePanel for TorrentsPanel {
+    fn panel_name(&self) -> &'static str {
+        "torrents"
+    }
+
+    /// The center content can't be dismissed.
+    fn closable(&self, _cx: &App) -> bool {
+        false
+    }
+}
+
+impl DockPanel for TorrentsPanel {
+    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        "Torrents"
+    }
+
+    /// The table runs edge to edge, as it did before the dock.
+    fn inner_padding(&self, _cx: &App) -> bool {
+        false
+    }
+
+    /// The panel starts zoomed, so the zoom-out button stays visible on the
+    /// zoomed tab bar — not buried in the ⋯ menu.
+    fn zoom_control(&self, _cx: &App) -> Option<PanelControl> {
+        Some(PanelControl::Both)
+    }
+}
+
+impl EventEmitter<PanelEvent> for TorrentsPanel {}
+
+impl Focusable for TorrentsPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for TorrentsPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_resizable("main-split")
+            .with_state(&self.resizable_state)
+            .child(
+                resizable_panel().child(
+                    div()
+                        .size_full()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .child(DataTable::new(&self.table_state).bordered(false)),
+                ),
+            )
+            .child(
+                resizable_panel()
+                    .visible(self.detail_panel.is_some())
+                    .size(px(400.))
+                    .size_range(px(250.)..px(800.))
+                    .child(
+                        self.detail_panel
+                            .clone()
+                            .map(|p| p.into_any_element())
+                            .unwrap_or_else(|| div().into_any_element()),
+                    ),
+            )
+    }
+}
+
+/// The center tab group containing `panel_id`, for programmatic zoom.
+fn center_group_node(area: &DockArea, panel_id: PanelId) -> Option<NodeId> {
+    let tree = area.layout(DockPlacement::Center)?;
+    let mut found = None;
+    tree.root().walk(&mut |node| {
+        if matches!(
+            node.kind(),
+            PaneRef::Tabs { panels, .. } if panels.contains(&panel_id)
+        ) {
+            found = Some(node.id());
+        }
+    });
+    found
+}
+
 /// Main panel that displays the list of torrents.
 pub struct MainPanel {
     client: Arc<dyn TorrentClient>,
     host: Arc<dyn UiHost>,
     table_state: Entity<TableState<TorrentTableDelegate>>,
-    resizable_state: Entity<ResizableState>,
+    /// The dockable main layout: Explorer tree as the left dock, the
+    /// torrent table + detail split as the center panel.
+    ///
+    /// The torrents panel starts zoomed, filling the whole area; the
+    /// status-bar toggle reveals/hides the Explorer dock on top of that
+    /// (see [`MainPanel::toggle_explorer`]).
+    dock_area: Entity<DockArea>,
+    explorer: Entity<ExplorerPanel>,
+    torrents_panel: Entity<TorrentsPanel>,
     /// Host-provided full page (settings) or the shared log page, when open.
     active_page: Option<AnyView>,
     detail_panel: Option<Entity<TorrentDetailPanel>>,
@@ -186,23 +309,45 @@ impl MainPanel {
     ) -> Self {
         let weak = cx.entity().downgrade();
 
+        // The dockable main layout: Explorer tree docked left, the torrent
+        // table + detail split as the center panel.
+        let (dock_area, dock_skin) = DockSkin::dock_area("main-dock", None, window, cx);
+        dock_skin.set_panel_style(PanelStyle::TabBar, cx);
+        let explorer = cx.new(|cx| ExplorerPanel::new(client.clone(), host.clone(), cx));
+
+        let table_state = cx.new(|cx| {
+            TableState::new(
+                TorrentTableDelegate::new(weak, client.clone(), host.clone()),
+                window,
+                cx,
+            )
+            .row_selectable(true)
+        });
+        let resizable_state = cx.new(|_cx| ResizableState::default());
+        let torrents_panel =
+            cx.new(|cx| TorrentsPanel::new(table_state.clone(), resizable_state.clone(), cx));
+        let center = DockLayout::tabs().panel_view(panel_handle(torrents_panel.clone()), cx);
+        let left = DockLayout::tabs().panel_view(panel_handle(explorer.clone()), cx);
+        let torrents_panel_id = PanelId::from(torrents_panel.entity_id());
+        dock_area.update(cx, |area, cx| {
+            area.set_center(center, window, cx);
+            area.set_dock(DockPlacement::Left, left, window, cx);
+            area.set_dock_size(DockPlacement::Left, px(260.), window, cx);
+            // The torrents panel starts zoomed: it fills the whole dock
+            // area, keeping the Explorer dock (created open, underneath)
+            // hidden until the zoom is cleared.
+            if let Some(node) = center_group_node(area, torrents_panel_id) {
+                area.set_zoomed_in(node, window, cx);
+            }
+        });
+
         let mut this = Self {
             client: client.clone(),
             host,
-            // Placeholder; replaced just below once `this` exists.
-            table_state: cx.new(|_cx| {
-                TableState::new(
-                    TorrentTableDelegate::new(
-                        WeakEntity::new_invalid(),
-                        client.clone(),
-                        dummy_host(),
-                    ),
-                    window,
-                    _cx,
-                )
-                .row_selectable(true)
-            }),
-            resizable_state: cx.new(|_cx| ResizableState::default()),
+            table_state,
+            dock_area,
+            explorer,
+            torrents_panel,
             active_page: None,
             detail_panel: None,
             pending_detail_id: None,
@@ -234,35 +379,17 @@ impl MainPanel {
             focus_handle: cx.focus_handle(),
         };
 
-        // Now that `this` exists, build the real table state with a weak handle to it.
-        let table_state = cx.new(|cx| {
-            TableState::new(
-                TorrentTableDelegate::new(weak, client, this.host.clone()),
-                window,
-                cx,
-            )
-            .row_selectable(true)
-        });
-        this.table_state = table_state.clone();
-
         // Open/update detail panel when a row is selected in the table, and
         // persist column widths so user resizes survive the delegate's
         // column rebuilds (a `refresh()` re-reads the delegate's columns).
-        cx.subscribe(&table_state, |this, table, event: &TableEvent, cx| {
-            match event {
+        let table_state = this.table_state.clone();
+        cx.subscribe(
+            &table_state,
+            |this, table, event: &TableEvent, cx| match event {
                 TableEvent::SelectRow(row_ix) => {
                     let torrent_id = table.read(cx).delegate().rows.get(*row_ix).map(|r| r.id);
                     if let Some(id) = torrent_id {
-                        if let Some(panel) = &this.detail_panel {
-                            // Update existing panel to show the newly selected torrent.
-                            panel.update(cx, |panel, cx| {
-                                panel.switch_torrent(id as usize, cx);
-                            });
-                        } else {
-                            // Mark that we need to create a panel; defer to render where window is available.
-                            this.pending_detail_id = Some(id as usize);
-                            cx.notify();
-                        }
+                        this.open_details(id as usize, cx);
                     }
                 }
                 TableEvent::ColumnWidthsChanged(widths) => {
@@ -271,8 +398,8 @@ impl MainPanel {
                     });
                 }
                 _ => {}
-            }
-        })
+            },
+        )
         .detach();
 
         // Refresh immediately when the window is re-activated, so the table
@@ -317,6 +444,25 @@ impl MainPanel {
                 this.apply_search_and_filter(cx);
             },
         )
+        .detach();
+
+        // Re-render right away when the user toggles the dock via its own
+        // chrome (collapse button), so the status-bar Explorer toggle's
+        // state follows. Zoom changes surface through the regular refresh
+        // cadence.
+        let dock_area = this.dock_area.clone();
+        cx.subscribe(&dock_area, |_, _, _event: &DockToggleEvent, cx| {
+            cx.notify();
+        })
+        .detach();
+
+        // Selecting an entry in the Explorer opens (or retargets) the
+        // torrent detail panel.
+        let explorer = this.explorer.clone();
+        cx.subscribe(&explorer, |this, _, event: &ExplorerEvent, cx| {
+            let ExplorerEvent::TorrentSelected(id) = event;
+            this.open_details(*id as usize, cx);
+        })
         .detach();
 
         this.fetch_torrents(cx);
@@ -401,7 +547,10 @@ impl MainPanel {
                     PushUpdate::TorrentList(list) => {
                         let rows: Vec<TorrentRow> =
                             list.torrents.iter().map(TorrentRow::from_details).collect();
-                        let _ = this.update(cx, |this, cx| this.install_rows(rows, cx));
+                        let _ = this.update(cx, |this, cx| {
+                            this.install_rows(rows, cx);
+                            this.update_explorer(&list.torrents, cx);
+                        });
                     }
                     PushUpdate::SessionStats(stats) => {
                         let _ = this.update(cx, |this, cx| {
@@ -447,8 +596,9 @@ impl MainPanel {
     fn fetch_torrents(&mut self, cx: &mut Context<Self>) {
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let response = client.list(true).await;
-            let rows: Vec<TorrentRow> = response
+            let list = client.list(true).await.ok();
+            let rows: Vec<TorrentRow> = list
+                .as_ref()
                 .map(|r| r.torrents.iter().map(TorrentRow::from_details).collect())
                 .unwrap_or_default();
             // Session default download folder — keeps default-folder torrents
@@ -463,6 +613,9 @@ impl MainPanel {
                         .set_default_folder(default_folder.as_deref());
                 });
                 this.install_rows(rows, cx);
+                if let Some(list) = list {
+                    this.update_explorer(&list.torrents, cx);
+                }
             });
         })
         .detach();
@@ -847,6 +1000,68 @@ impl MainPanel {
         .detach();
     }
 
+    /// Open the detail panel for a torrent, or retarget the existing one.
+    /// Shared by the table's row selection and the Explorer's tree selection.
+    fn open_details(&mut self, torrent_id: usize, cx: &mut Context<Self>) {
+        if let Some(panel) = &self.detail_panel {
+            // Update existing panel to show the newly selected torrent.
+            panel.update(cx, |panel, cx| {
+                panel.switch_torrent(torrent_id, cx);
+            });
+        } else {
+            // Mark that we need to create a panel; defer to render where
+            // window is available.
+            self.pending_detail_id = Some(torrent_id);
+            cx.notify();
+        }
+    }
+
+    /// Whether the Explorer dock is on screen. The torrents panel starts
+    /// zoomed — filling the whole area — which keeps the dock hidden until
+    /// the zoom is cleared, so visibility is zoom + dock-open, not either
+    /// alone.
+    fn explorer_visible(&self, cx: &App) -> bool {
+        let area = self.dock_area.read(cx);
+        !area.is_zoomed() && area.is_dock_open(DockPlacement::Left)
+    }
+
+    /// The status-bar Explorer toggle (Zed-style, far left). Showing the
+    /// explorer clears the torrents panel's zoom and opens the dock; hiding
+    /// it closes the dock and restores the default maximized torrents view.
+    fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let show = !self.explorer_visible(cx);
+        let torrents_panel_id = PanelId::from(self.torrents_panel.entity_id());
+        self.dock_area.update(cx, |area, cx| {
+            if show {
+                if area.is_zoomed() {
+                    area.set_zoomed_out(window, cx);
+                }
+                if !area.is_dock_open(DockPlacement::Left) {
+                    area.toggle_dock(DockPlacement::Left, window, cx);
+                }
+            } else {
+                if area.is_dock_open(DockPlacement::Left) {
+                    area.toggle_dock(DockPlacement::Left, window, cx);
+                }
+                if let Some(node) = center_group_node(area, torrents_panel_id) {
+                    area.set_zoomed_in(node, window, cx);
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    /// Feed the latest torrent list to the Explorer tree (per-file progress
+    /// rides on the list rows' stats).
+    fn update_explorer(
+        &mut self,
+        torrents: &[rqbit_protocol::TorrentDetails],
+        cx: &mut Context<Self>,
+    ) {
+        self.explorer
+            .update(cx, |explorer, cx| explorer.set_torrents(torrents, cx));
+    }
+
     fn create_detail_panel(
         &mut self,
         torrent_id: usize,
@@ -870,6 +1085,7 @@ impl MainPanel {
         )
         .detach();
         self.detail_panel = Some(panel);
+        self.sync_torrents_panel_detail(cx);
         cx.notify();
     }
 
@@ -881,7 +1097,18 @@ impl MainPanel {
             cx.notify();
         });
         self.detail_panel = None;
+        self.sync_torrents_panel_detail(cx);
         cx.notify();
+    }
+
+    /// Mirror the detail panel into the dock's center panel, which renders
+    /// the table + details split.
+    fn sync_torrents_panel_detail(&mut self, cx: &mut Context<Self>) {
+        let detail = self.detail_panel.clone();
+        self.torrents_panel.update(cx, |panel, cx| {
+            panel.set_detail_panel(detail);
+            cx.notify();
+        });
     }
 
     fn on_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1120,36 +1347,15 @@ impl MainPanel {
     }
 
     /// Render the main content area: the host settings page or log viewer
-    /// page when open, otherwise the resizable split of torrent table (left)
-    /// + detail panel (right, conditional).
-    fn render_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// page when open, otherwise the dockable layout (Explorer dock left,
+    /// torrent table + detail split centered).
+    fn render_content(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         div().flex_1().min_h_0().child(match &self.active_page {
             // Pages replace the main content.
             Some(page) => div().size_full().child(page.clone()).into_any_element(),
-            None => v_resizable("main-split")
-                .with_state(&self.resizable_state)
-                .child(
-                    resizable_panel().child(
-                        div()
-                            .size_full()
-                            .overflow_hidden()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .child(DataTable::new(&self.table_state).bordered(false)),
-                    ),
-                )
-                .child(
-                    resizable_panel()
-                        .visible(self.detail_panel.is_some())
-                        .size(px(400.))
-                        .size_range(px(250.)..px(800.))
-                        .child(
-                            self.detail_panel
-                                .clone()
-                                .map(|p| p.into_any_element())
-                                .unwrap_or_else(|| div().into_any_element()),
-                        ),
-                )
+            None => div()
+                .size_full()
+                .child(self.dock_area.clone())
                 .into_any_element(),
         })
     }
@@ -1218,6 +1424,21 @@ impl MainPanel {
         });
 
         StatusBar::new()
+            // ← Explorer dock toggle, far left like Zed's status bar. Lit
+            // while the tree is on screen (the zoomed torrents panel covers
+            // the dock, so visibility is zoom + dock-open).
+            .left(
+                Button::new("explorer-toggle")
+                    .tooltip("Toggle Explorer")
+                    .icon(IconName::PanelLeft)
+                    .small()
+                    .ghost()
+                    .selected(self.explorer_visible(cx))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_explorer(window, cx);
+                    })),
+            )
+            .left(Separator::vertical())
             // ↓ Download speed (and total fetched)
             .left(
                 h_flex()
@@ -1343,21 +1564,6 @@ impl Focusable for MainPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
-}
-
-/// Placeholder host used only while the placeholder table state is built
-/// before `self.host` is available; never consulted for rendering.
-fn dummy_host() -> Arc<dyn UiHost> {
-    struct Dummy;
-    impl UiHost for Dummy {
-        fn capabilities(&self) -> crate::host::UiCapabilities {
-            crate::host::UiCapabilities::remote()
-        }
-        fn version(&self) -> String {
-            String::new()
-        }
-    }
-    Arc::new(Dummy)
 }
 
 #[cfg(test)]
