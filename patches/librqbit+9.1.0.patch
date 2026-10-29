@@ -1,0 +1,186 @@
+diff --git a/src/api.rs b/src/api.rs
+index f795c1f..9607b6d 100644
+--- a/src/api.rs
++++ b/src/api.rs
+@@ -15,10 +15,7 @@ use crate::{
+         AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, TorrentId,
+     },
+     session_stats::snapshot::SessionStatsSnapshot,
+-    torrent_state::{
+-        FileStream, ManagedTorrentHandle,
+-        peer::stats::snapshot::{PeerStatsFilter, PeerStatsSnapshot},
+-    },
++    torrent_state::{FileStream, ManagedTorrentHandle},
+     type_aliases::BF,
+ };
+ 
+@@ -29,6 +26,9 @@ use futures::Stream;
+ #[cfg(feature = "tracing-subscriber-utils")]
+ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
+ 
++pub use crate::torrent_state::peer::stats::snapshot::{
++    PeerCounters, PeerStats, PeerStatsFilter, PeerStatsFilterState, PeerStatsSnapshot,
++};
+ pub use crate::torrent_state::stats::{LiveStats, TorrentStats};
+ 
+ pub type Result<T> = std::result::Result<T, ApiError>;
+@@ -228,6 +228,7 @@ impl Api {
+                         // These will be filled in /details and /stats endpoints
+                         files: None,
+                         stats: None,
++                        comment: None,
+                     };
+                     if opts.with_stats {
+                         r.stats = Some(mgr.stats());
+@@ -257,6 +258,12 @@ impl Api {
+             handle.name().as_deref(),
+             only_files.as_deref(),
+             output_folder,
++            handle
++                .metadata
++                .load()
++                .as_ref()
++                .and_then(|m| m.comment.as_ref())
++                .map(|c| c.to_string()),
+         )
+     }
+ 
+@@ -398,6 +405,12 @@ impl Api {
+                         .output_folder
+                         .to_string_lossy()
+                         .into_owned(),
++                    handle
++                        .metadata
++                        .load()
++                        .as_ref()
++                        .and_then(|m| m.comment.as_ref())
++                        .map(|c| c.to_string()),
+                 )
+                 .context("error making torrent details")?;
+                 ApiAddTorrentResponse {
+@@ -430,6 +443,7 @@ impl Api {
+                     None,
+                     only_files.as_deref(),
+                     output_folder.to_string_lossy().into_owned().to_string(),
++                    None,
+                 )
+                 .context("error making torrent details")?,
+             },
+@@ -446,6 +460,12 @@ impl Api {
+                         .output_folder
+                         .to_string_lossy()
+                         .into_owned(),
++                    handle
++                        .metadata
++                        .load()
++                        .as_ref()
++                        .and_then(|m| m.comment.as_ref())
++                        .map(|c| c.to_string()),
+                 )
+                 .context("error making torrent details")?;
+                 ApiAddTorrentResponse {
+@@ -549,6 +569,8 @@ pub struct TorrentDetailsResponse {
+     pub files: Option<Vec<TorrentDetailsResponseFile>>,
+     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
+     pub stats: Option<TorrentStats>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub comment: Option<String>,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+@@ -566,6 +588,7 @@ fn make_torrent_details(
+     name: Option<&str>,
+     only_files: Option<&[usize]>,
+     output_folder: String,
++    comment: Option<String>,
+ ) -> Result<TorrentDetailsResponse> {
+     let files = match info {
+         Some(info) => info
+@@ -596,6 +619,7 @@ fn make_torrent_details(
+         files: Some(files),
+         output_folder,
+         total_pieces,
++        comment,
+         stats: None,
+     })
+ }
+diff --git a/src/session.rs b/src/session.rs
+index 5e02415..ab0d3d7 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -1093,6 +1093,12 @@ impl Session {
+         callback(&mut self.db.read().torrents.iter().map(|(id, t)| (*id, t)))
+     }
+ 
++    /// The session-wide default output folder torrents are downloaded to
++    /// when no explicit destination is given.
++    pub fn default_output_folder(&self) -> &Path {
++        &self.output_folder
++    }
++
+     /// Add a torrent to the session.
+     #[inline(never)]
+     pub fn add_torrent<'a>(
+@@ -1169,6 +1175,7 @@ impl Session {
+                             torrent.meta.info.data.validate()?,
+                             torrent.torrent_bytes,
+                             torrent.meta.info.raw_bytes.0,
++                            torrent.meta.comment.clone(),
+                         )?),
+                         trackers: trackers
+                             .iter()
+@@ -1677,6 +1684,7 @@ impl Session {
+                         info,
+                         torrent_file_from_info_bytes(info_bytes.as_ref(), trackers)?,
+                         info_bytes.0,
++                        None,
+                     )?,
+                     peer_rx: rx,
+                     seen_peers: {
+diff --git a/src/torrent_state/mod.rs b/src/torrent_state/mod.rs
+index db47001..66780c3 100644
+--- a/src/torrent_state/mod.rs
++++ b/src/torrent_state/mod.rs
+@@ -140,6 +140,8 @@ pub struct TorrentMetadata {
+     pub torrent_bytes: Bytes,
+     pub info_bytes: Bytes,
+     pub file_infos: FileInfos,
++    /// Top-level "comment" field from the .torrent metainfo, if present.
++    pub comment: Option<ByteBufOwned>,
+ }
+ 
+ impl TorrentMetadata {
+@@ -147,6 +149,7 @@ impl TorrentMetadata {
+         info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
+         torrent_bytes: Bytes,
+         info_bytes: Bytes,
++        comment: Option<ByteBufOwned>,
+     ) -> anyhow::Result<Self> {
+         let file_infos = info
+             .iter_file_details_ext()
+@@ -166,6 +169,7 @@ impl TorrentMetadata {
+             torrent_bytes,
+             info_bytes,
+             file_infos,
++            comment,
+         })
+     }
+ 
+diff --git a/src/torrent_state/stats.rs b/src/torrent_state/stats.rs
+index 74f0a48..161ee4d 100644
+--- a/src/torrent_state/stats.rs
++++ b/src/torrent_state/stats.rs
+@@ -190,6 +190,13 @@ fn format_seconds_to_time(seconds: u64, f: &mut core::fmt::Formatter<'_>) -> cor
+ 
+ pub struct DurationWithHumanReadable(Duration);
+ 
++impl DurationWithHumanReadable {
++    /// Returns the underlying duration in seconds.
++    pub fn as_secs(&self) -> u64 {
++        self.0.as_secs()
++    }
++}
++
+ impl core::fmt::Display for DurationWithHumanReadable {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
+         format_seconds_to_time(self.0.as_secs(), f)
