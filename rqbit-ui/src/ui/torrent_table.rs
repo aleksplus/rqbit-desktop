@@ -539,7 +539,15 @@ impl TorrentTableDelegate {
     /// `refresh()` the table state so the framework re-reads the columns.
     pub fn set_custom_columns(&mut self, state: Option<&CustomColumnsState>) -> bool {
         let specs: Vec<CustomColumnSpec> = match state {
-            Some(s) if s.connected => s.columns.clone(),
+            Some(s) if s.connected => s
+                .columns
+                .iter()
+                // The promoted poster column is metadata, not a table
+                // column: it becomes the row's corner artwork, and rendering
+                // it as a cell thumbnail too would show the poster twice.
+                .filter(|s| !(s.key == "poster" && s.kind == CustomColumnKind::Image))
+                .cloned()
+                .collect(),
             _ => Vec::new(),
         };
         if specs == self.custom_specs {

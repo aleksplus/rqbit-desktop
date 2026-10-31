@@ -124,6 +124,12 @@ fn apply_shape_mask(buf: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, shape: ArtworkShap
 
 /// Decode, center-crop, mask, and wrap into a [`RenderImage`]. Runs on the
 /// background executor (a 512² JPEG costs a few milliseconds).
+///
+/// The frame buffer is left in **BGRA byte order**: gpui-pre's own decoders
+/// (`decode_static_image_from_decoder`, the GIF/WebP paths) all convert
+/// `into_rgba8()` and then swap bytes 0↔2 before building frames — the
+/// renderer reads the atlas as BGRA, so feeding plain RGBA renders every
+/// poster with red and blue exchanged (the blue-tint look).
 fn build_image(
     bytes: &[u8],
     shape: ArtworkShape,
@@ -135,6 +141,9 @@ fn build_image(
     let mut buf = cover_crop(img, bw, bh);
     if !mask_disabled() {
         apply_shape_mask(&mut buf, shape);
+    }
+    for pixel in buf.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
     }
     Ok(Arc::new(RenderImage::new(vec![Frame::new(buf)])))
 }
@@ -310,5 +319,22 @@ mod tests {
         let img = DynamicImage::new_rgba8(100, 400);
         let buf = cover_crop(img, 512, 512);
         assert_eq!(buf.dimensions(), (512, 512));
+    }
+
+    /// The renderer reads `RenderImage` frames as BGRA (gpui-pre's own
+    /// decoders swap `into_rgba8()` bytes 0↔2 before building frames);
+    /// feeding plain RGBA rendered every poster with red and blue
+    /// exchanged — the blue-tint regression.
+    #[test]
+    fn build_image_produces_bgra_bytes() {
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1, 1, Rgba([255, 0, 0, 255])))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let img = build_image(&png, ArtworkShape::Rect, 1.0, 1.0).unwrap();
+        let bytes = img.as_bytes(0).unwrap();
+        assert_eq!(bytes[0], 0, "blue byte must be 0 for a red input (BGRA)");
+        assert_eq!(bytes[2], 255, "red input must land in the blue byte slot");
+        assert_eq!(bytes[3], 255, "alpha is untouched by the swap");
     }
 }

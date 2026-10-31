@@ -260,7 +260,9 @@ async fn api_from_config(
 
     // Per-torrent artwork (hook posters / MyShows / media previews): one
     // background worker per session; the artwork HTTP route and the
-    // LocalClient payload decoration read its results.
+    // LocalClient payload decoration read its results. Hook-provided posters
+    // (e.g. moviesync-daemon's `poster` column) carry the resolve table's
+    // mapping — the app never talks to that daemon directly.
     let artwork_slot = ApiSlot::new(Arc::new(api.clone()));
     let artwork = ArtworkProvider::new(artwork_slot, columns.clone(), !config.disable_myshows);
     {

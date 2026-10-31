@@ -105,7 +105,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Per-torrent artwork (hook posters / MyShows / media previews): one
     // background worker; the artwork HTTP route and payload decoration read
-    // its results.
+    // its results. Hook-provided posters (e.g. moviesync-daemon's `poster`
+    // column) carry the resolve-table's mapping — the app never talks to
+    // that daemon directly.
     let artwork = ArtworkProvider::new(daemon.api.clone(), columns.clone(), !args.disable_myshows);
     artwork.start();
 

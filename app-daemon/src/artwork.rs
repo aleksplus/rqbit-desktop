@@ -94,6 +94,10 @@ impl Source {
 #[derive(Debug, Clone, Copy)]
 enum Failure {
     NoCompletedMedia,
+    /// A hook-poster URL was advertised but its download failed — retried
+    /// often (the hook may recover), and it gates the hook-poster upgrade
+    /// so a broken URL doesn't re-resolve on every payload decoration.
+    HookUrl,
     Error,
     NoFfmpeg,
 }
@@ -101,7 +105,7 @@ enum Failure {
 impl Failure {
     fn cooldown(self) -> Duration {
         match self {
-            Failure::NoCompletedMedia => COOLDOWN_RETRYABLE,
+            Failure::NoCompletedMedia | Failure::HookUrl => COOLDOWN_RETRYABLE,
             Failure::Error => COOLDOWN_ERROR,
             Failure::NoFfmpeg => COOLDOWN_NO_FFMPEG,
         }
@@ -258,6 +262,15 @@ impl ArtworkProvider {
             return;
         }
         self.kick(&hash);
+        // Upgrade: a hook poster beats whatever an earlier resolve picked —
+        // the columns snapshot (and its poster) can arrive after the
+        // background chain already settled on a fallback, and without this
+        // the fallback would stick forever. The re-resolve re-runs the chain
+        // with the hook first; the old artwork stays until the new one is
+        // ready.
+        if self.hook_poster(&hash).is_some() && self.art_source(&hash) != Some(Source::Hook) {
+            self.kick_upgrade(&hash);
+        }
         let artwork = self.ready_artwork(&hash);
         details.artwork = artwork;
     }
@@ -281,6 +294,40 @@ impl ArtworkProvider {
         if queue {
             self.wake.notify_one();
         }
+    }
+
+    /// Re-resolve a torrent that already has artwork because a
+    /// higher-priority source (the hook poster) appeared. Ignores ready
+    /// state — the hook URL is new information — but honors failure
+    /// cooldowns, so a broken hook URL retries at the failure's cadence.
+    fn kick_upgrade(&self, hash: &str) {
+        let mut queue = false;
+        {
+            let mut inner = self.inner.lock();
+            if let Some(entry) = inner.entries.get(hash)
+                && let Some((_, until)) = entry.failed
+                && Instant::now() < until
+            {
+                return;
+            }
+            if inner.queued.insert(hash.to_owned()) {
+                inner.interactive.push_back(hash.to_owned());
+                queue = true;
+            }
+        }
+        if queue {
+            self.wake.notify_one();
+        }
+    }
+
+    fn art_source(&self, hash: &str) -> Option<Source> {
+        self.inner
+            .lock()
+            .entries
+            .get(hash)?
+            .art
+            .as_ref()
+            .map(|a| a.source)
     }
 
     fn ready_artwork(&self, hash: &str) -> Option<TorrentArtwork> {
@@ -344,6 +391,10 @@ impl ArtworkProvider {
         };
         let name = torrent.name.clone().unwrap_or_default();
 
+        // Hook-provided poster (the columns API's Image column keyed
+        // `poster` — e.g. moviesync-daemon publishes its resolve table's
+        // poster there): authoritative by construction, so a hit ends the
+        // chain here.
         if let Some(url) = self.hook_poster(hash) {
             match fetch_image_with(&self.client, &url).await {
                 Ok((bytes, content_type)) => {
@@ -352,10 +403,20 @@ impl ArtworkProvider {
                 }
                 Err(e) => {
                     tracing::info!(hash, url = %url, error = %e, "hook poster fetch failed");
+                    // Gate the hook-poster upgrade: without this the
+                    // decorate path would re-resolve (and re-fail) on every
+                    // payload while the URL is broken.
+                    self.fail(hash, Failure::HookUrl);
                 }
             }
         }
 
+        // The built-in MyShows search is the fallback when no hook supplied
+        // a poster. It only accepts an exact title match (original or
+        // localized, compared case/punctuation-insensitively): MyShows'
+        // fuzzy ranking returns unrelated shows for hard names
+        // ("…First Marriage" → "Marriage Toxin"), and a wrong poster is
+        // worse than none — the hook's resolve table is the recall path.
         if self.myshows_enabled && !name.is_empty() {
             match self.myshows_poster(&name).await {
                 Ok(Some((show_id, url))) => match fetch_image_with(&self.client, &url).await {
@@ -376,7 +437,12 @@ impl ArtworkProvider {
             }
         }
 
-        match self.preview_candidate(&torrent) {
+        self.preview_fallback(hash, &torrent).await;
+    }
+
+    /// The preview stage at the end of the chain.
+    async fn preview_fallback(&self, hash: &str, torrent: &TorrentDetails) {
+        match self.preview_candidate(torrent) {
             Ok(Some((file_idx, path))) => {
                 self.advertise_preview(hash, file_idx);
                 match extract_frame(&path).await {
@@ -435,7 +501,12 @@ impl ArtworkProvider {
     }
 
     /// Search MyShows for the cleaned release title. Returns
-    /// `(show id, poster url)`; `Ok(None)` = searched, nothing usable.
+    /// `(show id, poster url)`; `Ok(None)` = searched, nothing usable. Only
+    /// a result whose title — original or localized — equals the cleaned
+    /// name is accepted: MyShows' fuzzy ranking returns unrelated shows for
+    /// hard names ("…First Marriage" → "Marriage Toxin"), and a wrong poster
+    /// is worse than none. The hook's resolve table is the recall path for
+    /// names no exact search can match.
     async fn myshows_poster(&self, name: &str) -> Result<Option<(String, String)>, String> {
         let title = clean_title(name);
         if title.is_empty() {
@@ -491,12 +562,23 @@ impl ArtworkProvider {
             .error_for_status()
             .map_err(|e| e.to_string())?;
         let rpc: MyShowsRpc = resp.json().await.map_err(|e| e.to_string())?;
-        let show = rpc
-            .result
-            .unwrap_or_default()
-            .into_iter()
-            .find(|s| s.image.as_deref().is_some_and(|u| u.starts_with("http")));
-        Ok(show.map(|s| (format!("s{}", s.id), s.image.expect("filtered above"))))
+        let results = rpc.result.unwrap_or_default();
+        let norm = normalize_alnum(title);
+        let exact = |s: &MyShowsShow| {
+            normalize_alnum(&s.title) == norm
+                || s.title_original
+                    .as_deref()
+                    .is_some_and(|t| normalize_alnum(t) == norm)
+        };
+        let show = results
+            .iter()
+            .find(|s| exact(s) && s.image.as_deref().is_some_and(|u| u.starts_with("http")));
+        Ok(show.map(|s| {
+            (
+                format!("s{}", s.id),
+                s.image.clone().expect("filtered above"),
+            )
+        }))
     }
 
     /// The largest fully-downloaded video file and its on-disk path.
@@ -628,19 +710,20 @@ impl ArtworkProvider {
         let Some(entry) = inner.entries.get_mut(hash) else {
             return;
         };
-        // An existing image is never dropped by a later failed refresh.
-        if entry.art.is_none() {
-            entry.failed = Some((failure, Instant::now() + failure.cooldown()));
-            // "No completed media file" is the normal state for downloads in
-            // flight (retried every 60 s) — keep it quiet; the rest is worth
-            // surfacing on the log pages.
-            match failure {
-                Failure::NoCompletedMedia => {
-                    tracing::debug!(hash, ?failure, "no torrent artwork");
-                }
-                Failure::Error | Failure::NoFfmpeg => {
-                    tracing::info!(hash, ?failure, "no torrent artwork");
-                }
+        // An existing image is never dropped by a later failed refresh — but
+        // the cooldown is still recorded: it gates the hook-poster upgrade
+        // (kick_upgrade), so a broken hook URL retries at the failure's
+        // cadence instead of on every payload decoration.
+        entry.failed = Some((failure, Instant::now() + failure.cooldown()));
+        // "No completed media file" is the normal state for downloads in
+        // flight (retried every 60 s) — keep it quiet; the rest is worth
+        // surfacing on the log pages.
+        match failure {
+            Failure::NoCompletedMedia | Failure::HookUrl => {
+                tracing::debug!(hash, ?failure, "no torrent artwork");
+            }
+            Failure::Error | Failure::NoFfmpeg => {
+                tracing::info!(hash, ?failure, "no torrent artwork");
             }
         }
     }
@@ -697,7 +780,26 @@ struct MyShowsShow {
     #[serde(default)]
     id: i64,
     #[serde(default)]
+    title: String,
+    /// The original (usually English) title — the localized `title` often
+    /// differs, and the exact-match check compares both. The API spells the
+    /// field camelCase; without the rename it always deserialized empty and
+    /// the exact match degraded to comparing localized titles only.
+    #[serde(rename = "titleOriginal", default)]
+    title_original: Option<String>,
+    #[serde(default)]
     image: Option<String>,
+}
+
+/// Case- and punctuation-insensitive title comparison, matching
+/// moviesync-daemon's `normalize_title` (lowercase, alphanumeric only) so
+/// both sides agree on what "the same title" means.
+fn normalize_alnum(title: &str) -> String {
+    title
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
 
 /// Download an image and detect its content type.
@@ -956,5 +1058,57 @@ mod tests {
         assert_eq!(detect_image(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(detect_image(b"RIFF1234WEBPVP8 "), Some("image/webp"));
         assert_eq!(detect_image(b"<html>"), None);
+    }
+
+    /// The exact-match filter depends on `titleOriginal`: MyShows spells it
+    /// camelCase, and a serde field-name mismatch silently deserialized it
+    /// empty — leaving localized titles as the only comparison, which
+    /// matched almost no release name ("only Newlyweds shows a poster").
+    #[test]
+    fn myshows_show_parses_camel_case_original_title() {
+        let show: MyShowsShow = serde_json::from_str(
+            r#"{"id":67366,"title":"Тед Лассо","titleOriginal":"Ted Lasso",
+                "image":"https://media.myshows.me/shows/normal/x.jpg"}"#,
+        )
+        .unwrap();
+        assert_eq!(show.title, "Тед Лассо");
+        assert_eq!(show.title_original.as_deref(), Some("Ted Lasso"));
+        assert_eq!(
+            normalize_alnum(show.title_original.as_deref().unwrap()),
+            "tedlasso"
+        );
+    }
+
+    /// The exact-match filter accepts the original or the localized title,
+    /// and rejects unrelated shows.
+    #[test]
+    fn exact_title_check() {
+        let ted = MyShowsShow {
+            id: 67366,
+            title: "Тед Лассо".into(),
+            title_original: Some("Ted Lasso".into()),
+            image: Some("https://x.jpg".into()),
+        };
+        assert!(
+            normalize_alnum(&ted.title) == normalize_alnum("Ted Lasso") || {
+                ted.title_original
+                    .as_deref()
+                    .is_some_and(|t| normalize_alnum(t) == normalize_alnum("Ted Lasso"))
+            }
+        );
+        let toxin = MyShowsShow {
+            id: 98262,
+            title: "Брачный токсин".into(),
+            title_original: Some("Marriage Toxin".into()),
+            image: Some("https://x.jpg".into()),
+        };
+        let norm = normalize_alnum("Georgie and Mandys First Marriage");
+        assert!(normalize_alnum(&toxin.title) != norm);
+        assert!(
+            !toxin
+                .title_original
+                .as_deref()
+                .is_some_and(|t| normalize_alnum(t) == norm)
+        );
     }
 }
