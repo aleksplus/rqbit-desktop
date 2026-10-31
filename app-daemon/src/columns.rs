@@ -37,7 +37,11 @@
 //! Values must be JSON scalars (string / number / bool); they are stored as
 //! strings. Column entries with empty or duplicate keys are dropped, the
 //! column count is capped, and value strings are truncated — a misbehaving
-//! hook cannot break the layout. An empty response body means "no columns
+//! hook cannot break the layout. Image-kind columns (`"kind": "image"`)
+//! carry `http(s)://` URLs (up to 512 chars): the torrent table renders them
+//! as thumbnails, and a torrent-level column keyed `poster` additionally
+//! becomes the torrent's artwork reference for `artwork.rs` (see the
+//! "Hook poster" priority there). An empty response body means "no columns
 //! right now" (the hook counts as connected). Errors flip the snapshot's
 //! `connected` flag to false (the UI then hides the columns and shows the
 //! offline plug) and are logged at `warn!` level, which reaches both UIs'
@@ -59,6 +63,8 @@ use crate::server::ApiSlot;
 const MAX_COLUMNS: usize = 8;
 /// Hard cap on a single stored value's length.
 const MAX_VALUE_LEN: usize = 64;
+/// Hard cap on Image-column values (they hold image URLs, which run long).
+const MAX_URL_VALUE_LEN: usize = 512;
 /// Clamping range for hook-declared column widths (logical pixels).
 const MIN_WIDTH: f32 = 40.0;
 const MAX_WIDTH: f32 = 400.0;
@@ -213,11 +219,14 @@ fn parse_snapshot(
         });
     }
     let declared: HashSet<&str> = specs.iter().map(|c| c.key.as_str()).collect();
+    let kinds: HashMap<&str, CustomColumnKind> =
+        specs.iter().map(|c| (c.key.as_str(), c.kind)).collect();
 
-    // Values: keep only keys that match a declared column; scalars only.
+    // Values: keep only keys that match a declared column; scalars only
+    // (Image columns additionally carry http(s) URLs).
     let mut torrent_values: HashMap<String, BTreeMap<String, String>> = HashMap::new();
     for (info_hash, values) in resp.torrents {
-        let sanitized = sanitize_values(values, &declared);
+        let sanitized = sanitize_values(values, &declared, &kinds);
         if !sanitized.is_empty() {
             torrent_values.insert(info_hash, sanitized);
         }
@@ -227,7 +236,7 @@ fn parse_snapshot(
     for (info_hash, entries) in resp.files {
         let mut per_file: HashMap<usize, BTreeMap<String, String>> = HashMap::new();
         for entry in entries {
-            let sanitized = sanitize_values(entry.values, &declared);
+            let sanitized = sanitize_values(entry.values, &declared, &kinds);
             if !sanitized.is_empty() {
                 per_file.insert(entry.index, sanitized);
             }
@@ -250,15 +259,20 @@ fn parse_snapshot(
 
 /// JSON scalars keyed by column key → stored strings. Unknown keys and
 /// non-scalar values (objects/arrays/null) are not renderable and are
-/// dropped.
+/// dropped. Image columns require `http(s)://` string values (they become
+/// artwork references) and allow a longer cap; other columns are plain text.
 fn sanitize_values(
     values: BTreeMap<String, serde_json::Value>,
     declared: &HashSet<&str>,
+    kinds: &HashMap<&str, CustomColumnKind>,
 ) -> BTreeMap<String, String> {
     values
         .into_iter()
         .filter(|(k, _)| declared.contains(k.as_str()))
-        .filter_map(|(k, v)| scalar_to_string(&v).map(|v| (k, v)))
+        .filter_map(|(k, v)| match kinds.get(k.as_str()) {
+            Some(CustomColumnKind::Image) => image_url_to_string(&v).map(|url| (k, url)),
+            _ => scalar_to_string(&v).map(|v| (k, v)),
+        })
         .collect()
 }
 
@@ -271,6 +285,19 @@ fn scalar_to_string(v: &serde_json::Value) -> Option<String> {
         _ => return None,
     };
     Some(truncate(&s, MAX_VALUE_LEN))
+}
+
+/// Image-column value → stored URL. Only `http(s)://` strings are kept
+/// (anything else cannot be fetched), capped at [`MAX_URL_VALUE_LEN`].
+fn image_url_to_string(v: &serde_json::Value) -> Option<String> {
+    let serde_json::Value::String(s) = v else {
+        return None;
+    };
+    let url = s.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return None;
+    }
+    Some(truncate(url, MAX_URL_VALUE_LEN))
 }
 
 fn truncate(s: &str, max: usize) -> String {

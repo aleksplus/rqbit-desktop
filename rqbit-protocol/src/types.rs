@@ -152,6 +152,11 @@ pub struct TorrentDetails {
     /// key (`CustomColumnSpec::key`). `None`/empty = no hook data.
     #[serde(default)]
     pub custom: Option<BTreeMap<String, String>>,
+    /// Resolved artwork (poster/preview) for this torrent, when any source
+    /// produced one. Decoration is asynchronous — it appears on a later
+    /// payload after the daemon resolves it.
+    #[serde(default)]
+    pub artwork: Option<TorrentArtwork>,
 }
 
 /// How a hook-provided custom-column cell renders.
@@ -164,6 +169,26 @@ pub enum CustomColumnKind {
     /// Render the value as a colored status badge (recognized values map to
     /// success / warning / danger tones, everything else stays plain text).
     Status,
+    /// The value is an `http(s)://` image URL (validated by the daemon);
+    /// rendered as a small thumbnail. A torrent-level Image column keyed
+    /// `poster` is additionally promoted to the torrent's
+    /// [`TorrentDetails::artwork`].
+    Image,
+}
+
+/// Per-torrent artwork shown behind the detail panel's Overview tab and in
+/// the torrent list row corner. The bytes live on the daemon; the reference
+/// only points at them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentArtwork {
+    /// Cache key: the UI refetches when this changes for the same torrent.
+    pub key: String,
+    /// Daemon-relative URL path serving the image bytes (e.g.
+    /// `/torrents/by-hash/{hash}/artwork`); hosts prepend their HTTP base.
+    pub path: String,
+    /// Where the artwork came from (`hook`, `myshows`, `preview`) — shown in
+    /// tooltips / logs, and lets the UI skip re-decoding identical sources.
+    pub source: String,
 }
 
 /// One hook-provided column definition, served verbatim from the hook's

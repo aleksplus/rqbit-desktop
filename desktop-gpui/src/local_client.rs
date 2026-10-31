@@ -49,6 +49,12 @@ impl LocalClient {
         self.shared.read().columns().and_then(|p| p.snapshot())
     }
 
+    /// The artwork provider, when one is configured. Read per call like
+    /// [`Self::columns`].
+    fn artwork(&self) -> Option<Arc<app_daemon::artwork::ArtworkProvider>> {
+        self.shared.read().artwork()
+    }
+
     /// Fire the `torrent_deleted` hook after a successful delete/forget.
     /// Mirrors the flow the settings/main panel used to inline.
     fn dispatch_deleted(
@@ -88,6 +94,9 @@ impl TorrentClient for LocalClient {
         if let Some(snapshot) = self.columns() {
             snapshot.decorate_list(&mut list);
         }
+        if let Some(artwork) = self.artwork() {
+            artwork.decorate_list(&mut list);
+        }
         Ok(list)
     }
 
@@ -109,6 +118,9 @@ impl TorrentClient for LocalClient {
         let mut details = conv::torrent_details(&resp, trackers);
         if let Some(snapshot) = self.columns() {
             snapshot.decorate_details(&mut details);
+        }
+        if let Some(artwork) = self.artwork() {
+            artwork.decorate_details(&mut details);
         }
         Ok(details)
     }

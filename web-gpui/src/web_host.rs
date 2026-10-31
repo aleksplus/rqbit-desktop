@@ -236,6 +236,44 @@ impl UiHost for WebHost {
         ))
     }
 
+    fn artwork_url(&self, path: &str) -> Option<String> {
+        // Absolute URLs (hook Image-column values) are used verbatim; only
+        // daemon-relative artwork paths get the daemon origin prepended.
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return Some(path.to_owned());
+        }
+        Some(format!("{}{path}", self.media_base.as_deref()?))
+    }
+
+    fn fetch_bytes<'a>(
+        &'a self,
+        url: String,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + 'a>> {
+        Box::pin(async move {
+            use wasm_bindgen::JsCast as _;
+            use wasm_bindgen_futures::JsFuture;
+            use web_sys::{Request, RequestInit, Response};
+
+            let window = web_sys::window().ok_or("no window")?;
+            let init = RequestInit::new();
+            let request = Request::new_with_str_and_init(&url, &init)
+                .map_err(|e| format!("request error: {e:?}"))?;
+            let resp_value = JsFuture::from(window.fetch_with_request(&request))
+                .await
+                .map_err(|e| format!("fetch error: {e:?}"))?;
+            let resp: Response = resp_value
+                .dyn_into()
+                .map_err(|e| format!("response error: {e:?}"))?;
+            if !resp.ok() {
+                return Err(format!("http {}", resp.status()));
+            }
+            let buffer = JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("body error: {e:?}"))?;
+            Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+        })
+    }
+
     fn pick_torrent_files(
         &self,
         _cx: &mut App,

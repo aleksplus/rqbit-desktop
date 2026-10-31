@@ -106,6 +106,25 @@ pub trait UiHost: 'static {
         None
     }
 
+    /// Full URL for a daemon-relative artwork path (e.g. the
+    /// `TorrentArtwork::path` of a decorated payload), when the host knows
+    /// an HTTP base that serves it. Absolute `http(s)://` paths (hook
+    /// Image-column values) pass through unchanged. `None` = artwork is not
+    /// fetchable here and the UI renders none.
+    fn artwork_url(&self, _path: &str) -> Option<String> {
+        None
+    }
+
+    /// Fetch bytes over HTTP (artwork loading). Desktop: reqwest; browser:
+    /// a same-origin fetch. The neutral default always fails, so hosts
+    /// without a transport simply never show artwork.
+    fn fetch_bytes<'a>(
+        &'a self,
+        _url: String,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + 'a>> {
+        Box::pin(async { Err("fetching bytes is not supported here".to_string()) })
+    }
+
     /// Open the host's settings page (rendered full-page inside MainPanel).
     /// The client is the same transport the panel talks to. The host
     /// subscribes its own "Back" event (via `cx.subscribe`) and must call

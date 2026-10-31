@@ -2,6 +2,7 @@ use crate::config::{HttpMethod, RqbitDesktopConfig, read_config, write_config};
 use crate::folder_watcher::start_folder_watcher;
 use crate::hooks::{HookDispatcher, HookEvent};
 use crate::web_settings::WebViewSettingsBackend;
+use app_daemon::artwork::ArtworkProvider;
 use app_daemon::columns::{ColumnsHook, ColumnsMethod, ColumnsProvider};
 use app_daemon::server::ApiSlot;
 use librqbit::{api::Api, tracing_subscriber_config_utils::InitLoggingResult};
@@ -25,6 +26,9 @@ pub struct SharedState {
     /// when no hook provides columns. Swapped together with the session on
     /// reconfigure; `LocalClient` re-reads it per call.
     columns: Option<Arc<ColumnsProvider>>,
+    /// Per-torrent artwork provider (hook posters / MyShows / media
+    /// previews). Same lifecycle as `columns`.
+    artwork: Option<Arc<ArtworkProvider>>,
 }
 
 impl SharedState {
@@ -40,6 +44,7 @@ impl SharedState {
             config,
             api,
             columns: None,
+            artwork: None,
         }
     }
 
@@ -50,6 +55,11 @@ impl SharedState {
     /// The custom-column provider, when a hook provides columns.
     pub fn columns(&self) -> Option<Arc<ColumnsProvider>> {
         self.columns.clone()
+    }
+
+    /// The artwork provider, when one is configured.
+    pub fn artwork(&self) -> Option<Arc<ArtworkProvider>> {
+        self.artwork.clone()
     }
 
     /// Replace the in-memory config snapshot (does not persist to disk).
@@ -80,10 +90,11 @@ impl Clone for State {
     }
 }
 
-/// A session's Api plus the hook-columns provider built alongside it.
+/// A session's Api plus the providers built alongside it.
 struct SessionApi {
     api: Api,
     columns: Option<Arc<ColumnsProvider>>,
+    artwork: Option<Arc<ArtworkProvider>>,
 }
 
 /// Hooks subscribed to `torrent_columns`, converted for the daemon-side
@@ -247,6 +258,19 @@ async fn api_from_config(
         Some(provider)
     };
 
+    // Per-torrent artwork (hook posters / MyShows / media previews): one
+    // background worker per session; the artwork HTTP route and the
+    // LocalClient payload decoration read its results.
+    let artwork_slot = ApiSlot::new(Arc::new(api.clone()));
+    let artwork = ArtworkProvider::new(artwork_slot, columns.clone(), !config.disable_myshows);
+    {
+        let worker = artwork.clone();
+        session.spawn(debug_span!("artwork"), "artwork", async move {
+            worker.run().await;
+            Ok(())
+        });
+    }
+
     // The bundled web view: the same WS protocol (`/ws`) and embedded browser
     // client (`/`) `app-daemon` serves, pointed at this session. One librqbit
     // instance then serves both the native UI and the browser UI. Spawned on
@@ -263,6 +287,7 @@ async fn api_from_config(
         let api = api.clone();
         let line_broadcast = init_logging.line_broadcast.clone();
         let columns_for_router = columns.clone();
+        let artwork_for_router = artwork.clone();
         let web_view_task = async move {
             let settings_backend: Option<Arc<dyn app_daemon::server::SessionSettingsBackend>> =
                 web_settings
@@ -271,6 +296,7 @@ async fn api_from_config(
                 ApiSlot::new(Arc::new(api)),
                 Some(line_broadcast),
                 columns_for_router,
+                Some(artwork_for_router),
                 settings_backend,
             );
             let listener = tokio::net::TcpListener::bind(listen_addr)
@@ -283,7 +309,11 @@ async fn api_from_config(
         };
         session.spawn(debug_span!("web_view"), "web_view", web_view_task);
     }
-    Ok(SessionApi { api, columns })
+    Ok(SessionApi {
+        api,
+        columns,
+        artwork: Some(artwork),
+    })
 }
 
 impl State {
@@ -311,6 +341,7 @@ impl State {
             config,
             api: Arc::new(session_api.api),
             columns: session_api.columns,
+            artwork: session_api.artwork,
         }));
 
         // The hook dispatcher reads hooks from the shared config at dispatch
@@ -407,6 +438,7 @@ impl State {
                     let mut shared = self.shared.write();
                     shared.config = config;
                     shared.columns = None;
+                    shared.artwork = None;
                     return Err(e.into());
                 }
             };
@@ -420,6 +452,7 @@ impl State {
             existing.config = config;
             existing.api = Arc::new(session_api.api);
             existing.columns = session_api.columns;
+            existing.artwork = session_api.artwork;
         }
         // The old session's folder watcher exits with its cancellation
         // token; start one for the new session (no-op when unconfigured).
@@ -457,6 +490,7 @@ pub(crate) mod tests {
             config,
             api: Arc::new(session_api.api),
             columns: session_api.columns,
+            artwork: session_api.artwork,
         }));
         let hooks = Arc::new(HookDispatcher::new(
             shared.clone(),

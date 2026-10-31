@@ -29,6 +29,7 @@ pub fn router() -> axum::Router<RouterState> {
             get(stream_file),
         )
         .route("/torrents/{id}/playlist", get(torrent_playlist))
+        .route("/torrents/by-hash/{hash}/artwork", get(torrent_artwork))
 }
 
 /// The handler answers both stream routes; the filename segment is
@@ -129,6 +130,32 @@ async fn torrent_playlist(
 
 fn torrent_id(id: u64) -> librqbit::api::TorrentIdOrHash {
     librqbit::api::TorrentIdOrHash::Id(id as usize)
+}
+
+/// Serve the resolved artwork bytes for a torrent, by info-hash. When the
+/// artwork is advertised but not extracted yet (a preview frame), the
+/// handler waits on the provider's worker for a bounded time so the first
+/// UI request usually gets the image inline. 404 until anything is ready.
+async fn torrent_artwork(
+    State(state): State<RouterState>,
+    Path(hash): Path<String>,
+) -> Result<Response, MediaError> {
+    let Some(artwork) = state.4.as_ref() else {
+        return Err(MediaError::Status(
+            StatusCode::NOT_FOUND,
+            "no artwork provider".to_string(),
+        ));
+    };
+    match artwork.request_bytes(&hash).await {
+        Some((bytes, content_type)) => {
+            let header = http::HeaderValue::from_static(content_type);
+            Ok(([(http::header::CONTENT_TYPE, header)], bytes.to_vec()).into_response())
+        }
+        None => Err(MediaError::Status(
+            StatusCode::NOT_FOUND,
+            "no artwork".to_string(),
+        )),
+    }
 }
 
 fn host_header(headers: &HeaderMap) -> Result<String, MediaError> {

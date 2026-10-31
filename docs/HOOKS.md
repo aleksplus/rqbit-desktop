@@ -18,6 +18,7 @@ Source map:
 | Dispatcher + completion watcher | `desktop-gpui/src/hooks/dispatcher.rs` |
 | `torrent_columns` provider (poller, store, response parsing) | `app-daemon/src/columns.rs` (`ColumnsProvider`) |
 | Custom-column wire types + push frame | `rqbit-protocol/src/types.rs` (`CustomColumnsState`), `messages.rs` (`PushUpdate::CustomColumns`) |
+| Per-torrent artwork (poster/preview sources, serving) | `app-daemon/src/artwork.rs` (`ArtworkProvider`), route in `media.rs` |
 | Call sites | `state.rs:241`, `local_client.rs:47,203`, `folder_watcher.rs:203`, `desktop_host.rs:116` |
 
 ---
@@ -409,7 +410,7 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
   ```json
   {
     "columns": [ { "key": "sync_status", "name": "Sync", "files": false,
-                   "kind": "text" | "status", "width": 100 } ],
+                   "kind": "text" | "status" | "image", "width": 100 } ],
     "torrents": { "<info_hash>": { "sync_status": "synced" } },
     "files": { "<info_hash>": [ { "index": 0,
                                   "values": { "sync_status": "synced" } } ] }
@@ -421,6 +422,16 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
   must be JSON scalars and are truncated to 64 chars; value keys not
   matching a declared column are ignored. An empty 2xx body means
   "connected, no columns right now".
+* Image-kind columns: the value must be an `http(s)://` URL (anything else
+  is dropped) and is allowed to run to 512 chars. `text`/`status` cells
+  render as text; an `image` cell renders as a small thumbnail. A
+  torrent-level `image` column keyed **`poster`** additionally becomes the
+  torrent's *artwork* — the daemon downloads the image, serves it from
+  `/torrents/by-hash/{hash}/artwork` and decorates the payloads with
+  `TorrentArtwork`, which the UIs show behind the detail panel's Overview
+  tab (triangle-cropped poster) and in the torrent list row corner. The
+  built-in artwork sources (MyShows poster lookup, media-file preview) only
+  run when no hook provides a poster.
 * Snapshot: the last successful response is cached as a `ColumnsSnapshot`
   (`state` = columns + `connected` + hook name, plus the per-torrent and
   per-file value maps). On a failed poll the data is retained but

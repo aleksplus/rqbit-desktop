@@ -15,6 +15,10 @@ rqbit-protocol = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
+# Artwork decoding + masking (posters/previews). Version must stay compatible
+# with gpui-pre's `image` dependency so `image::Frame` types unify with
+# `RenderImage::new`.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
 gpui-kit = { version = "0.8.1", features = ["test-support"] }

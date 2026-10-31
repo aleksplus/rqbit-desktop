@@ -104,6 +104,7 @@ pub fn torrent_details(resp: &TorrentDetailsResponse, trackers: Vec<String>) -> 
         comment: resp.comment.clone(),
         trackers,
         custom: None,
+        artwork: None,
     }
 }
 

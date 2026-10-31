@@ -306,6 +306,11 @@ pub struct RqbitDesktopConfig {
 
     pub hooks: RqbitDesktopConfigHooks,
 
+    /// Disable the built-in MyShows poster lookup (per-torrent artwork).
+    /// Hook-provided posters and media-file previews stay enabled.
+    #[serde(default)]
+    pub disable_myshows: bool,
+
     /// UI theme: "light" or "dark". Defaults to "light".
     #[serde(default)]
     pub theme: String,
@@ -332,6 +337,7 @@ impl Default for RqbitDesktopConfig {
             web_view: Default::default(),
             ratelimits: Default::default(),
             hooks: Default::default(),
+            disable_myshows: false,
             theme: "light".to_string(),
             #[cfg(feature = "disable-upload")]
             disable_upload: false,

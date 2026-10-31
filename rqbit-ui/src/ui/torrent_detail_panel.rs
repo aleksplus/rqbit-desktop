@@ -18,6 +18,7 @@ use rqbit_protocol::{PeerEntry, PeerStatsSnapshot, TorrentDetails, TorrentId, To
 
 use crate::client::TorrentClient;
 use crate::host::UiHost;
+use crate::ui::artwork::{ArtworkShape, DETAIL_ARTWORK_SIZE, masked_artwork};
 use crate::ui::file_table::{FileRow, FileTableDelegate};
 use crate::ui::utils::{format_bytes, format_speed};
 
@@ -272,19 +273,30 @@ impl TorrentDetailPanel {
                         });
                         this.stats = Some(s);
                     }
-                    if let Ok(d) = details
-                        && let Some(files) = &d.files
-                    {
-                        this.file_table_state.update(cx, |state, cx| {
-                            let delegate = state.delegate_mut();
-                            for row in delegate.rows.iter_mut() {
-                                if let Some(file) = files.get(row.file_index) {
-                                    row.custom = file.custom.clone().unwrap_or_default();
-                                }
-                            }
-                            delegate.apply_sort();
+                    if let Ok(d) = details {
+                        // Hook custom values ride on the details payload, and
+                        // artwork resolves asynchronously after the panel
+                        // opened — refresh both so a late poster/preview
+                        // appears without reopening the panel.
+                        if let Some(existing) = this.details.as_mut()
+                            && (existing.artwork != d.artwork || existing.custom != d.custom)
+                        {
+                            existing.artwork = d.artwork.clone();
+                            existing.custom = d.custom.clone();
                             cx.notify();
-                        });
+                        }
+                        if let Some(files) = &d.files {
+                            this.file_table_state.update(cx, |state, cx| {
+                                let delegate = state.delegate_mut();
+                                for row in delegate.rows.iter_mut() {
+                                    if let Some(file) = files.get(row.file_index) {
+                                        row.custom = file.custom.clone().unwrap_or_default();
+                                    }
+                                }
+                                delegate.apply_sort();
+                                cx.notify();
+                            });
+                        }
                     }
                     this.peer_stats = peer_stats.ok();
                     cx.notify();
@@ -569,10 +581,35 @@ impl TorrentDetailPanel {
             .and_then(|s| s.error.clone())
             .unwrap_or_default();
 
+        // The Overview corner artwork: looked up (and kicked for background
+        // load) before the content so it paints behind the text rows.
+        let artwork_image = self
+            .details
+            .as_ref()
+            .and_then(|d| d.artwork.as_ref())
+            .and_then(|artwork| {
+                masked_artwork(
+                    &self.host,
+                    artwork,
+                    ArtworkShape::Detail,
+                    DETAIL_ARTWORK_SIZE,
+                    DETAIL_ARTWORK_SIZE,
+                    cx,
+                )
+            });
+
         v_flex()
             .gap_4()
             .p_4()
             .overflow_y_scrollbar()
+            .children(artwork_image.map(|image| {
+                img(image)
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .w(px(DETAIL_ARTWORK_SIZE))
+                    .h(px(DETAIL_ARTWORK_SIZE))
+            }))
             .child(
                 div()
                     .text_size(px(20.))

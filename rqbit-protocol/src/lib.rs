@@ -41,5 +41,5 @@ pub use messages::{
 pub use types::{
     ApiAddTorrent, ConnKind, CustomColumnKind, CustomColumnSpec, CustomColumnsState, DhtStats,
     LiveStats, PeerEntry, PeerStats, PeerStatsSnapshot, SessionInfo, SessionSettings, SessionStats,
-    Speed, TorrentDetails, TorrentFile, TorrentList, TorrentState, TorrentStats,
+    Speed, TorrentArtwork, TorrentDetails, TorrentFile, TorrentList, TorrentState, TorrentStats,
 };

@@ -26,19 +26,22 @@ use rqbit_protocol::{
 };
 use tokio::sync::{broadcast, mpsc};
 
+use crate::artwork::ArtworkProvider;
 use crate::columns::ColumnsProvider;
 
 /// How often subscribed state is sampled for pushes.
 const PUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Execute one request against the Api, decorating list/details responses
-/// with hook-provided custom column values when a provider is present.
-/// `settings` (when present) answers the session settings requests.
-/// Public so integration tests can exercise the mapping without a socket.
+/// with hook-provided custom column values and resolved artwork when the
+/// providers are present. `settings` (when present) answers the session
+/// settings requests. Public so integration tests can exercise the mapping
+/// without a socket.
 pub async fn handle_request(
     api: &Api,
     req: Request,
     columns: Option<&ColumnsProvider>,
+    artwork: Option<&ArtworkProvider>,
     settings: Option<&dyn SessionSettingsBackend>,
 ) -> Result<ResponsePayload, proto::ProtoError> {
     use proto::ProtoErrorKind;
@@ -48,6 +51,9 @@ pub async fn handle_request(
                 TorrentList::from(&api.api_torrent_list_ext(ApiTorrentListOpts { with_stats }));
             if let Some(snapshot) = columns.and_then(|c| c.snapshot()) {
                 snapshot.decorate_list(&mut list);
+            }
+            if let Some(artwork) = artwork {
+                artwork.decorate_list(&mut list);
             }
             ResponsePayload::List(Box::new(list))
         }
@@ -67,6 +73,9 @@ pub async fn handle_request(
             let mut details = conv::torrent_details(&resp, trackers);
             if let Some(snapshot) = columns.and_then(|c| c.snapshot()) {
                 snapshot.decorate_details(&mut details);
+            }
+            if let Some(artwork) = artwork {
+                artwork.decorate_details(&mut details);
             }
             ResponsePayload::Details(Box::new(details))
         }
@@ -257,6 +266,7 @@ pub async fn run_connection(
     api: ApiSlot,
     line_broadcast: Option<LineBroadcast>,
     columns: Option<Arc<ColumnsProvider>>,
+    artwork: Option<Arc<ArtworkProvider>>,
     settings: Option<Arc<dyn SessionSettingsBackend>>,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -278,6 +288,7 @@ pub async fn run_connection(
         let state = state.clone();
         let api = api.clone();
         let columns = columns.clone();
+        let artwork = artwork.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(PUSH_INTERVAL);
@@ -296,11 +307,14 @@ pub async fn run_connection(
                 let mut list = TorrentList::from(
                     &api.api_torrent_list_ext(ApiTorrentListOpts { with_stats: true }),
                 );
-                // Attach hook-provided custom column values so the change
-                // diff picks up column updates too.
+                // Attach hook-provided custom column values and resolved
+                // artwork so the change diff picks their updates up too.
                 let columns_snapshot = columns.as_ref().and_then(|c| c.snapshot());
                 if let Some(snapshot) = &columns_snapshot {
                     snapshot.decorate_list(&mut list);
+                }
+                if let Some(artwork) = &artwork {
+                    artwork.decorate_list(&mut list);
                 }
                 if let Ok(bytes) = codec::encode_server(&ServerMessage::Push(
                     PushUpdate::TorrentList(Box::new(list)),
@@ -394,8 +408,14 @@ pub async fn run_connection(
         };
         match msg {
             ClientMessage::Request { id, req } => {
-                let result =
-                    handle_request(&api.get(), req, columns.as_deref(), settings.as_deref()).await;
+                let result = handle_request(
+                    &api.get(),
+                    req,
+                    columns.as_deref(),
+                    artwork.as_deref(),
+                    settings.as_deref(),
+                )
+                .await;
                 let frame = codec::encode_server(&ServerMessage::Response { id, result })
                     .unwrap_or_else(|e| {
                         codec::encode_server(&ServerMessage::Response {
@@ -442,13 +462,16 @@ pub async fn run_connection(
 /// port at `/` — the same port and path the classic React webui occupies
 /// in the upstream `rqbit server`. `columns` (when present) provides
 /// hook-declared custom columns: the sampler pushes their state and
-/// list/details responses are decorated with their values. `settings`
-/// (when present) answers the session settings requests. `api` must be the
-/// same slot a settings backend swaps, so rebuilds reach live connections.
+/// list/details responses are decorated with their values. `artwork` (when
+/// present) decorates list/details with resolved per-torrent artwork and
+/// serves the artwork bytes route. `settings` (when present) answers the
+/// session settings requests. `api` must be the same slot a settings
+/// backend swaps, so rebuilds reach live connections.
 pub fn router(
     api: ApiSlot,
     line_broadcast: Option<LineBroadcast>,
     columns: Option<Arc<ColumnsProvider>>,
+    artwork: Option<Arc<ArtworkProvider>>,
     settings: Option<Arc<dyn SessionSettingsBackend>>,
 ) -> axum::Router {
     use axum::routing::get;
@@ -457,7 +480,7 @@ pub fn router(
         .route("/ws", get(ws_route))
         .merge(crate::media::router())
         .fallback(serve_static)
-        .with_state((api, line_broadcast, columns, settings))
+        .with_state((api, line_broadcast, columns, settings, artwork))
 }
 
 /// Shared router state: the Api slot plus the optional services. Also the
@@ -467,6 +490,7 @@ pub(crate) type RouterState = (
     Option<LineBroadcast>,
     Option<Arc<ColumnsProvider>>,
     Option<Arc<dyn SessionSettingsBackend>>,
+    Option<Arc<ArtworkProvider>>,
 );
 
 /// Serve the embedded web client under `/` (upstream-webui convention):
@@ -505,10 +529,12 @@ async fn serve_static(uri: axum::http::Uri) -> axum::response::Response {
 }
 
 async fn ws_route(
-    axum::extract::State((api, line_broadcast, columns, settings)): axum::extract::State<
+    axum::extract::State((api, line_broadcast, columns, settings, artwork)): axum::extract::State<
         RouterState,
     >,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> axum::response::Response {
-    upgrade.on_upgrade(move |socket| run_connection(socket, api, line_broadcast, columns, settings))
+    upgrade.on_upgrade(move |socket| {
+        run_connection(socket, api, line_broadcast, columns, artwork, settings)
+    })
 }

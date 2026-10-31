@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::Parser;
 
+use app_daemon::artwork::ArtworkProvider;
 use app_daemon::columns::{ColumnsHook, ColumnsMethod, ColumnsProvider};
 use app_daemon::server;
 use app_daemon::{DaemonSettingsBackend, start_session};
@@ -48,6 +49,11 @@ struct Args {
     /// Seconds between polls of each --column-hook service.
     #[arg(long, default_value_t = 10)]
     column_hook_poll_secs: u64,
+
+    /// Disable the built-in MyShows poster lookup (per-torrent artwork).
+    /// The media-file preview source and hook-provided posters stay on.
+    #[arg(long)]
+    disable_myshows: bool,
 }
 
 #[tokio::main]
@@ -97,6 +103,12 @@ async fn main() -> anyhow::Result<()> {
         Some(provider)
     };
 
+    // Per-torrent artwork (hook posters / MyShows / media previews): one
+    // background worker; the artwork HTTP route and payload decoration read
+    // its results.
+    let artwork = ArtworkProvider::new(daemon.api.clone(), columns.clone(), !args.disable_myshows);
+    artwork.start();
+
     // Session settings: Get mirrors the running session's settings, Set
     // rebuilds it in place (connections keep working via the shared slot).
     let settings_backend: std::sync::Arc<dyn server::SessionSettingsBackend> = std::sync::Arc::new(
@@ -107,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         daemon.api.clone(),
         daemon.line_broadcast.clone(),
         columns,
+        Some(artwork),
         Some(settings_backend),
     );
 

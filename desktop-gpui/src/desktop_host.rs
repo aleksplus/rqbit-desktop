@@ -20,11 +20,19 @@ use crate::ui::settings_page::{SettingsPage, SettingsPageEvent};
 
 pub struct DesktopHost {
     state: Arc<State>,
+    /// Handle to the app's tokio runtime. `reqwest` needs a tokio reactor,
+    /// but `UiHost::fetch_bytes` is awaited on GPUI's executor — the actual
+    /// HTTP work is spawned through this handle instead.
+    tokio: tokio::runtime::Handle,
 }
 
 impl DesktopHost {
     pub fn new(state: Arc<State>) -> Self {
-        Self { state }
+        Self {
+            state,
+            tokio: tokio::runtime::Handle::try_current()
+                .expect("DesktopHost must be created inside the tokio runtime"),
+        }
     }
 
     /// The on-disk path of one torrent file, when it is fully downloaded:
@@ -119,6 +127,43 @@ impl UiHost for DesktopHost {
             file_idx,
             filename,
         ))
+    }
+
+    fn artwork_url(&self, path: &str) -> Option<String> {
+        // Absolute URLs (hook Image-column values) are used verbatim; only
+        // daemon-relative artwork paths get a base prepended.
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return Some(path.to_owned());
+        }
+        // Artwork bytes are served by the bundled app-daemon router (the
+        // artwork route in `app-daemon/src/media.rs`), which runs on the
+        // web-view listener — not on librqbit's own HTTP API, where only
+        // the stream/playlist endpoints exist.
+        let web_view = &self.state.config().web_view;
+        if web_view.disable {
+            return None;
+        }
+        Some(format!("{}{path}", http_api_base_url(web_view.listen_addr)))
+    }
+
+    fn fetch_bytes<'a>(
+        &'a self,
+        url: String,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + 'a>> {
+        let tokio = self.tokio.clone();
+        Box::pin(async move {
+            tokio
+                .spawn(async move {
+                    let resp = reqwest::get(&url)
+                        .await
+                        .and_then(|r| r.error_for_status())
+                        .map_err(|e| e.to_string())?;
+                    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+                    Ok(bytes.to_vec())
+                })
+                .await
+                .map_err(|e| format!("artwork fetch task failed: {e}"))?
+        })
     }
 
     fn open_settings(

@@ -11,11 +11,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rqbit_protocol::{
-    CustomColumnKind, CustomColumnSpec, CustomColumnsState, TorrentDetails, TorrentState,
+    CustomColumnKind, CustomColumnSpec, CustomColumnsState, TorrentArtwork, TorrentDetails,
+    TorrentState,
 };
 
 use crate::client::TorrentClient;
 use crate::host::UiHost;
+use crate::ui::artwork::{ArtworkShape, ROW_WEDGE_HEIGHT, ROW_WEDGE_WIDTH, masked_artwork};
 use crate::ui::main_panel::MainPanel;
 use crate::ui::utils::{
     format_bytes, format_eta, format_speed, is_media_file, render_custom_cell,
@@ -92,6 +94,9 @@ pub struct TorrentRow {
     /// Hook-provided custom column values, keyed by column key. Empty when
     /// no hook provides data for this torrent.
     pub custom: BTreeMap<String, String>,
+    /// Resolved artwork (poster/preview), when the daemon decorated the
+    /// list payload. Rendered as a wedge in the row's right corner.
+    pub artwork: Option<TorrentArtwork>,
 }
 
 impl TorrentRow {
@@ -167,6 +172,7 @@ impl TorrentRow {
             depth: 0,
             group_size: 1,
             custom: t.custom.clone().unwrap_or_default(),
+            artwork: t.artwork.clone(),
         }
     }
 
@@ -436,6 +442,34 @@ pub struct TorrentTableDelegate {
 }
 
 impl TorrentTableDelegate {
+    /// One Image-kind custom-column cell: a small rounded thumbnail of the
+    /// hook-provided image URL, or an empty cell for anything unparsable.
+    fn render_image_cell(&self, url: &str, cx: &mut Context<TableState<Self>>) -> Div {
+        const CELL_THUMB: f32 = 28.0;
+        let image = if url.starts_with("http://") || url.starts_with("https://") {
+            let artwork = TorrentArtwork {
+                key: url.to_string(),
+                path: url.to_string(),
+                source: "hook".to_string(),
+            };
+            masked_artwork(
+                &self.host,
+                &artwork,
+                ArtworkShape::Rect,
+                CELL_THUMB,
+                CELL_THUMB,
+                cx,
+            )
+        } else {
+            None
+        };
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .children(image.map(|image| img(image).size(px(CELL_THUMB)).rounded_sm()))
+    }
+
     /// The static columns every torrent list shows, before any
     /// hook-provided dynamic ones.
     fn base_columns() -> Vec<Column> {
@@ -803,8 +837,16 @@ impl TableDelegate for TorrentTableDelegate {
             "up" => div().child(row.up_speed.clone()),
             "uploaded" => div().child(row.uploaded.clone()),
             "eta" => div().child(row.eta.clone()),
-            // Hook-provided dynamic columns: text or a tinted status badge.
+            // Hook-provided dynamic columns: text, a tinted status badge, or
+            // a small thumbnail for Image-kind columns.
             _ => match self.custom_kinds.get(col.key.as_ref()).copied() {
+                Some(CustomColumnKind::Image) => self.render_image_cell(
+                    row.custom
+                        .get(col.key.as_ref())
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    cx,
+                ),
                 Some(kind) => render_custom_cell(
                     row.custom
                         .get(col.key.as_ref())
@@ -907,11 +949,39 @@ impl TableDelegate for TorrentTableDelegate {
         // color so the style closure doesn't need to borrow `cx`.
         let child_guide = cx.theme().border;
         let is_child = self.rows.get(row_ix).is_some_and(|r| r.depth == 1);
+        // Row corner artwork: looked up (and kicked for background load)
+        // before the row div so it paints behind the cells.
+        let artwork_image = self
+            .rows
+            .get(row_ix)
+            .and_then(|r| r.artwork.as_ref())
+            .and_then(|artwork| {
+                masked_artwork(
+                    &self.host,
+                    artwork,
+                    ArtworkShape::Row,
+                    ROW_WEDGE_WIDTH,
+                    ROW_WEDGE_HEIGHT,
+                    cx,
+                )
+            });
         div()
             .id(("torrent-row", row_ix))
+            .relative()
             .when(is_paused, |this| this.text_color(dimmed_text))
             .when(is_child, |this| this.border_l_1().border_color(child_guide))
             .when(is_selected, |this| this.bg(gpui::rgb(0x2a2a3e)))
+            .when_some(artwork_image, |this, image| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .w(px(ROW_WEDGE_WIDTH))
+                        .h(px(ROW_WEDGE_HEIGHT))
+                        .child(img(image).size_full()),
+                )
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |state, e: &MouseDownEvent, _, cx| {
@@ -1207,6 +1277,7 @@ mod tests {
             depth: 0,
             group_size: 1,
             custom: Default::default(),
+            artwork: None,
         }
     }
 

@@ -38,22 +38,28 @@ async fn handle_request_maps_api_surface() {
     let api = quiet_api().await;
 
     // Session stats: an empty session still reports speeds/uptime.
-    let resp = server::handle_request(&api, proto::Request::SessionStats, None, None)
+    let resp = server::handle_request(&api, proto::Request::SessionStats, None, None, None)
         .await
         .unwrap();
     assert!(matches!(resp, proto::ResponsePayload::SessionStats(_)));
 
     // List: empty session → empty list.
-    let resp = server::handle_request(&api, proto::Request::List { with_stats: true }, None, None)
-        .await
-        .unwrap();
+    let resp = server::handle_request(
+        &api,
+        proto::Request::List { with_stats: true },
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     match resp {
         proto::ResponsePayload::List(list) => assert!(list.torrents.is_empty()),
         other => panic!("unexpected payload: {other:?}"),
     }
 
     // DHT is disabled in this session → DhtDisabled error kind.
-    let err = server::handle_request(&api, proto::Request::DhtStats, None, None)
+    let err = server::handle_request(&api, proto::Request::DhtStats, None, None, None)
         .await
         .unwrap_err();
     assert_eq!(err.kind, proto::ProtoErrorKind::DhtDisabled);
@@ -65,6 +71,7 @@ async fn handle_request_maps_api_surface() {
         proto::Request::Details {
             torrent: bogus.clone(),
         },
+        None,
         None,
         None,
     )
@@ -81,6 +88,7 @@ async fn handle_request_maps_api_surface() {
         },
         None,
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -92,6 +100,7 @@ async fn handle_request_maps_api_surface() {
         proto::Request::Stats {
             torrent: proto::TorrentId::Hash("nope".into()),
         },
+        None,
         None,
         None,
     )
@@ -109,7 +118,13 @@ async fn spawn_server_addr() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
     let api = quiet_api().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = app_daemon::server::router(app_daemon::server::ApiSlot::new(api), None, None, None);
+    let app = app_daemon::server::router(
+        app_daemon::server::ApiSlot::new(api),
+        None,
+        None,
+        None,
+        None,
+    );
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (addr, handle)
 }
@@ -276,7 +291,7 @@ async fn session_settings_flow_through_backend() {
     let api = quiet_api().await;
 
     // No backend configured → BadRequest.
-    let err = server::handle_request(&api, proto::Request::GetSessionSettings, None, None)
+    let err = server::handle_request(&api, proto::Request::GetSessionSettings, None, None, None)
         .await
         .unwrap_err();
     assert_eq!(err.kind, proto::ProtoErrorKind::BadRequest);
@@ -284,6 +299,7 @@ async fn session_settings_flow_through_backend() {
     let err = server::handle_request(
         &api,
         proto::Request::SetSessionSettings(Box::default()),
+        None,
         None,
         None,
     )
@@ -312,6 +328,7 @@ async fn session_settings_flow_through_backend() {
         &api,
         proto::Request::GetSessionSettings,
         None,
+        None,
         Some(&backend),
     )
     .await
@@ -324,6 +341,7 @@ async fn session_settings_flow_through_backend() {
     let resp = server::handle_request(
         &api,
         proto::Request::SetSessionSettings(Box::default()),
+        None,
         None,
         Some(&backend),
     )

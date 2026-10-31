@@ -85,7 +85,7 @@ async fn media_routes_serve_stream_ranges_and_playlist() {
     let (api, file_bytes) = seeded_movie().await;
     let file_len = file_bytes.len() as u64;
 
-    let app = router(ApiSlot::new(api), None, None, None);
+    let app = router(ApiSlot::new(api), None, None, None, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
