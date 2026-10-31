@@ -1019,9 +1019,10 @@ impl TableDelegate for TorrentTableDelegate {
         // right-clicked torrent. Placed before Open Folder, whose closure
         // consumes the `client`/`host` handles.
         if host.playlist_url(torrent_id).is_some() {
-            // Play streams the torrent's first media file in name order (the
+            // Play targets the torrent's first media file in name order (the
             // same order the playlist endpoint uses); the file list is
-            // resolved lazily like Open Folder's output folder.
+            // resolved lazily like Open Folder's output folder. The host
+            // decides local-file vs stream playback.
             m = m
                 .item(
                     PopupMenuItem::new(format!("Play: {torrent_name}")).on_click({
@@ -1051,7 +1052,7 @@ impl TableDelegate for TorrentTableDelegate {
                                 else {
                                     return;
                                 };
-                                cx.update(|_| host.open_media(&url));
+                                cx.update(|_| host.play_media_file(torrent_id, file_idx, &url));
                             })
                             .detach();
                         }

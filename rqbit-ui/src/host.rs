@@ -79,6 +79,16 @@ pub trait UiHost: 'static {
     /// the raw [`UiHost::stream_url`].
     fn open_media(&self, _url: &str) {}
 
+    /// Play one torrent file (a Play action in the torrent list or the
+    /// files list). Receives the file's [`UiHost::stream_url`] as the
+    /// fallback. The default delegates to [`UiHost::open_media`]; hosts
+    /// with filesystem access may open the local file with the OS default
+    /// player instead, using the stream only when the file isn't fully on
+    /// disk yet.
+    fn play_media_file(&self, _torrent_id: u64, _file_idx: usize, stream_url: &str) {
+        self.open_media(stream_url);
+    }
+
     /// Persist the theme choice ("dark"/"light").
     fn persist_theme(&self, _mode: &str) {}
 

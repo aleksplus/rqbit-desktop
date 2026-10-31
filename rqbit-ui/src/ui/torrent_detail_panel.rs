@@ -396,10 +396,11 @@ impl TorrentDetailPanel {
         );
     }
 
-    /// Open one file's HTTP stream URL with the host's media handler
-    /// (desktop: the OS opener — browser tab or media player; browser: a
-    /// new tab with an HTML player, so autoplay isn't muted). Works while
-    /// the file is still downloading.
+    /// Play one file: hosts with filesystem access open the local file with
+    /// the OS default player once it's fully downloaded, falling back to
+    /// the HTTP stream (desktop: OS opener; browser: a new tab with an
+    /// HTML player, so autoplay isn't muted). Streaming works while the
+    /// file is still downloading.
     fn play_file(
         &mut self,
         file_index: usize,
@@ -413,7 +414,8 @@ impl TorrentDetailPanel {
         else {
             return;
         };
-        self.host.open_media(&url);
+        self.host
+            .play_media_file(self.torrent_id as u64, file_index, &url);
     }
 
     /// Copy one file's HTTP stream URL to the clipboard (paste into an

@@ -5,6 +5,7 @@
 //! embedded HTTP API.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{AnyView, App, AppContext as _, Context, Window};
@@ -24,6 +25,29 @@ pub struct DesktopHost {
 impl DesktopHost {
     pub fn new(state: Arc<State>) -> Self {
         Self { state }
+    }
+
+    /// The on-disk path of one torrent file, when it is fully downloaded:
+    /// `details.output_folder` already includes the extraction subfolder
+    /// and the file's components are relative to it (the same rule the
+    /// filesystem storage writes by). `None` when the torrent is unknown,
+    /// its metadata isn't resolved, or the file has bytes missing.
+    fn local_media_file(&self, torrent_id: u64, file_idx: usize) -> Option<PathBuf> {
+        let api = self.state.api();
+        let id = librqbit::api::TorrentIdOrHash::Id(torrent_id as usize);
+        let details = api.api_torrent_details(id).ok()?;
+        let file = details.files.as_ref()?.get(file_idx)?;
+        let downloaded = api
+            .api_stats_v1(id)
+            .ok()?
+            .file_progress
+            .get(file_idx)
+            .copied()
+            .unwrap_or(0);
+        if file.length == 0 || downloaded < file.length {
+            return None;
+        }
+        torrent_file_disk_path(&details.output_folder, &file.components)
     }
 }
 
@@ -56,6 +80,20 @@ impl UiHost for DesktopHost {
         // No in-app player: hand the stream URL to the OS default handler
         // (browser tab, VLC, …) which manages its own audio.
         self.open_url(url)
+    }
+
+    fn play_media_file(&self, torrent_id: u64, file_idx: usize, stream_url: &str) {
+        // Prefer the file on disk with the OS default player; the stream
+        // URL is only for files not fully downloaded yet (Range streaming).
+        if let Some(path) = self.local_media_file(torrent_id, file_idx) {
+            // Detached: launching a player must not block the UI thread.
+            if let Err(e) = open::that_detached(&path) {
+                tracing::warn!(path = %path.display(), error = %e, "error opening media file");
+            } else {
+                return;
+            }
+        }
+        self.open_media(stream_url);
     }
 
     fn persist_theme(&self, mode: &str) {
@@ -192,9 +230,24 @@ fn stream_http_url(
     )
 }
 
+/// Join a torrent's output folder and a file's relative components into an
+/// on-disk path. `None` when the folder is empty (host didn't report one).
+fn torrent_file_disk_path(output_folder: &str, components: &[String]) -> Option<PathBuf> {
+    if output_folder.is_empty() {
+        return None;
+    }
+    let mut path = PathBuf::from(output_folder);
+    for component in components {
+        path.push(component);
+    }
+    Some(path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{http_api_base_url, playlist_http_url, stream_http_url};
+    use std::path::PathBuf;
+
+    use super::{http_api_base_url, playlist_http_url, stream_http_url, torrent_file_disk_path};
 
     fn addr(s: &str) -> std::net::SocketAddr {
         s.parse().unwrap()
@@ -242,5 +295,25 @@ mod tests {
             stream_http_url(addr("0.0.0.0:3030"), 7, 2, "some dir/movie (2024).mkv"),
             "http://127.0.0.1:3030/torrents/7/stream/2/some%20dir%2Fmovie%20%282024%29.mkv"
         );
+    }
+
+    #[test]
+    fn file_disk_path_joins_folder_and_components() {
+        // Multi-file torrent: the output folder already contains the
+        // extraction subfolder, components carry the inner directories.
+        assert_eq!(
+            torrent_file_disk_path(
+                "/downloads/My Torrent",
+                &["season 1".to_string(), "e01.mkv".to_string()]
+            ),
+            Some(PathBuf::from("/downloads/My Torrent/season 1/e01.mkv"))
+        );
+        // Single-file torrent: the file sits loose in the output folder.
+        assert_eq!(
+            torrent_file_disk_path("/downloads", &["movie.mkv".to_string()]),
+            Some(PathBuf::from("/downloads/movie.mkv"))
+        );
+        // No output folder reported (remote-style details): unusable.
+        assert_eq!(torrent_file_disk_path("", &["movie.mkv".to_string()]), None);
     }
 }
