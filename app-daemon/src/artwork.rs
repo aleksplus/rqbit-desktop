@@ -1,7 +1,8 @@
 //! Per-torrent artwork: the poster shown behind the detail panel's Overview
 //! tab and in the torrent list rows' corner.
 //!
-//! Resolution per torrent, in priority order:
+//! Sources per torrent, in priority order (the chain stops at the first
+//! source that produces an image):
 //! 1. Hook poster — an Image-kind custom column keyed `poster` whose value
 //!    is an image URL (see `columns.rs`).
 //! 2. MyShows poster — the torrent's release name is cleaned into a show
@@ -10,6 +11,12 @@
 //! 3. Media preview — the largest completed video file's frame, extracted
 //!    with the system `ffmpeg` (an absent ffmpeg just disables this source).
 //!
+//! Every image a torrent ever resolved is kept as a *candidate* (at most
+//! one per source, ordered by priority): when a higher-priority source
+//! appears later (the columns snapshot — and its poster — can arrive after
+//! the chain settled on a fallback), it is added alongside the old one, so
+//! the UI can fall back to it when the primary's bytes fail to load.
+//!
 //! Resolution runs in one background worker ([`ArtworkProvider::run`]);
 //! decoration (`decorate_list`/`decorate_details`) only kicks the worker and
 //! attaches what is already ready, so the frequent UI polls never block.
@@ -17,6 +24,12 @@
 //! Preview frames are extracted lazily — advertised as soon as the daemon
 //! knows a completed video file exists, but only decoded when the route is
 //! first asked for the torrent.
+//!
+//! Bytes are additionally persisted in a **disk cache**
+//! ([`ArtworkOptions::disk_cache`], one `{source}#{ident}.bin` file per
+//! candidate under the torrent's info-hash directory): memory evictions and
+//! restarts re-load them from disk instead of re-downloading or
+//! re-extracting. The disk cache is capped and LRU-evicted by file mtime.
 //!
 //! The UI cache key ([`ArtData::key`]) changes whenever the image behind a
 //! torrent changes (new source, re-extraction, eviction), so clients refetch
@@ -49,6 +62,9 @@ const MAX_CACHED_BYTES: usize = 64 * 1024 * 1024;
 /// Cap on torrents whose artwork bytes are kept in memory.
 const MAX_CACHED_ENTRIES: usize = 128;
 
+/// Cap on the persisted disk cache (LRU-evicted by file mtime beyond this).
+const MAX_DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// No completed media file (yet) — recheck soon, a download may finish.
 const COOLDOWN_RETRYABLE: Duration = Duration::from_secs(60);
 /// MyShows found nothing for this title / HTTP or ffmpeg failed.
@@ -73,7 +89,25 @@ const PREVIEW_SEEK_SECS: u64 = 60;
 /// How long the artwork route waits for a lazy preview extraction.
 const EXTRACT_WAIT: Duration = Duration::from_secs(12);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which artwork sources run. The hook poster is authoritative by
+/// construction (it is the user's own hook service answering); the MyShows
+/// search and the ffmpeg preview are best-effort built-ins that can each be
+/// turned off.
+#[derive(Clone, Debug, Default)]
+pub struct ArtworkOptions {
+    /// Hook-provided posters (an Image column keyed `poster`).
+    pub posters: bool,
+    /// The built-in MyShows poster search (a subset of `posters`; off when
+    /// `posters` is off).
+    pub myshows: bool,
+    /// Media-file preview frames (ffmpeg).
+    pub previews: bool,
+    /// Directory of the persistent artwork cache. `None` keeps artwork in
+    /// memory only (re-downloaded / re-extracted after a restart).
+    pub disk_cache: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Source {
     Hook,
     MyShows,
@@ -90,14 +124,15 @@ impl Source {
     }
 }
 
-/// Why the last resolution attempt produced nothing.
+/// Why the last resolution attempt for a source produced nothing.
 #[derive(Debug, Clone, Copy)]
 enum Failure {
     NoCompletedMedia,
     /// A hook-poster URL was advertised but its download failed — retried
-    /// often (the hook may recover), and it gates the hook-poster upgrade
-    /// so a broken URL doesn't re-resolve on every payload decoration.
+    /// often (the hook may recover).
     HookUrl,
+    /// The MyShows search answered but carried nothing usable.
+    NotFound,
     Error,
     NoFfmpeg,
 }
@@ -106,13 +141,13 @@ impl Failure {
     fn cooldown(self) -> Duration {
         match self {
             Failure::NoCompletedMedia | Failure::HookUrl => COOLDOWN_RETRYABLE,
-            Failure::Error => COOLDOWN_ERROR,
+            Failure::NotFound | Failure::Error => COOLDOWN_ERROR,
             Failure::NoFfmpeg => COOLDOWN_NO_FFMPEG,
         }
     }
 }
 
-/// Ready (or advertised) artwork for one torrent.
+/// Ready (or advertised) artwork for one torrent from one source.
 #[derive(Clone)]
 struct ArtData {
     source: Source,
@@ -124,7 +159,8 @@ struct ArtData {
     rev: u32,
     content_type: &'static str,
     /// `None` while a preview frame is advertised but not extracted yet, or
-    /// after an eviction (the next resolve re-derives the bytes).
+    /// after an eviction (the next resolve re-derives the bytes — from the
+    /// disk cache when one is configured).
     bytes: Option<Arc<[u8]>>,
     last_used: Instant,
 }
@@ -137,10 +173,32 @@ impl ArtData {
 
 #[derive(Default)]
 struct Entry {
-    art: Option<ArtData>,
-    /// Last failure and when the worker may retry. Ignored while `art` is
-    /// `Some` (an existing image is never dropped by later failures).
-    failed: Option<(Failure, Instant)>,
+    /// Every resolved candidate, best source first. At most one per source.
+    candidates: Vec<ArtData>,
+    /// Per-source last failure and when the worker may retry. A source with
+    /// a live candidate is never retried regardless of cooldowns.
+    failed: HashMap<Source, (Failure, Instant)>,
+}
+
+impl Entry {
+    fn candidate(&self, source: Source) -> Option<&ArtData> {
+        self.candidates.iter().find(|c| c.source == source)
+    }
+
+    /// The source still owes bytes: no candidate yet, or a candidate whose
+    /// bytes were never filled (an advertised preview) or were evicted.
+    fn pending(&self, source: Source) -> bool {
+        match self.candidate(source) {
+            None => true,
+            Some(c) => c.bytes.is_none(),
+        }
+    }
+
+    fn cooling(&self, source: Source) -> bool {
+        self.failed
+            .get(&source)
+            .is_some_and(|(_, until)| Instant::now() < *until)
+    }
 }
 
 #[derive(Default)]
@@ -180,7 +238,7 @@ impl Inner {
 pub struct ArtworkProvider {
     api: ApiSlot,
     columns: Option<Arc<ColumnsProvider>>,
-    myshows_enabled: bool,
+    opts: ArtworkOptions,
     client: reqwest::Client,
     inner: Mutex<Inner>,
     wake: tokio::sync::Notify,
@@ -190,20 +248,19 @@ impl ArtworkProvider {
     pub fn new(
         api: ApiSlot,
         columns: Option<Arc<ColumnsProvider>>,
-        myshows_enabled: bool,
+        opts: ArtworkOptions,
     ) -> Arc<Self> {
         Arc::new(Self {
             api,
             columns,
-            myshows_enabled,
+            opts,
             client: reqwest::Client::new(),
             inner: Mutex::new(Inner::default()),
             wake: tokio::sync::Notify::new(),
         })
     }
 
-    /// Spawn the worker. A no-op when there is nothing to do? Never — the
-    /// provider always serves previews, so callers start it unconditionally.
+    /// Spawn the worker. With every source disabled the worker just idles.
     pub fn start(self: &Arc<Self>) {
         tokio::spawn(self.clone().run());
     }
@@ -262,82 +319,84 @@ impl ArtworkProvider {
             return;
         }
         self.kick(&hash);
-        // Upgrade: a hook poster beats whatever an earlier resolve picked —
-        // the columns snapshot (and its poster) can arrive after the
-        // background chain already settled on a fallback, and without this
-        // the fallback would stick forever. The re-resolve re-runs the chain
-        // with the hook first; the old artwork stays until the new one is
-        // ready.
-        if self.hook_poster(&hash).is_some() && self.art_source(&hash) != Some(Source::Hook) {
-            self.kick_upgrade(&hash);
-        }
-        let artwork = self.ready_artwork(&hash);
-        details.artwork = artwork;
+        let candidates = self.ready_artwork_all(&hash);
+        details.artwork = candidates.first().cloned();
+        details.artwork_candidates = candidates;
     }
 
-    /// Queue the torrent for resolution unless something is already served
-    /// or the last failure is still cooling down.
+    /// Queue the torrent for resolution while the chain still has work: a
+    /// source with no bytes yet (nothing resolved, an advertised preview, or
+    /// evicted bytes) that isn't cooling down — or, when a lower-priority
+    /// candidate already exists, a hook poster that just appeared (the
+    /// upgrade; the old artwork stays as a fallback until the new one is
+    /// ready).
     fn kick(&self, hash: &str) {
-        let mut queue = false;
+        let mut queued = false;
         {
             let mut inner = self.inner.lock();
             let entry = inner.entries.entry(hash.to_owned()).or_default();
-            let ready = entry.art.is_some();
-            let cooling = entry
-                .failed
-                .is_some_and(|(_, until)| Instant::now() < until);
-            if !ready && !cooling && inner.queued.insert(hash.to_owned()) {
-                inner.background.push_back(hash.to_owned());
-                queue = true;
+            let pending = |source| entry.pending(source);
+            let cooling = |source| entry.cooling(source);
+            let hook_available = self.opts.posters && self.hook_poster(hash).is_some();
+            let chain_work = (self.opts.posters && pending(Source::Hook) && hook_available)
+                || (self.myshows_active() && pending(Source::MyShows))
+                || (self.opts.previews && pending(Source::Preview));
+
+            // Upgrade: a hook poster exists but the best candidate came from
+            // a lower-priority source — the columns snapshot (and its
+            // poster) can arrive after the background chain already settled
+            // on a fallback, and without this the fallback would stick
+            // forever. Runs on the interactive lane; a cooling hook URL
+            // retries at its failure's cadence instead.
+            let upgrade = match entry.candidates.first() {
+                Some(best) => {
+                    best.source != Source::Hook
+                        && hook_available
+                        && pending(Source::Hook)
+                        && !cooling(Source::Hook)
+                }
+                None => false,
+            };
+
+            // Otherwise: only an untouched chain (no candidates yet) is
+            // worth a background pass. A chain that already produced a
+            // candidate must not re-run for the lower-priority sources it
+            // skipped — the chain stops at the first success, so the pass
+            // would just repeat the same failures. Candidates whose bytes
+            // were evicted (or never filled) are refilled by the
+            // interactive resolve the artwork route triggers.
+            let background = entry.candidates.is_empty() && chain_work;
+            let should = upgrade || background;
+            if should && inner.queued.insert(hash.to_owned()) {
+                if upgrade {
+                    inner.interactive.push_back(hash.to_owned());
+                } else {
+                    inner.background.push_back(hash.to_owned());
+                }
+                queued = true;
             }
         }
-        if queue {
+        if queued {
             self.wake.notify_one();
         }
     }
 
-    /// Re-resolve a torrent that already has artwork because a
-    /// higher-priority source (the hook poster) appeared. Ignores ready
-    /// state — the hook URL is new information — but honors failure
-    /// cooldowns, so a broken hook URL retries at the failure's cadence.
-    fn kick_upgrade(&self, hash: &str) {
-        let mut queue = false;
-        {
-            let mut inner = self.inner.lock();
-            if let Some(entry) = inner.entries.get(hash)
-                && let Some((_, until)) = entry.failed
-                && Instant::now() < until
-            {
-                return;
-            }
-            if inner.queued.insert(hash.to_owned()) {
-                inner.interactive.push_back(hash.to_owned());
-                queue = true;
-            }
-        }
-        if queue {
-            self.wake.notify_one();
-        }
-    }
-
-    fn art_source(&self, hash: &str) -> Option<Source> {
-        self.inner
-            .lock()
-            .entries
-            .get(hash)?
-            .art
-            .as_ref()
-            .map(|a| a.source)
-    }
-
-    fn ready_artwork(&self, hash: &str) -> Option<TorrentArtwork> {
+    fn ready_artwork_all(&self, hash: &str) -> Vec<TorrentArtwork> {
         let inner = self.inner.lock();
-        let art = inner.entries.get(hash)?.art.as_ref()?;
-        Some(TorrentArtwork {
-            key: art.key(),
-            path: format!("{ARTWORK_PATH_PREFIX}/{hash}/artwork"),
-            source: art.source.as_str().to_owned(),
-        })
+        inner
+            .entries
+            .get(hash)
+            .map(|e| {
+                e.candidates
+                    .iter()
+                    .map(|art| TorrentArtwork {
+                        key: art.key(),
+                        path: format!("{ARTWORK_PATH_PREFIX}/{hash}/artwork"),
+                        source: art.source.as_str().to_owned(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // --- serving (called from the artwork HTTP route) ---
@@ -374,19 +433,28 @@ impl ArtworkProvider {
         }
     }
 
+    /// Bytes of the first candidate that has any — the route serves one
+    /// image per torrent; while the primary's bytes are being re-derived
+    /// (advertised preview, eviction), a lower candidate's bytes are better
+    /// than a 404.
     fn ready_bytes(&self, hash: &str) -> Option<(Arc<[u8]>, &'static str)> {
         let mut inner = self.inner.lock();
-        let art = inner.entries.get_mut(hash)?.art.as_mut()?;
-        art.last_used = Instant::now();
-        let bytes = art.bytes.clone()?;
-        Some((bytes, art.content_type))
+        let entry = inner.entries.get_mut(hash)?;
+        let candidate = entry.candidates.iter_mut().find(|c| c.bytes.is_some())?;
+        candidate.last_used = Instant::now();
+        let bytes = candidate.bytes.clone()?;
+        Some((bytes, candidate.content_type))
     }
 
     // --- resolution (worker only) ---
 
+    /// The chain: hook poster, then MyShows, then the media preview. Stops
+    /// at the first source that produces an image; sources that already have
+    /// one (or are cooling down) are skipped, so a later pass only ever adds
+    /// a candidate (the hook-poster upgrade) or refills evicted bytes.
     async fn resolve(&self, hash: &str, _interactive: bool) {
         let Some(torrent) = self.load_torrent(hash) else {
-            self.fail(hash, Failure::Error);
+            tracing::debug!(hash, "torrent gone before artwork resolution");
             return;
         };
         let name = torrent.name.clone().unwrap_or_default();
@@ -395,18 +463,23 @@ impl ArtworkProvider {
         // `poster` — e.g. moviesync-daemon publishes its resolve table's
         // poster there): authoritative by construction, so a hit ends the
         // chain here.
-        if let Some(url) = self.hook_poster(hash) {
+        if self.opts.posters
+            && self.entry_pending(hash, Source::Hook)
+            && let Some(url) = self.hook_poster(hash)
+        {
+            let ident = short_hash(&url);
+            if let Some((bytes, content_type)) = self.disk_load(hash, Source::Hook, &ident).await {
+                self.ready(hash, Source::Hook, ident, bytes, content_type, false);
+                return;
+            }
             match fetch_image_with(&self.client, &url).await {
                 Ok((bytes, content_type)) => {
-                    self.ready(hash, Source::Hook, short_hash(&url), bytes, content_type);
+                    self.ready(hash, Source::Hook, ident, bytes.into(), content_type, true);
                     return;
                 }
                 Err(e) => {
                     tracing::info!(hash, url = %url, error = %e, "hook poster fetch failed");
-                    // Gate the hook-poster upgrade: without this the
-                    // decorate path would re-resolve (and re-fail) on every
-                    // payload while the URL is broken.
-                    self.fail(hash, Failure::HookUrl);
+                    self.fail(hash, Source::Hook, Failure::HookUrl);
                 }
             }
         }
@@ -417,54 +490,92 @@ impl ArtworkProvider {
         // fuzzy ranking returns unrelated shows for hard names
         // ("…First Marriage" → "Marriage Toxin"), and a wrong poster is
         // worse than none — the hook's resolve table is the recall path.
-        if self.myshows_enabled && !name.is_empty() {
+        if self.myshows_active() && self.entry_pending(hash, Source::MyShows) && !name.is_empty() {
             match self.myshows_poster(&name).await {
-                Ok(Some((show_id, url))) => match fetch_image_with(&self.client, &url).await {
-                    Ok((bytes, content_type)) => {
-                        self.ready(hash, Source::MyShows, show_id, bytes, content_type);
+                Ok(Some((show_id, url))) => {
+                    if let Some((bytes, content_type)) =
+                        self.disk_load(hash, Source::MyShows, &show_id).await
+                    {
+                        self.ready(hash, Source::MyShows, show_id, bytes, content_type, false);
                         return;
                     }
-                    Err(e) => {
-                        tracing::info!(hash, url = %url, error = %e, "myshows poster fetch failed");
+                    match fetch_image_with(&self.client, &url).await {
+                        Ok((bytes, content_type)) => {
+                            self.ready(
+                                hash,
+                                Source::MyShows,
+                                show_id,
+                                bytes.into(),
+                                content_type,
+                                true,
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::info!(hash, url = %url, error = %e, "myshows poster fetch failed");
+                            self.fail(hash, Source::MyShows, Failure::Error);
+                        }
                     }
-                },
-                Ok(None) => {}
+                }
+                Ok(None) => {
+                    self.fail(hash, Source::MyShows, Failure::NotFound);
+                }
                 Err(e) => {
                     // Visible on the log pages: this is the main reason a
                     // downloading torrent has no poster yet.
                     tracing::info!(hash, error = %e, "myshows search failed");
+                    self.fail(hash, Source::MyShows, Failure::Error);
                 }
             }
         }
 
-        self.preview_fallback(hash, &torrent).await;
-    }
-
-    /// The preview stage at the end of the chain.
-    async fn preview_fallback(&self, hash: &str, torrent: &TorrentDetails) {
-        match self.preview_candidate(torrent) {
-            Ok(Some((file_idx, path))) => {
-                self.advertise_preview(hash, file_idx);
-                match extract_frame(&path).await {
-                    Ok((bytes, content_type)) => {
-                        self.fill_preview_bytes(hash, file_idx, bytes, content_type)
+        // The preview stage at the end of the chain.
+        if self.opts.previews && self.entry_pending(hash, Source::Preview) {
+            match self.preview_candidate(&torrent) {
+                Ok(Some((file_idx, path))) => {
+                    let ident = format!("f{file_idx}");
+                    // A frame extracted by a previous run (or an earlier
+                    // eviction) is served from the disk cache — no ffmpeg.
+                    if let Some((bytes, content_type)) =
+                        self.disk_load(hash, Source::Preview, &ident).await
+                    {
+                        self.ready(hash, Source::Preview, ident, bytes, content_type, false);
+                        return;
                     }
-                    Err(e) => {
-                        tracing::debug!(hash, error = %e, "preview extraction failed");
-                        if e == "ffmpeg not found" {
-                            self.fail(hash, Failure::NoFfmpeg);
-                        } else {
-                            self.fail(hash, Failure::Error);
+                    self.advertise_preview(hash, file_idx);
+                    match extract_frame(&path).await {
+                        Ok((bytes, content_type)) => {
+                            self.fill_preview_bytes(hash, file_idx, bytes, content_type)
+                        }
+                        Err(e) => {
+                            tracing::debug!(hash, error = %e, "preview extraction failed");
+                            // The advertised-but-empty candidate must not
+                            // stick around advertising bytes that never come.
+                            self.drop_candidate(hash, Source::Preview);
+                            if e == "ffmpeg not found" {
+                                self.fail(hash, Source::Preview, Failure::NoFfmpeg);
+                            } else {
+                                self.fail(hash, Source::Preview, Failure::Error);
+                            }
                         }
                     }
                 }
-            }
-            Ok(None) => self.fail(hash, Failure::NoCompletedMedia),
-            Err(e) => {
-                tracing::debug!(hash, error = %e, "no preview candidate");
-                self.fail(hash, Failure::Error);
+                Ok(None) => self.fail(hash, Source::Preview, Failure::NoCompletedMedia),
+                Err(e) => {
+                    tracing::debug!(hash, error = %e, "no preview candidate");
+                    self.fail(hash, Source::Preview, Failure::Error);
+                }
             }
         }
+    }
+
+    /// Whether the given source still owes bytes and isn't cooling down.
+    fn entry_pending(&self, hash: &str, source: Source) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .entries
+            .get(hash)
+            .is_none_or(|e| e.pending(source) && !e.cooling(source))
     }
 
     /// Read the torrent (details + stats) from the live session, by hash.
@@ -483,10 +594,19 @@ impl ArtworkProvider {
         Some(details)
     }
 
+    /// The built-in MyShows search is a poster source: it runs only while
+    /// posters as a whole are enabled.
+    fn myshows_active(&self) -> bool {
+        self.opts.posters && self.opts.myshows
+    }
+
     /// The hook's poster URL for this torrent: an Image-kind column keyed
     /// `poster` with an `http(s)://` value (already validated in
     /// `columns.rs`'s sanitization).
     fn hook_poster(&self, hash: &str) -> Option<String> {
+        if !self.opts.posters {
+            return None;
+        }
         let snapshot = self.columns.as_ref()?.snapshot()?;
         let declared = snapshot
             .state
@@ -616,58 +736,84 @@ impl ArtworkProvider {
 
     // --- state transitions ---
 
+    /// Record a resolved candidate: replaces any other candidate from the
+    /// same source (a changed hook URL or a different MyShows match), keeps
+    /// the rest as fallbacks, ordered hook → MyShows → preview.
     fn ready(
         &self,
         hash: &str,
         source: Source,
         ident: String,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
         content_type: &'static str,
+        persist: bool,
     ) {
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(hash.to_owned()).or_default();
-        let rev = match entry.art.as_ref() {
-            Some(prev) if prev.source == source && prev.ident == ident => prev.rev + 1,
+        let rev = match entry.candidate(source) {
+            Some(prev) if prev.ident == ident => prev.rev + 1,
             _ => 0,
         };
-        entry.failed = None;
-        entry.art = Some(ArtData {
+        entry.candidates.retain(|c| c.source != source);
+        let art = ArtData {
             source,
-            ident,
+            ident: ident.clone(),
             rev,
             content_type,
-            bytes: Some(bytes.clone().into()),
+            bytes: Some(bytes.clone()),
             last_used: Instant::now(),
-        });
+        };
+        let ix = entry
+            .candidates
+            .partition_point(|c| priority(c.source) <= priority(source));
+        entry.candidates.insert(ix, art);
+        entry.failed.remove(&source);
         inner.bytes_total += bytes.len();
+        let disk = self.opts.disk_cache.clone();
+        let hash = hash.to_owned();
         drop(inner);
         tracing::info!(hash, source = source.as_str(), "torrent artwork ready");
+        if persist && let Some(dir) = disk {
+            tokio::task::spawn_blocking(move || {
+                disk_store(&dir, &hash, source, &ident, bytes);
+            });
+        }
         self.evict();
     }
 
     /// Advertise the preview source (bytes not yet extracted) so the UIs
     /// learn artwork is coming; the route request triggers the extraction.
-    /// Never downgrades artwork whose bytes are still cached.
+    /// Never downgrades a preview candidate whose bytes are already cached.
     fn advertise_preview(&self, hash: &str, file_idx: usize) {
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(hash.to_owned()).or_default();
-        if entry.art.as_ref().is_some_and(|a| a.bytes.is_some()) {
-            return;
+        if let Some(prev) = entry.candidate(Source::Preview) {
+            if prev.bytes.is_some() {
+                return;
+            }
+            // Already advertised for the same file — nothing to add.
+            if prev.ident == format!("f{file_idx}") {
+                return;
+            }
         }
         let ident = format!("f{file_idx}");
-        let rev = match entry.art.as_ref() {
-            Some(prev) if prev.source == Source::Preview && prev.ident == ident => prev.rev,
+        let rev = match entry.candidate(Source::Preview) {
+            Some(prev) if prev.ident == ident => prev.rev,
             _ => 0,
         };
-        entry.failed = None;
-        entry.art = Some(ArtData {
+        entry.candidates.retain(|c| c.source != Source::Preview);
+        let art = ArtData {
             source: Source::Preview,
             ident,
             rev,
             content_type: "image/png",
             bytes: None,
             last_used: Instant::now(),
-        });
+        };
+        let ix = entry
+            .candidates
+            .partition_point(|c| priority(c.source) <= priority(Source::Preview));
+        entry.candidates.insert(ix, art);
     }
 
     fn fill_preview_bytes(
@@ -677,94 +823,242 @@ impl ArtworkProvider {
         bytes: Vec<u8>,
         content_type: &'static str,
     ) {
+        let ident = format!("f{file_idx}");
+        let bytes: Arc<[u8]> = bytes.into();
         let mut inner = self.inner.lock();
         let Some(entry) = inner.entries.get_mut(hash) else {
             return;
         };
-        // Only replace artwork without live bytes (the preview we advertised,
-        // or an evicted poster whose source just failed again).
-        if entry.art.as_ref().is_some_and(|a| a.bytes.is_some()) {
+        // Only fill the advertised candidate (or an evicted one) — never
+        // replace live bytes.
+        if let Some(prev) = entry.candidate(Source::Preview)
+            && prev.bytes.is_some()
+        {
             return;
         }
-        let ident = format!("f{file_idx}");
-        let rev = match entry.art.as_ref() {
-            Some(prev) if prev.source == Source::Preview && prev.ident == ident => prev.rev + 1,
+        let rev = match entry.candidate(Source::Preview) {
+            Some(prev) if prev.ident == ident => prev.rev + 1,
             _ => 0,
         };
-        entry.failed = None;
-        entry.art = Some(ArtData {
+        entry.candidates.retain(|c| c.source != Source::Preview);
+        let art = ArtData {
             source: Source::Preview,
-            ident,
+            ident: ident.clone(),
             rev,
             content_type,
-            bytes: Some(bytes.clone().into()),
+            bytes: Some(bytes.clone()),
             last_used: Instant::now(),
-        });
+        };
+        let ix = entry
+            .candidates
+            .partition_point(|c| priority(c.source) <= priority(Source::Preview));
+        entry.candidates.insert(ix, art);
+        entry.failed.remove(&Source::Preview);
         inner.bytes_total += bytes.len();
+        let disk = self.opts.disk_cache.clone();
+        let hash = hash.to_owned();
         drop(inner);
         tracing::info!(hash, "media preview extracted");
+        if let Some(dir) = disk {
+            tokio::task::spawn_blocking(move || {
+                disk_store(&dir, &hash, Source::Preview, &ident, bytes);
+            });
+        }
         self.evict();
     }
-    fn fail(&self, hash: &str, failure: Failure) {
+
+    /// Remove a candidate (used for the advertised-but-empty preview when
+    /// its extraction failed).
+    fn drop_candidate(&self, hash: &str, source: Source) {
+        let mut inner = self.inner.lock();
+        if let Some(entry) = inner.entries.get_mut(hash) {
+            entry.candidates.retain(|c| c.source != source);
+        }
+    }
+
+    fn fail(&self, hash: &str, source: Source, failure: Failure) {
         let mut inner = self.inner.lock();
         let Some(entry) = inner.entries.get_mut(hash) else {
             return;
         };
-        // An existing image is never dropped by a later failed refresh — but
-        // the cooldown is still recorded: it gates the hook-poster upgrade
-        // (kick_upgrade), so a broken hook URL retries at the failure's
-        // cadence instead of on every payload decoration.
-        entry.failed = Some((failure, Instant::now() + failure.cooldown()));
+        entry
+            .failed
+            .insert(source, (failure, Instant::now() + failure.cooldown()));
         // "No completed media file" is the normal state for downloads in
         // flight (retried every 60 s) — keep it quiet; the rest is worth
         // surfacing on the log pages.
         match failure {
-            Failure::NoCompletedMedia | Failure::HookUrl => {
-                tracing::debug!(hash, ?failure, "no torrent artwork");
+            Failure::NoCompletedMedia | Failure::HookUrl | Failure::NotFound => {
+                tracing::debug!(
+                    hash,
+                    source = source.as_str(),
+                    ?failure,
+                    "no torrent artwork"
+                );
             }
             Failure::Error | Failure::NoFfmpeg => {
-                tracing::info!(hash, ?failure, "no torrent artwork");
+                tracing::info!(
+                    hash,
+                    source = source.as_str(),
+                    ?failure,
+                    "no torrent artwork"
+                );
             }
         }
     }
 
-    /// Drop the oldest cached bytes when over budget. Evicted entries keep
-    /// their metadata (with a bumped rev) so the next decorated payload
-    /// triggers a refetch, which re-downloads or re-extracts.
+    /// Drop the oldest cached bytes when over budget. Evicted candidates
+    /// keep their metadata (with a bumped rev) so the next decorated payload
+    /// triggers a refetch, which re-derives the bytes — from the disk cache
+    /// when one is configured.
     fn evict(&self) {
         let mut inner = self.inner.lock();
         loop {
             let with_bytes = inner
                 .entries
                 .values()
-                .filter(|e| e.art.as_ref().is_some_and(|a| a.bytes.is_some()))
+                .filter(|e| e.candidates.iter().any(|c| c.bytes.is_some()))
                 .count();
             if inner.bytes_total <= MAX_CACHED_BYTES && with_bytes <= MAX_CACHED_ENTRIES {
                 break;
             }
+            // The globally oldest candidate-with-bytes, identified by its
+            // owning torrent — two torrents can share a source+ident (the
+            // same hook poster URL), so the hash must be part of the key.
             let victim = inner
                 .entries
                 .iter()
-                .filter(|(_, e)| e.art.as_ref().is_some_and(|a| a.bytes.is_some()))
-                .min_by_key(|(_, e)| {
-                    e.art
-                        .as_ref()
-                        .map(|a| a.last_used)
-                        .unwrap_or_else(Instant::now)
+                .filter_map(|(hash, e)| {
+                    e.candidates
+                        .iter()
+                        .filter(|c| c.bytes.is_some())
+                        .min_by_key(|c| c.last_used)
+                        .map(|c| (hash.clone(), c.source, c.ident.clone(), c.last_used))
                 })
-                .map(|(hash, _)| hash.clone());
-            let Some(victim) = victim else {
+                .min_by_key(|(_, _, _, last_used)| *last_used);
+            let Some((hash, source, ident, _)) = victim else {
                 break;
             };
-            let Some(entry) = inner.entries.get_mut(&victim) else {
+            let Some(entry) = inner.entries.get_mut(&hash) else {
                 break;
             };
-            let Some(art) = entry.art.as_mut() else {
+            let Some(art) = entry
+                .candidates
+                .iter_mut()
+                .find(|c| c.source == source && c.ident == ident && c.bytes.is_some())
+            else {
                 break;
             };
             let dropped = art.bytes.take().map(|b| b.len()).unwrap_or(0);
             art.rev += 1;
             inner.bytes_total = inner.bytes_total.saturating_sub(dropped);
+        }
+    }
+
+    // --- disk cache ---
+
+    /// Load a candidate's bytes from the persistent disk cache. `None` when
+    /// no cache is configured, the file is absent, or the bytes don't sniff
+    /// as a known image format.
+    async fn disk_load(
+        &self,
+        hash: &str,
+        source: Source,
+        ident: &str,
+    ) -> Option<(Arc<[u8]>, &'static str)> {
+        let dir = self.opts.disk_cache.as_ref()?;
+        let path = cache_file(dir, hash, source, ident);
+        tokio::task::spawn_blocking(move || {
+            let bytes = std::fs::read(path).ok()?;
+            detect_image(&bytes).map(|ct| (Arc::from(bytes.as_slice()) as Arc<[u8]>, ct))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+/// Candidate ordering: hook posters first, then MyShows, then previews.
+fn priority(source: Source) -> u8 {
+    match source {
+        Source::Hook => 0,
+        Source::MyShows => 1,
+        Source::Preview => 2,
+    }
+}
+
+/// Filename of one cached artwork candidate under the torrent's info-hash
+/// directory. Idents are filesystem-safe by construction (a hex hash, an
+/// `s{id}` show id, an `f{idx}` file index) and the info hash is validated
+/// to keep path traversal out even if a peer name ever leaked in.
+fn cache_file(dir: &Path, hash: &str, source: Source, ident: &str) -> PathBuf {
+    dir.join(hash)
+        .join(format!("{}#{ident}.bin", source.as_str()))
+}
+
+fn valid_cache_hash(hash: &str) -> bool {
+    !hash.is_empty() && hash.len() <= 64 && hash.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Persist one candidate's bytes, then shrink the cache back under its cap
+/// by deleting the oldest files. Best-effort: failures are logged and the
+/// in-memory copy is unaffected.
+fn disk_store(dir: &Path, hash: &str, source: Source, ident: &str, bytes: Arc<[u8]>) {
+    if !valid_cache_hash(hash) {
+        return;
+    }
+    let path = cache_file(dir, hash, source, ident);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        tracing::warn!(error = %e, path = %parent.display(), "artwork disk cache mkdir failed");
+        return;
+    }
+    let tmp = path.with_extension("tmp");
+    let write = std::fs::write(&tmp, bytes.as_ref()).and_then(|_| std::fs::rename(&tmp, &path));
+    match write {
+        Ok(()) => disk_evict(dir),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "artwork disk cache write failed");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Delete the oldest cached files until the cache is back under
+/// [`MAX_DISK_CACHE_BYTES`].
+fn disk_evict(dir: &Path) {
+    let Ok(hash_dirs) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, u64, Option<std::time::SystemTime>)> = Vec::new();
+    for entry in hash_dirs.flatten() {
+        let Ok(candidates) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for file in candidates.flatten() {
+            let path = file.path();
+            if path.extension().is_some_and(|e| e == "bin")
+                && let Ok(meta) = file.metadata()
+            {
+                files.push((path, meta.len(), meta.modified().ok()));
+            }
+        }
+    }
+    let total: u64 = files.iter().map(|(_, size, _)| size).sum();
+    if total <= MAX_DISK_CACHE_BYTES {
+        return;
+    }
+    // Oldest first; files without an mtime (unexpected) go first too.
+    files.sort_by_key(|(_, _, mtime)| *mtime);
+    let mut total = total;
+    for (path, size, _) in files {
+        if total <= MAX_DISK_CACHE_BYTES {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
         }
     }
 }
@@ -1110,5 +1404,81 @@ mod tests {
                 .as_deref()
                 .is_some_and(|t| normalize_alnum(t) == norm)
         );
+    }
+
+    #[test]
+    fn cache_file_layout_is_two_levels_and_safe() {
+        let dir = Path::new("/cache/artwork");
+        let path = cache_file(dir, "ab12", Source::Hook, "0123abcd");
+        assert_eq!(path, Path::new("/cache/artwork/ab12/hook#0123abcd.bin"));
+        assert!(valid_cache_hash("ab12"));
+        assert!(valid_cache_hash(&"x".repeat(64)));
+        assert!(!valid_cache_hash(""));
+        assert!(!valid_cache_hash("../../etc"));
+        assert!(!valid_cache_hash(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn disk_store_roundtrip_and_eviction() {
+        let scratch = std::env::temp_dir().join(format!(
+            "rqbit-artwork-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let png_bytes: Arc<[u8]> = vec![0x89u8, b'P', b'N', b'G', 0, 0].into();
+
+        disk_store(&scratch, "ab12", Source::Hook, "1234", png_bytes.clone());
+        let path = cache_file(&scratch, "ab12", Source::Hook, "1234");
+        assert!(path.exists());
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(read, png_bytes.as_ref());
+        // The temp file is gone after the rename.
+        assert!(!path.with_extension("tmp").exists());
+
+        // Invalid hashes are refused (no traversal out of the cache dir).
+        disk_store(&scratch, "../../evil", Source::Hook, "1", png_bytes.clone());
+        assert!(!scratch.parent().unwrap().join("evil").exists());
+
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// Candidate ordering: the same source replaces its own candidate,
+    /// everything else lands in priority order (hook → myshows → preview).
+    #[test]
+    fn candidates_keep_priority_order() {
+        let make = |source, ident: &str| ArtData {
+            source,
+            ident: ident.to_owned(),
+            rev: 0,
+            content_type: "image/png",
+            bytes: Some(vec![0x89, b'P', b'N', b'G', 0].into()),
+            last_used: Instant::now(),
+        };
+        let mut candidates: Vec<ArtData> = Vec::new();
+        for art in [
+            make(Source::Preview, "f0"),
+            make(Source::MyShows, "s1"),
+            make(Source::Hook, "aaaa"),
+        ] {
+            let ix = candidates.partition_point(|c| priority(c.source) <= priority(art.source));
+            candidates.insert(ix, art);
+        }
+        assert_eq!(
+            candidates.iter().map(|c| c.source).collect::<Vec<_>>(),
+            vec![Source::Hook, Source::MyShows, Source::Preview]
+        );
+        // A new hook ident replaces the old hook candidate, order intact.
+        let replacement = make(Source::Hook, "bbbb");
+        candidates.retain(|c| c.source != Source::Hook);
+        let ix = candidates.partition_point(|c| priority(c.source) <= priority(replacement.source));
+        candidates.insert(ix, replacement);
+        assert_eq!(
+            candidates.iter().map(|c| c.source).collect::<Vec<_>>(),
+            vec![Source::Hook, Source::MyShows, Source::Preview]
+        );
+        assert_eq!(candidates[0].ident, "bbbb");
     }
 }

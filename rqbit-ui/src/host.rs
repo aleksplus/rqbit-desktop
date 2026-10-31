@@ -115,6 +115,14 @@ pub trait UiHost: 'static {
         None
     }
 
+    /// Whether artwork should be recolored to match the active theme (the
+    /// desktop's "tint artwork" setting; the browser client has no such
+    /// setting and renders posters in their own colors). The colors come
+    /// from the theme at render time, so a theme switch re-tints.
+    fn artwork_tint(&self) -> bool {
+        false
+    }
+
     /// Fetch bytes over HTTP (artwork loading). Desktop: reqwest; browser:
     /// a same-origin fetch. The neutral default always fails, so hosts
     /// without a transport simply never show artwork.

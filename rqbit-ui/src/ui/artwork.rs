@@ -1,5 +1,5 @@
-//! Artwork loading and masking: turns a decorated [`TorrentArtwork`]
-//! reference into masked [`RenderImage`]s for the detail panel's Overview
+//! Artwork loading, masking, and tinting: turns decorated [`TorrentArtwork`]
+//! references into masked [`RenderImage`]s for the detail panel's Overview
 //! corner and the torrent list rows.
 //!
 //! GPUI can only clip images to rectangles (plus corner radii), so the
@@ -8,8 +8,20 @@
 //! ([`UiHost::fetch_bytes`]), are decoded with the `image` crate,
 //! center-cropped to the target size (cover), and multiplied with a
 //! per-pixel triangle mask. The result is cached per (artwork key, shape,
-//! size) in a bounded LRU; loads run detached through `App::spawn`, so
+//! size, tint) in a bounded LRU; loads run detached through `App::spawn`, so
 //! callers just re-render on their next poll and pick the image up.
+//!
+//! A torrent can carry several artwork *candidates* (best source first —
+//! hook poster, MyShows poster, media preview): the first candidate whose
+//! image is already loaded wins, and every not-yet-loaded candidate gets a
+//! background load kicked, so when the primary's bytes fail (a temporarily
+//! broken poster URL), the next candidate's image simply appears on the
+//! next poll.
+//!
+//! When the host asks for a theme tint ([`UiHost::artwork_tint`]), each
+//! image is additionally recolored as a duotone from the theme's background
+//! to its primary color ([`apply_tint`]) — the poster follows the active
+//! theme instead of carrying its own colors.
 //!
 //! The mask (see [`triangle_alpha`]): a right triangle flush with the
 //! element's top-right corner — sharp angle at the top-left vertex, 90° at
@@ -22,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{App, Global, RenderImage};
+use gpui_kit::component::ActiveTheme as _;
 use image::imageops::FilterType;
 use image::{DynamicImage, Frame, ImageBuffer, Rgba};
 use rqbit_protocol::types::TorrentArtwork;
@@ -50,6 +63,65 @@ fn mask_disabled() -> bool {
         std::env::var("RQBIT_ARTWORK_OPAQUE")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
+}
+
+/// The two endpoints of the theme-tint duotone: an image pixel's luminance
+/// maps from `shadow` (black) to `highlight` (white). Built from the active
+/// theme so posters follow it — with the default palettes that is a
+/// light-mono wash in dark mode and a dark-mono one in light mode; a custom
+/// colored theme tints posters with its own hue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtworkTint {
+    shadow: Rgba<u8>,
+    highlight: Rgba<u8>,
+}
+
+impl ArtworkTint {
+    /// The active theme's duotone endpoints: background (shadows) to
+    /// primary (highlights).
+    pub fn from_theme(cx: &App) -> Self {
+        let theme = cx.theme();
+        Self {
+            shadow: to_u8(theme.background),
+            highlight: to_u8(theme.primary),
+        }
+    }
+
+    /// A stable id for the cache key: the packed endpoint colors, so a
+    /// theme switch (different colors) re-renders tinted images.
+    fn id(&self) -> u64 {
+        (pack(self.shadow) as u64) << 32 | pack(self.highlight) as u64
+    }
+}
+
+/// gpui colors are f32 HSLA; the mask/tint math runs on 8-bit RGBA.
+fn to_u8(color: gpui::Hsla) -> Rgba<u8> {
+    let rgba = gpui::Rgba::from(color);
+    Rgba([
+        (rgba.r * 255.0).round().clamp(0.0, 255.0) as u8,
+        (rgba.g * 255.0).round().clamp(0.0, 255.0) as u8,
+        (rgba.b * 255.0).round().clamp(0.0, 255.0) as u8,
+        (rgba.a * 255.0).round().clamp(0.0, 255.0) as u8,
+    ])
+}
+
+fn pack(color: Rgba<u8>) -> u32 {
+    u32::from_be_bytes(color.0)
+}
+
+/// Recolor one pixel as a duotone: its Rec. 709 luminance picks a point on
+/// the shadow→highlight ramp. Alpha is preserved, so this composes with the
+/// triangle mask either way round.
+pub fn tint_pixel([r, g, b, a]: [u8; 4], tint: &ArtworkTint) -> [u8; 4] {
+    let luma = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+    let mix =
+        |s: u8, h: u8| (f32::from(s) + (f32::from(h) - f32::from(s)) * luma / 255.0).round() as u8;
+    [
+        mix(tint.shadow.0[0], tint.highlight.0[0]),
+        mix(tint.shadow.0[1], tint.highlight.0[1]),
+        mix(tint.shadow.0[2], tint.highlight.0[2]),
+        a,
+    ]
 }
 
 /// Which masked rendition of an artwork to build.
@@ -122,8 +194,8 @@ fn apply_shape_mask(buf: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, shape: ArtworkShap
     }
 }
 
-/// Decode, center-crop, mask, and wrap into a [`RenderImage`]. Runs on the
-/// background executor (a 512² JPEG costs a few milliseconds).
+/// Decode, center-crop, tint, mask, and wrap into a [`RenderImage`]. Runs
+/// on the background executor (a 512² JPEG costs a few milliseconds).
 ///
 /// The frame buffer is left in **BGRA byte order**: gpui-pre's own decoders
 /// (`decode_static_image_from_decoder`, the GIF/WebP paths) all convert
@@ -135,10 +207,16 @@ fn build_image(
     shape: ArtworkShape,
     render_w: f32,
     render_h: f32,
+    tint: Option<ArtworkTint>,
 ) -> Result<Arc<RenderImage>, String> {
     let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
     let (bw, bh) = shape.bake_size(render_w, render_h);
     let mut buf = cover_crop(img, bw, bh);
+    if let Some(tint) = &tint {
+        for pixel in buf.pixels_mut() {
+            *pixel = Rgba(tint_pixel(pixel.0, tint));
+        }
+    }
     if !mask_disabled() {
         apply_shape_mask(&mut buf, shape);
     }
@@ -154,6 +232,8 @@ struct CacheKey {
     shape: ArtworkShape,
     w: u32,
     h: u32,
+    /// Packed duotone endpoints (0 = untinted): a theme switch re-renders.
+    tint: u64,
 }
 
 #[derive(Default)]
@@ -200,53 +280,90 @@ struct GlobalArtworkCache(Mutex<CacheState>);
 
 impl Global for GlobalArtworkCache {}
 
-/// Look up the masked artwork image, starting a background load when it is
-/// not cached yet. Returns `None` while loading or after a failure; callers
-/// re-render on their regular poll cycle, so a completed load appears
-/// without any further plumbing.
+/// Look up the best loaded artwork image among the candidates, starting
+/// background loads for every candidate that isn't cached yet. Returns
+/// `None` while loading or after a failure; callers re-render on their
+/// regular poll cycle, so a completed load appears without any further
+/// plumbing. Candidates come in priority order — the first *loaded* one
+/// wins, and with a failed primary the next candidate's image takes over.
 pub fn masked_artwork(
     host: &Arc<dyn UiHost>,
-    artwork: &TorrentArtwork,
+    candidates: &[TorrentArtwork],
     shape: ArtworkShape,
     render_w: f32,
     render_h: f32,
     cx: &mut App,
 ) -> Option<Arc<RenderImage>> {
-    let cache_key = CacheKey {
-        key: artwork.key.clone(),
-        shape,
-        w: render_w as u32,
-        h: render_h as u32,
-    };
+    let tint = host.artwork_tint().then(|| ArtworkTint::from_theme(cx));
+    let tint_id = tint.as_ref().map_or(0, ArtworkTint::id);
     if !cx.has_global::<GlobalArtworkCache>() {
         cx.set_global(GlobalArtworkCache::default());
     }
 
-    let (image, cooling, inflight) = {
-        let Ok(mut state) = cx.global::<GlobalArtworkCache>().0.lock() else {
-            return None;
+    for candidate in candidates {
+        let cache_key = CacheKey {
+            key: candidate.key.clone(),
+            shape,
+            w: render_w as u32,
+            h: render_h as u32,
+            tint: tint_id,
         };
-        let image = state.entries.get(&cache_key).and_then(|e| e.image.clone());
-        if image.is_some() {
-            state.touch(&cache_key);
+        // A ready image wins immediately; a missing one gets a background
+        // load kicked (throttled by the inflight set and the failure
+        // cooldown) and the next candidate gets its chance.
+        let loaded = {
+            let Ok(mut state) = cx.global::<GlobalArtworkCache>().0.lock() else {
+                return None;
+            };
+            let image = state.entries.get(&cache_key).and_then(|e| e.image.clone());
+            if image.is_some() {
+                state.touch(&cache_key);
+            }
+            image
+        };
+        if let Some(image) = loaded {
+            return Some(image);
         }
-        // A failed load retries after the cooldown instead of staying
-        // suppressed until the key changes.
+        load_artwork_if_needed(
+            host, candidate, cache_key, shape, render_w, render_h, tint, cx,
+        );
+    }
+    None
+}
+
+/// Kick a background load for one candidate unless it is already loading or
+/// cooling down after a failure. The caller has checked the cache; a cached
+/// candidate never reaches this.
+#[allow(clippy::too_many_arguments)]
+fn load_artwork_if_needed(
+    host: &Arc<dyn UiHost>,
+    candidate: &TorrentArtwork,
+    cache_key: CacheKey,
+    shape: ArtworkShape,
+    render_w: f32,
+    render_h: f32,
+    tint: Option<ArtworkTint>,
+    cx: &mut App,
+) {
+    let (cooling, inflight) = {
+        let Ok(state) = cx.global::<GlobalArtworkCache>().0.lock() else {
+            return;
+        };
         let cooling = state
             .entries
             .get(&cache_key)
             .and_then(|e| e.failed_at)
             .is_some_and(|at| at.elapsed() < FAILED_RETRY);
-        (image, cooling, state.inflight.contains(&cache_key))
+        (cooling, state.inflight.contains(&cache_key))
     };
-    if let Some(image) = image {
-        return Some(image);
-    }
     if cooling || inflight {
-        return None;
+        return;
     }
 
-    let url = host.artwork_url(&artwork.path)?;
+    let url = match host.artwork_url(&candidate.path) {
+        Some(url) => url,
+        None => return,
+    };
     if let Ok(mut state) = cx.global::<GlobalArtworkCache>().0.lock() {
         state.inflight.insert(cache_key.clone());
     }
@@ -256,7 +373,7 @@ pub fn masked_artwork(
         let build = async {
             let bytes = host.fetch_bytes(url.clone()).await?;
             cx.background_executor()
-                .spawn(async move { build_image(&bytes, shape, render_w, render_h) })
+                .spawn(async move { build_image(&bytes, shape, render_w, render_h, tint) })
                 .await
         }
         .await;
@@ -280,7 +397,6 @@ pub fn masked_artwork(
         });
     })
     .detach();
-    None
 }
 
 #[cfg(test)]
@@ -331,10 +447,56 @@ mod tests {
         DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1, 1, Rgba([255, 0, 0, 255])))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        let img = build_image(&png, ArtworkShape::Rect, 1.0, 1.0).unwrap();
+        let img = build_image(&png, ArtworkShape::Rect, 1.0, 1.0, None).unwrap();
         let bytes = img.as_bytes(0).unwrap();
         assert_eq!(bytes[0], 0, "blue byte must be 0 for a red input (BGRA)");
         assert_eq!(bytes[2], 255, "red input must land in the blue byte slot");
         assert_eq!(bytes[3], 255, "alpha is untouched by the swap");
+    }
+
+    /// The tint maps a grayscale pixel onto the shadow→highlight ramp:
+    /// black lands on the shadow color, white on the highlight, mid-gray
+    /// halfway; alpha is preserved.
+    #[test]
+    fn tint_pixel_maps_luma_onto_ramp() {
+        let tint = ArtworkTint {
+            shadow: Rgba([0, 0, 0, 255]),
+            highlight: Rgba([100, 200, 50, 255]),
+        };
+        assert_eq!(tint_pixel([0, 0, 0, 255], &tint), [0, 0, 0, 255]);
+        assert_eq!(tint_pixel([255, 255, 255, 255], &tint), [100, 200, 50, 255]);
+        let [r, g, b, a] = tint_pixel([128, 128, 128, 200], &tint);
+        assert_eq!((r, g, b, a), (50, 100, 25, 200));
+        // A gray poster keeps its shading: brighter pixels sit closer to
+        // the highlight on every channel.
+        let dark = tint_pixel([40, 40, 40, 255], &tint);
+        let bright = tint_pixel([200, 200, 200, 255], &tint);
+        assert!(dark[1] < bright[1]);
+    }
+
+    /// The tint passes through `build_image` (and lands BGRA-swapped like
+    /// everything else), keyed so a different theme re-renders.
+    #[test]
+    fn build_image_applies_tint() {
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1, 1, Rgba([255, 255, 255, 255])))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let tint = ArtworkTint {
+            shadow: Rgba([10, 20, 30, 255]),
+            highlight: Rgba([40, 60, 80, 255]),
+        };
+        let img = build_image(&png, ArtworkShape::Rect, 1.0, 1.0, Some(tint)).unwrap();
+        let bytes = img.as_bytes(0).unwrap();
+        // A white input lands exactly on the highlight color (BGRA: bytes
+        // [0] and [2] are swapped blue/red).
+        assert_eq!((bytes[0], bytes[1], bytes[2]), (80, 60, 40));
+        // Different endpoints → different cache id.
+        let other = ArtworkTint {
+            shadow: Rgba([10, 20, 30, 255]),
+            highlight: Rgba([41, 60, 80, 255]),
+        };
+        assert_ne!(tint.id(), other.id());
+        assert_eq!(tint.id(), tint.id());
     }
 }

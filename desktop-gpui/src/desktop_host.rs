@@ -146,6 +146,10 @@ impl UiHost for DesktopHost {
         Some(format!("{}{path}", http_api_base_url(web_view.listen_addr)))
     }
 
+    fn artwork_tint(&self) -> bool {
+        self.state.config().poster_tint
+    }
+
     fn fetch_bytes<'a>(
         &'a self,
         url: String,

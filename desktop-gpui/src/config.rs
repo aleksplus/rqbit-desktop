@@ -307,9 +307,26 @@ pub struct RqbitDesktopConfig {
     pub hooks: RqbitDesktopConfigHooks,
 
     /// Disable the built-in MyShows poster lookup (per-torrent artwork).
-    /// Hook-provided posters and media-file previews stay enabled.
+    /// Hook-provided posters stay enabled unless `disable_posters` is set.
     #[serde(default)]
     pub disable_myshows: bool,
+
+    /// Disable all poster artwork: hook-provided posters and the MyShows
+    /// lookup. Media-file previews stay enabled unless `disable_previews`
+    /// is set.
+    #[serde(default)]
+    pub disable_posters: bool,
+
+    /// Disable the media-file preview source (ffmpeg frame extraction).
+    /// Poster sources stay enabled unless `disable_posters` is set.
+    #[serde(default)]
+    pub disable_previews: bool,
+
+    /// Recolor posters to match the active theme (a duotone from the
+    /// theme's background to its primary color) instead of showing them in
+    /// their own colors.
+    #[serde(default)]
+    pub poster_tint: bool,
 
     /// UI theme: "light" or "dark". Defaults to "light".
     #[serde(default)]
@@ -338,6 +355,9 @@ impl Default for RqbitDesktopConfig {
             ratelimits: Default::default(),
             hooks: Default::default(),
             disable_myshows: false,
+            disable_posters: false,
+            disable_previews: false,
+            poster_tint: false,
             theme: "light".to_string(),
             #[cfg(feature = "disable-upload")]
             disable_upload: false,
@@ -395,6 +415,26 @@ mod tests {
         let json = r#"{"default_download_location": "/tmp/dl"}"#;
         let cfg: RqbitDesktopConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.auto_add_paused);
+    }
+
+    /// The artwork switches default to enabled with the tint off, and an
+    /// old config file without the fields deserializes to those defaults.
+    #[test]
+    fn artwork_switches_default_on_tint_off() {
+        let json = r#"{"default_download_location": "/tmp/dl"}"#;
+        let cfg: RqbitDesktopConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.disable_posters);
+        assert!(!cfg.disable_myshows);
+        assert!(!cfg.disable_previews);
+        assert!(!cfg.poster_tint);
+
+        let cfg = RqbitDesktopConfig {
+            poster_tint: true,
+            ..Default::default()
+        };
+        let back: RqbitDesktopConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(back.poster_tint);
     }
 
     #[test]

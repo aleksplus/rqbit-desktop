@@ -262,9 +262,22 @@ async fn api_from_config(
     // background worker per session; the artwork HTTP route and the
     // LocalClient payload decoration read its results. Hook-provided posters
     // (e.g. moviesync-daemon's `poster` column) carry the resolve table's
-    // mapping — the app never talks to that daemon directly.
+    // mapping — the app never talks to that daemon directly. Sources follow
+    // the config's artwork switches; resolved bytes persist in a disk cache
+    // so restarts don't re-download posters or re-extract preview frames.
     let artwork_slot = ApiSlot::new(Arc::new(api.clone()));
-    let artwork = ArtworkProvider::new(artwork_slot, columns.clone(), !config.disable_myshows);
+    let artwork_dir = directories::ProjectDirs::from("com", "rqbit", "desktop")
+        .map(|dirs| dirs.cache_dir().join("artwork"));
+    let artwork = ArtworkProvider::new(
+        artwork_slot,
+        columns.clone(),
+        app_daemon::artwork::ArtworkOptions {
+            posters: !config.disable_posters,
+            myshows: !config.disable_myshows,
+            previews: !config.disable_previews,
+            disk_cache: artwork_dir,
+        },
+    );
     {
         let worker = artwork.clone();
         session.spawn(debug_span!("artwork"), "artwork", async move {

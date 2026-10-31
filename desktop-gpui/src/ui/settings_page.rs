@@ -493,6 +493,36 @@ fn set_web_view_enable(c: &mut RqbitDesktopConfig, v: bool) {
     c.web_view.disable = !v;
 }
 
+// Artwork switches: the getters invert the `disable_*` config flags so the
+// switches read as "on = shown", like every other enable-style switch here.
+fn get_posters(c: &RqbitDesktopConfig) -> bool {
+    !c.disable_posters
+}
+fn set_posters(c: &mut RqbitDesktopConfig, v: bool) {
+    c.disable_posters = !v;
+}
+
+fn get_myshows(c: &RqbitDesktopConfig) -> bool {
+    !c.disable_myshows
+}
+fn set_myshows(c: &mut RqbitDesktopConfig, v: bool) {
+    c.disable_myshows = !v;
+}
+
+fn get_previews(c: &RqbitDesktopConfig) -> bool {
+    !c.disable_previews
+}
+fn set_previews(c: &mut RqbitDesktopConfig, v: bool) {
+    c.disable_previews = !v;
+}
+
+fn get_poster_tint(c: &RqbitDesktopConfig) -> bool {
+    c.poster_tint
+}
+fn set_poster_tint(c: &mut RqbitDesktopConfig, v: bool) {
+    c.poster_tint = v;
+}
+
 fn get_web_view_ip(c: &RqbitDesktopConfig) -> String {
     c.web_view.listen_addr.ip().to_string()
 }
@@ -1051,6 +1081,45 @@ impl Render for SettingsPage {
                                             .description(
                                                 "Use a dark color scheme for the application UI. \
                                                  Applies and persists immediately.",
+                                            ),
+                                        ]),
+                                    )
+                                    .group(
+                                        SettingGroup::new().title("Artwork").items(vec![
+                                            SettingItem::new(
+                                                "Torrent posters",
+                                                switch_field(config.clone(), get_posters, set_posters),
+                                            )
+                                            .description(
+                                                "Show poster artwork in the torrent list and the \
+                                                 detail panel: hook-provided posters (e.g. a \
+                                                 moviesync-daemon resolve table) and the MyShows \
+                                                 lookup below. Applies on session restart.",
+                                            ),
+                                            SettingItem::new(
+                                                "MyShows poster lookup",
+                                                switch_field(config.clone(), get_myshows, set_myshows),
+                                            )
+                                            .description(
+                                                "Look up posters on myshows.me (exact-title match) \
+                                                 for releases without a hook-provided poster.",
+                                            ),
+                                            SettingItem::new(
+                                                "Media previews",
+                                                switch_field(config.clone(), get_previews, set_previews),
+                                            )
+                                            .description(
+                                                "Use a frame from the largest downloaded video \
+                                                 file (via ffmpeg) when no poster was found.",
+                                            ),
+                                            SettingItem::new(
+                                                "Tint artwork with the theme color",
+                                                switch_field(config.clone(), get_poster_tint, set_poster_tint),
+                                            )
+                                            .description(
+                                                "Recolor posters to match the active theme (a \
+                                                 duotone from the background to the primary \
+                                                 color) instead of their own colors.",
                                             ),
                                         ]),
                                     ),

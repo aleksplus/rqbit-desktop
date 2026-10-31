@@ -33,6 +33,7 @@ serde_json = { workspace = true }
 mime_guess = { workspace = true }
 tokio-util = { workspace = true }
 urlencoding = { workspace = true }
+directories = { workspace = true }
 
 [dev-dependencies]
 # WS client for integration tests of the binary protocol end-to-end.

@@ -153,10 +153,19 @@ pub struct TorrentDetails {
     #[serde(default)]
     pub custom: Option<BTreeMap<String, String>>,
     /// Resolved artwork (poster/preview) for this torrent, when any source
-    /// produced one. Decoration is asynchronous — it appears on a later
-    /// payload after the daemon resolves it.
+    /// produced one. The best candidate — see [`Self::artwork_candidates`].
+    /// Decoration is asynchronous — it appears on a later payload after the
+    /// daemon resolves it.
     #[serde(default)]
     pub artwork: Option<TorrentArtwork>,
+    /// Every resolved artwork candidate for this torrent, best source first
+    /// (hook poster, MyShows poster, media preview). The UI renders the
+    /// first candidate whose bytes load and falls back to the next one when
+    /// a load fails (a temporarily broken poster URL doesn't blank a torrent
+    /// that already has a preview). `artwork` mirrors the first entry for
+    /// simple consumers.
+    #[serde(default)]
+    pub artwork_candidates: Vec<TorrentArtwork>,
 }
 
 /// How a hook-provided custom-column cell renders.

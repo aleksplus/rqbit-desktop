@@ -279,9 +279,11 @@ impl TorrentDetailPanel {
                         // opened — refresh both so a late poster/preview
                         // appears without reopening the panel.
                         if let Some(existing) = this.details.as_mut()
-                            && (existing.artwork != d.artwork || existing.custom != d.custom)
+                            && (existing.artwork_candidates != d.artwork_candidates
+                                || existing.custom != d.custom)
                         {
                             existing.artwork = d.artwork.clone();
+                            existing.artwork_candidates = d.artwork_candidates.clone();
                             existing.custom = d.custom.clone();
                             cx.notify();
                         }
@@ -586,11 +588,12 @@ impl TorrentDetailPanel {
         let artwork_image = self
             .details
             .as_ref()
-            .and_then(|d| d.artwork.as_ref())
-            .and_then(|artwork| {
+            .map(|d| d.artwork_candidates.as_slice())
+            .filter(|candidates| !candidates.is_empty())
+            .and_then(|candidates| {
                 masked_artwork(
                     &self.host,
-                    artwork,
+                    candidates,
                     ArtworkShape::Detail,
                     DETAIL_ARTWORK_SIZE,
                     DETAIL_ARTWORK_SIZE,

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::Parser;
 
-use app_daemon::artwork::ArtworkProvider;
+use app_daemon::artwork::{ArtworkOptions, ArtworkProvider};
 use app_daemon::columns::{ColumnsHook, ColumnsMethod, ColumnsProvider};
 use app_daemon::server;
 use app_daemon::{DaemonSettingsBackend, start_session};
@@ -54,6 +54,28 @@ struct Args {
     /// The media-file preview source and hook-provided posters stay on.
     #[arg(long)]
     disable_myshows: bool,
+
+    /// Disable all poster artwork: hook-provided posters and the MyShows
+    /// lookup. The media-file preview source stays on.
+    #[arg(long)]
+    disable_posters: bool,
+
+    /// Disable the media-file preview source (ffmpeg frame extraction).
+    /// Poster sources stay on.
+    #[arg(long)]
+    disable_previews: bool,
+
+    /// Where the persistent artwork cache (resolved posters and preview
+    /// frames, reused across restarts) is stored. Defaults to the OS cache
+    /// directory for this daemon.
+    #[arg(long)]
+    artwork_cache_dir: Option<PathBuf>,
+}
+
+fn default_artwork_cache_dir() -> PathBuf {
+    directories::ProjectDirs::from("com", "rqbit", "app-daemon")
+        .map(|dirs| dirs.cache_dir().join("artwork"))
+        .unwrap_or_else(|| std::env::temp_dir().join("rqbit-app-daemon-artwork"))
 }
 
 #[tokio::main]
@@ -108,7 +130,19 @@ async fn main() -> anyhow::Result<()> {
     // its results. Hook-provided posters (e.g. moviesync-daemon's `poster`
     // column) carry the resolve-table's mapping — the app never talks to
     // that daemon directly.
-    let artwork = ArtworkProvider::new(daemon.api.clone(), columns.clone(), !args.disable_myshows);
+    let artwork = ArtworkProvider::new(
+        daemon.api.clone(),
+        columns.clone(),
+        ArtworkOptions {
+            posters: !args.disable_posters,
+            myshows: !args.disable_myshows,
+            previews: !args.disable_previews,
+            disk_cache: Some(
+                args.artwork_cache_dir
+                    .unwrap_or_else(default_artwork_cache_dir),
+            ),
+        },
+    );
     artwork.start();
 
     // Session settings: Get mirrors the running session's settings, Set

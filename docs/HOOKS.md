@@ -432,6 +432,28 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
   tab (triangle-cropped poster) and in the torrent list row corner. The
   built-in artwork sources (MyShows poster lookup, media-file preview) only
   run when no hook provides a poster.
+
+  Artwork details (`app-daemon/src/artwork.rs`):
+  * A torrent keeps every image it ever resolved as a *candidate* (at most
+    one per source, best first: hook → MyShows → preview). The payloads
+    carry the full list in `TorrentDetails::artwork_candidates` (with
+    `artwork` mirroring the first entry); the UIs render the first
+    candidate whose bytes load, so a temporarily broken poster URL falls
+    back to a preview instead of blanking the row.
+  * Sources are gated by the desktop config's artwork switches (Settings →
+    General → Artwork): **Torrent posters** (hook posters + the MyShows
+    lookup; the daemon also has `--disable-posters`), **MyShows poster
+    lookup** (`disable_myshows` / `--disable-myshows`), and **Media
+    previews** (`disable_previews` / `--disable-previews`).
+  * Resolved bytes persist in a disk cache (desktop: the OS cache dir's
+    `artwork/` folder; daemon: `--artwork-cache-dir`), one
+    `{source}#{ident}.bin` file per candidate under the torrent's hash —
+    restarts and memory evictions re-load from disk instead of
+    re-downloading or re-running ffmpeg. Capped at 256 MiB, LRU-evicted by
+    file mtime.
+  * The desktop can recolor artwork to the active theme (**Tint artwork
+    with the theme color**, `poster_tint`): a duotone from the theme's
+    background to its primary color, baked into the bitmap at render time.
 * Snapshot: the last successful response is cached as a `ColumnsSnapshot`
   (`state` = columns + `connected` + hook name, plus the per-torrent and
   per-file value maps). On a failed poll the data is retained but

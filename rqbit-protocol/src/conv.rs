@@ -105,6 +105,7 @@ pub fn torrent_details(resp: &TorrentDetailsResponse, trackers: Vec<String>) -> 
         trackers,
         custom: None,
         artwork: None,
+        artwork_candidates: Vec::new(),
     }
 }
 

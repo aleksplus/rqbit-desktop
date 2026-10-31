@@ -16,10 +16,21 @@ use librqbit::{
 };
 use reqwest::header::CONTENT_TYPE;
 
-use app_daemon::artwork::ArtworkProvider;
+use app_daemon::artwork::{ArtworkOptions, ArtworkProvider};
 use app_daemon::columns::{ColumnsHook, ColumnsMethod, ColumnsProvider};
 use app_daemon::server::{ApiSlot, handle_request, router};
 use rqbit_protocol::{Request, ResponsePayload, TorrentArtwork, TorrentId};
+
+/// Provider options per test: which built-in sources run, no disk cache
+/// unless a test says so.
+fn opts(myshows: bool, previews: bool, disk_cache: Option<std::path::PathBuf>) -> ArtworkOptions {
+    ArtworkOptions {
+        posters: true,
+        myshows,
+        previews,
+        disk_cache,
+    }
+}
 
 fn ffmpeg_available() -> bool {
     std::process::Command::new("ffmpeg")
@@ -168,7 +179,7 @@ async fn artwork_route_serves_a_preview_frame() {
     // the only source. The artwork route itself waits on the worker for the
     // lazy ffmpeg extraction, so a single request should suffice.
     let (_dir, api, hash) = seeded_video("Sample.Show.S01E01.1080p.WEB.h264.mp4").await;
-    let artwork = ArtworkProvider::new(ApiSlot::new(api.clone()), None, false);
+    let artwork = ArtworkProvider::new(ApiSlot::new(api.clone()), None, opts(false, true, None));
     artwork.start();
     let (base, server) = serve(router(
         ApiSlot::new(api.clone()),
@@ -263,7 +274,11 @@ async fn artwork_prefers_hook_poster_from_columns_api() {
     );
     columns.start();
 
-    let artwork = ArtworkProvider::new(ApiSlot::new(api.clone()), Some(columns), false);
+    let artwork = ArtworkProvider::new(
+        ApiSlot::new(api.clone()),
+        Some(columns),
+        opts(false, true, None),
+    );
     artwork.start();
     let (base, server) = serve(router(
         ApiSlot::new(api.clone()),
@@ -289,6 +304,14 @@ async fn artwork_prefers_hook_poster_from_columns_api() {
         }
     };
 
+    // The candidates list carries the hook candidate first (any fallback
+    // that resolved before the upgrade stays as a later entry).
+    let candidates = decorated_candidates(&api, &artwork).await;
+    assert!(
+        candidates.first().is_some_and(|a| a.source == "hook"),
+        "hook poster must be the primary candidate, got {candidates:?}"
+    );
+
     // The route serves the hook's bytes.
     let client = reqwest::Client::new();
     let url = format!("{base}/torrents/by-hash/{hash}/artwork");
@@ -304,6 +327,112 @@ async fn artwork_prefers_hook_poster_from_columns_api() {
     poster_server.abort();
 }
 
+/// Poll the decorated details payload until at least one artwork candidate
+/// is attached, and return the full candidate list.
+async fn decorated_candidates(
+    api: &Arc<Api>,
+    artwork: &Arc<ArtworkProvider>,
+) -> Vec<TorrentArtwork> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let resp = handle_request(
+            api,
+            Request::Details {
+                torrent: TorrentId::Id(0),
+            },
+            None,
+            Some(artwork.as_ref()),
+            None,
+        )
+        .await
+        .unwrap();
+        if let ResponsePayload::Details(details) = resp
+            && !details.artwork_candidates.is_empty()
+        {
+            return details.artwork_candidates;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no artwork candidates ever decorated"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Resolved artwork persists on disk: a fresh provider over the same cache
+/// directory serves the same bytes without re-deriving them (the cached
+/// file is read, not rewritten).
+#[tokio::test]
+async fn artwork_persists_in_disk_cache_across_providers() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping disk cache test");
+        return;
+    }
+    let cache_dir = std::env::temp_dir().join(format!(
+        "rqbit-artwork-disk-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let (_dir, api, hash) = seeded_video("Disk.Cached.Show.S01E01.720p.WEB.h264.mp4").await;
+
+    // First provider: resolves the preview and persists it.
+    let first = ArtworkProvider::new(
+        ApiSlot::new(api.clone()),
+        None,
+        opts(false, true, Some(cache_dir.clone())),
+    );
+    first.start();
+    let artwork = decorated_artwork(&api, &first)
+        .await
+        .expect("first provider resolved artwork");
+    assert_eq!(artwork.source, "preview");
+    first.request_bytes(&hash).await.expect("bytes served");
+
+    // The cache file for the preview candidate exists under the hash dir.
+    let hash_dir = cache_dir.join(&hash);
+    let files: Vec<_> = std::fs::read_dir(&hash_dir)
+        .expect("cache dir created")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert!(
+        files.iter().any(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("preview#") && n.ends_with(".bin"))
+        }),
+        "expected a persisted preview file in {files:?}"
+    );
+    let before = std::fs::metadata(&files[0]).unwrap().modified().unwrap();
+
+    // Second provider over the same directory: serves the same bytes, and
+    // the cached file is untouched (read from disk, not re-extracted).
+    let second = ArtworkProvider::new(
+        ApiSlot::new(api.clone()),
+        None,
+        opts(false, true, Some(cache_dir.clone())),
+    );
+    second.start();
+    let (bytes, content_type) = second
+        .request_bytes(&hash)
+        .await
+        .expect("second provider served bytes from disk");
+    assert_eq!(content_type, "image/png");
+    assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+    let after = std::fs::metadata(&files[0]).unwrap().modified().unwrap();
+    assert_eq!(
+        before, after,
+        "the cached file must be read, not rewritten, by the second provider"
+    );
+
+    std::fs::remove_dir_all(&cache_dir).ok();
+}
+
 /// The built-in MyShows search only accepts an exact title match — the
 /// fuzzy first result that pairs "…First Marriage" with "Marriage Toxin"
 /// must not become the poster; the completed file's preview frame is the
@@ -313,7 +442,7 @@ async fn naive_search_rejects_fuzzy_title() {
     let (_dir, api, _hash) =
         seeded_video("Georgie.and.Mandys.First.Marriage.S01E05.720p.WEB.h264.mp4").await;
 
-    let artwork = ArtworkProvider::new(ApiSlot::new(api.clone()), None, true);
+    let artwork = ArtworkProvider::new(ApiSlot::new(api.clone()), None, opts(true, true, None));
     artwork.start();
     let _ = serve(router(
         ApiSlot::new(api.clone()),

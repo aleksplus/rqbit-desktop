@@ -94,9 +94,10 @@ pub struct TorrentRow {
     /// Hook-provided custom column values, keyed by column key. Empty when
     /// no hook provides data for this torrent.
     pub custom: BTreeMap<String, String>,
-    /// Resolved artwork (poster/preview), when the daemon decorated the
-    /// list payload. Rendered as a wedge in the row's right corner.
-    pub artwork: Option<TorrentArtwork>,
+    /// Resolved artwork candidates (poster/preview), best source first,
+    /// when the daemon decorated the list payload. Rendered as a wedge in
+    /// the row's right corner.
+    pub artwork_candidates: Vec<TorrentArtwork>,
 }
 
 impl TorrentRow {
@@ -172,7 +173,7 @@ impl TorrentRow {
             depth: 0,
             group_size: 1,
             custom: t.custom.clone().unwrap_or_default(),
-            artwork: t.artwork.clone(),
+            artwork_candidates: t.artwork_candidates.clone(),
         }
     }
 
@@ -454,7 +455,7 @@ impl TorrentTableDelegate {
             };
             masked_artwork(
                 &self.host,
-                &artwork,
+                std::slice::from_ref(&artwork),
                 ArtworkShape::Rect,
                 CELL_THUMB,
                 CELL_THUMB,
@@ -962,11 +963,12 @@ impl TableDelegate for TorrentTableDelegate {
         let artwork_image = self
             .rows
             .get(row_ix)
-            .and_then(|r| r.artwork.as_ref())
-            .and_then(|artwork| {
+            .map(|r| r.artwork_candidates.as_slice())
+            .filter(|candidates| !candidates.is_empty())
+            .and_then(|candidates| {
                 masked_artwork(
                     &self.host,
-                    artwork,
+                    candidates,
                     ArtworkShape::Row,
                     ROW_WEDGE_WIDTH,
                     ROW_WEDGE_HEIGHT,
@@ -1285,7 +1287,7 @@ mod tests {
             depth: 0,
             group_size: 1,
             custom: Default::default(),
-            artwork: None,
+            artwork_candidates: Vec::new(),
         }
     }
 
