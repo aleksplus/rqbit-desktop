@@ -72,7 +72,11 @@ To upgrade librqbit (e.g. to 9.0.2): bump the version in the root `Cargo.toml`, 
   and info dicts, not v1. The spec explicitly requires BEP 52 compliance.
 
 ## Other directives
-- Use narsil mcp for code retrieval or search
+- Code search: use semantic search (codeseeker mcp) to discover where a concept lives
+  ("where is X handled", "how does Y work"); use rg to pin down exact strings and to
+  verify results. rg is the safer default for exact terms — it never goes stale and
+  never misses, while codeseeker's index can lag the working tree (it refreshes on
+  query; force a sync after branch switches or large external changes).
 - Use context7 for documentation
 - Fetch https://longbridge.github.io/gpui-component/docs/ if needed.
 - If you need to resort to running shell commands, always use "rg" instead of "grep".

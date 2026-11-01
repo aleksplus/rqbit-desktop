@@ -1,0 +1,18 @@
+{
+    "servers": {
+        "codeseeker": {
+            "type": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "codeseeker",
+                "serve",
+                "--mcp",
+                "${workspaceFolder}"
+            ],
+            "env": {
+                "CODESEEKER_STORAGE_MODE": "embedded"
+            }
+        }
+    }
+}
