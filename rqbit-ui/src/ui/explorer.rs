@@ -110,14 +110,16 @@ fn file_progress_pct(progress: Option<u64>, length: u64) -> Option<u8> {
 /// context-menu actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeKind {
-    /// A torrent root. `path` is where its files live relative to the output
-    /// folder: the torrent name (rqbit's extraction subfolder) for
-    /// multi-file torrents, empty when the file sits loose.
-    Torrent { path: Vec<String> },
-    /// A directory, addressed by its path components below the output folder.
+    /// A torrent root. Its disk path is the torrent's output folder itself
+    /// (`details.output_folder`, which rqbit reports already including any
+    /// extraction subfolder); everything below it is relative to the
+    /// torrent root.
+    Torrent,
+    /// A directory inside the torrent, addressed by its components below
+    /// the torrent root.
     Dir { path: Vec<String> },
-    /// A file leaf: index into `TorrentDetails.files` plus its full relative
-    /// path, size and live status.
+    /// A file leaf: index into `TorrentDetails.files` plus its path below
+    /// the torrent root, size and live status.
     File {
         file_index: usize,
         path: Vec<String>,
@@ -128,11 +130,11 @@ enum NodeKind {
 }
 
 impl NodeKind {
-    /// The entry's own path components below the output folder (empty for a
-    /// torrent whose file sits loose in it).
+    /// The entry's own path components below the torrent root (empty for a
+    /// torrent root).
     fn own_path(&self) -> Vec<String> {
         match self {
-            NodeKind::Torrent { path } => path.clone(),
+            NodeKind::Torrent => Vec::new(),
             NodeKind::Dir { path } => path.clone(),
             NodeKind::File { path, .. } => path.clone(),
         }
@@ -243,27 +245,15 @@ fn last_component(file: &TorrentFile) -> &str {
         .unwrap_or(&file.name)
 }
 
-/// The folder a torrent's files live in, relative to the output folder:
-/// the torrent name for multi-file torrents with ≥2 entries (rqbit's
-/// `get_default_subfolder_for_torrent` extraction rule), nothing when the
-/// file sits loose.
-fn disk_subfolder(torrent_name: &str, file_count: usize) -> Vec<String> {
-    if file_count >= 2 && !torrent_name.is_empty() {
-        vec![torrent_name.to_owned()]
-    } else {
-        Vec::new()
-    }
-}
-
 /// Build one torrent's subtree: `TreeItem`s for the tree plus the flat
-/// [`NodeInfo`] metadata for every generated id. The extraction subfolder
-/// ([`disk_subfolder`]) is a path prefix only — the torrent root already
-/// displays the same name, so rendering it as a separate folder level would
-/// just duplicate the torrent row. Directories come before files at each
+/// [`NodeInfo`] metadata for every generated id. File components are
+/// relative to the torrent root, and the root row stands in for that root
+/// folder on disk (`details.output_folder`, which rqbit reports already
+/// including any extraction subfolder) — so the torrent name is never a
+/// rendered or joined path level. Directories come before files at each
 /// tier, all sorted 0-9, a-z, а-я.
 fn build_torrent_subtree(
     torrent_id: u64,
-    torrent_name: &str,
     files: &[TorrentFile],
     progress: Option<&[u64]>,
 ) -> (Vec<TreeItem>, Vec<(SharedString, NodeInfo)>) {
@@ -273,8 +263,7 @@ fn build_torrent_subtree(
     }
 
     let mut metas = Vec::new();
-    let subfolder = disk_subfolder(torrent_name, files.len());
-    let items = emit_dir_group(torrent_id, &root, files, progress, &subfolder, &mut metas);
+    let items = emit_dir_group(torrent_id, &root, files, progress, &[], &mut metas);
     (items, metas)
 }
 
@@ -340,11 +329,9 @@ fn emit_dir_group(
 /// replace instead of stacking.
 struct ExplorerPathCopiedNotice;
 
-/// Cached static metadata for one torrent: the display name (which decides
-/// the virtual name-folder level and doubles as that folder's label) plus
-/// the file list answered by `details()`.
+/// Cached static metadata for one torrent: the file list answered by
+/// `details()`.
 struct TorrentFiles {
-    name: String,
     files: Vec<TorrentFile>,
 }
 
@@ -456,7 +443,6 @@ impl ExplorerPanel {
             if let Some(cached) = self.files.get(&id) {
                 let (children, child_metas) = build_torrent_subtree(
                     id,
-                    &cached.name,
                     &cached.files,
                     self.progress.get(&id).map(Vec::as_slice),
                 );
@@ -478,20 +464,13 @@ impl ExplorerPanel {
 
     /// Install file metadata answered by a `details()` fetch. The torrent's
     /// children are built once here; later refreshes only touch labels.
-    fn install_files(
-        &mut self,
-        torrent_id: u64,
-        name: String,
-        files: Vec<TorrentFile>,
-        cx: &mut Context<Self>,
-    ) {
-        self.files.insert(torrent_id, TorrentFiles { name, files });
+    fn install_files(&mut self, torrent_id: u64, files: Vec<TorrentFile>, cx: &mut Context<Self>) {
+        self.files.insert(torrent_id, TorrentFiles { files });
         let Some(cached) = self.files.get(&torrent_id) else {
             return;
         };
         let (children, metas) = build_torrent_subtree(
             torrent_id,
-            &cached.name,
             &cached.files,
             self.progress.get(&torrent_id).map(Vec::as_slice),
         );
@@ -519,14 +498,13 @@ impl ExplorerPanel {
             let Some(files) = details.files else {
                 return;
             };
-            let name = details.name.unwrap_or_else(|| details.info_hash.clone());
             let _ = this.update(cx, |this, cx| {
                 // List rows always carry the id, so the fetch is queued once;
                 // still guard against a late duplicate answer.
                 if this.files.contains_key(&torrent_id) {
                     return;
                 }
-                this.install_files(torrent_id, name, files, cx);
+                this.install_files(torrent_id, files, cx);
             });
         })
         .detach();
@@ -541,20 +519,18 @@ impl ExplorerPanel {
             let Some(torrent_id) = torrent_id_of_item_id(&root.id) else {
                 continue;
             };
-            // The torrent root stands in for the extraction subfolder, so
-            // its own disk path is that subfolder (empty for loose files).
-            let kind = match self.files.get(&torrent_id) {
-                Some(cached) => NodeKind::Torrent {
-                    path: disk_subfolder(&cached.name, cached.files.len()),
+            // The torrent root's disk path is the torrent's output folder
+            // itself (already including any extraction subfolder).
+            self.meta.insert(
+                root.id.clone(),
+                NodeInfo {
+                    torrent_id,
+                    kind: NodeKind::Torrent,
                 },
-                None => NodeKind::Torrent { path: Vec::new() },
-            };
-            self.meta
-                .insert(root.id.clone(), NodeInfo { torrent_id, kind });
+            );
             if let Some(cached) = self.files.get(&torrent_id) {
                 let (_, metas) = build_torrent_subtree(
                     torrent_id,
-                    &cached.name,
                     &cached.files,
                     self.progress.get(&torrent_id).map(Vec::as_slice),
                 );
@@ -621,7 +597,7 @@ impl ExplorerPanel {
         let mut suffix: Option<String> = None;
 
         match &info.kind {
-            NodeKind::Torrent { .. } => {
+            NodeKind::Torrent => {
                 label_color = theme.foreground;
                 row = row.child(
                     Icon::new(IconName::HardDrive)
@@ -865,69 +841,59 @@ mod tests {
             file("b.txt", &["alpha", "sub", "b.txt"], 20, true),
             file("a.txt", &["alpha", "a.txt"], 30, true),
         ];
-        let (items, metas) = build_torrent_subtree(7, "Some Torrent", &files, None);
+        let (items, metas) = build_torrent_subtree(7, &files, None);
 
         // Top level under the torrent root: the `alpha` dir first, then the
-        // loose zeta.txt. Ids carry the extraction-subfolder prefix, but no
-        // folder node is rendered for it (the torrent root shows that name).
-        assert_eq!(ids(&items), vec!["t7/d/Some Torrent/alpha", "t7/f/0"]);
+        // loose zeta.txt.
+        assert_eq!(ids(&items), vec!["t7/d/alpha", "t7/f/0"]);
 
         let alpha = &items[0];
         // Within the dir: nested `sub` dir before the loose file.
-        assert_eq!(
-            ids(&alpha.children),
-            vec!["t7/d/Some Torrent/alpha/sub", "t7/f/2"]
-        );
+        assert_eq!(ids(&alpha.children), vec!["t7/d/alpha/sub", "t7/f/2"]);
         assert_eq!(ids(&alpha.children[0].children), vec!["t7/f/1"]);
 
         // Every emitted item has metadata, and ids are unique.
         let meta_ids: HashSet<&SharedString> = metas.iter().map(|(id, _)| id).collect();
         assert_eq!(meta_ids.len(), metas.len());
-        assert!(
-            metas
-                .iter()
-                .any(|(id, _)| id.as_ref() == "t7/d/Some Torrent/alpha/sub")
-        );
+        assert!(metas.iter().any(|(id, _)| id.as_ref() == "t7/d/alpha/sub"));
     }
 
     #[test]
     fn subtree_mirrors_disk_layout() {
-        // Multi-file with ≥2 entries and bare paths: rqbit extracts into the
-        // name folder, so every node's path carries that prefix — but the
-        // torrent root displays the same name, so no folder node is rendered.
+        // File components are relative to the torrent root; on disk they sit
+        // under `details.output_folder`, which rqbit reports already
+        // including the extraction subfolder. So the torrent name never
+        // appears as an id or path level (the torrent root displays it).
         let files = vec![
             file("a.txt", &["a.txt"], 10, true),
             file("b.txt", &["sub", "b.txt"], 20, true),
         ];
-        let (items, metas) = build_torrent_subtree(9, "Pack", &files, None);
+        let (items, metas) = build_torrent_subtree(9, &files, None);
 
-        assert_eq!(ids(&items), vec!["t9/d/Pack/sub", "t9/f/0"]);
+        assert_eq!(ids(&items), vec!["t9/d/sub", "t9/f/0"]);
         assert_eq!(ids(&items[0].children), vec!["t9/f/1"]);
 
         let by_id: HashMap<&str, &NodeInfo> =
             metas.iter().map(|(id, info)| (id.as_ref(), info)).collect();
-        assert_eq!(
-            by_id["t9/f/0"].kind.own_path(),
-            vec!["Pack".to_string(), "a.txt".to_string()]
-        );
+        assert_eq!(by_id["t9/f/0"].kind.own_path(), vec!["a.txt".to_string()]);
         assert_eq!(
             by_id["t9/f/1"].kind.own_path(),
-            vec!["Pack".to_string(), "sub".to_string(), "b.txt".to_string()]
+            vec!["sub".to_string(), "b.txt".to_string()]
         );
         assert!(!metas.iter().any(|(id, _)| id.as_ref() == "t9/d/Pack"));
 
-        // Fewer than 2 entries: the file really is loose in the output
-        // folder — no prefix, no folder level, bare filename label.
+        // A torrent whose single file has no folder components: the file
+        // sits directly under the torrent root, bare filename label.
         let single = vec![file("solo.txt", &["solo.txt"], 10, true)];
-        let (items, metas) = build_torrent_subtree(9, "Pack", &single, None);
+        let (items, metas) = build_torrent_subtree(9, &single, None);
         assert_eq!(ids(&items), vec!["t9/f/0"]);
         assert_eq!(items[0].label, "solo.txt");
         assert_eq!(metas[0].1.kind.own_path(), vec!["solo.txt".to_string()]);
 
         // A single entry that carries its own folder: that folder exists on
-        // disk and is rendered, again without any wrap.
+        // disk and is rendered like any directory level.
         let own_folder = vec![file("solo.txt", &["Data", "solo.txt"], 10, true)];
-        let (items, _) = build_torrent_subtree(9, "Pack", &own_folder, None);
+        let (items, _) = build_torrent_subtree(9, &own_folder, None);
         assert_eq!(ids(&items), vec!["t9/d/Data"]);
     }
 
@@ -964,7 +930,7 @@ mod tests {
             file("_cache.bin", &["_cache.bin"], 4, true),
             file("Beta.txt", &["Beta.txt"], 5, true),
         ];
-        let (items, _) = build_torrent_subtree(5, "T", &files, None);
+        let (items, _) = build_torrent_subtree(5, &files, None);
 
         // Directly under the torrent root: digits, then latin
         // (case-insensitive), then cyrillic, then symbols.
@@ -981,12 +947,9 @@ mod tests {
             file("a", &["apple", "a"], 2, true),
             file("a", &["2001", "a"], 3, true),
         ];
-        let (items, _) = build_torrent_subtree(6, "T", &files, None);
+        let (items, _) = build_torrent_subtree(6, &files, None);
 
-        assert_eq!(
-            ids(&items),
-            vec!["t6/d/T/2001", "t6/d/T/apple", "t6/d/T/Зима"]
-        );
+        assert_eq!(ids(&items), vec!["t6/d/2001", "t6/d/apple", "t6/d/Зима"]);
     }
 
     #[test]
@@ -996,7 +959,7 @@ mod tests {
             file("part.bin", &["part.bin"], 200, true),
             file("skipped.bin", &["skipped.bin"], 300, false),
         ];
-        let (_, metas) = build_torrent_subtree(3, "Torrent 3", &files, Some(&[100, 50, 0]));
+        let (_, metas) = build_torrent_subtree(3, &files, Some(&[100, 50, 0]));
 
         let by_id: HashMap<&str, &NodeInfo> =
             metas.iter().map(|(id, info)| (id.as_ref(), info)).collect();
@@ -1060,6 +1023,11 @@ mod tests {
         assert_eq!(
             join_disk_path("/downloads", &["alpha", "b.txt"].map(String::from)),
             Some("/downloads/alpha/b.txt".to_string())
+        );
+        // A torrent root (no components) joins to the folder itself.
+        assert_eq!(
+            join_disk_path("/downloads", &[]),
+            Some("/downloads".to_string())
         );
     }
 }
