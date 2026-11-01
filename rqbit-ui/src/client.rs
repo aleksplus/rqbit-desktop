@@ -23,6 +23,20 @@ use rqbit_protocol::{
 /// Result type all client methods return.
 pub type ClientResult<T> = Result<T, ProtoError>;
 
+/// Liveness of the transport between the UI and the backend, as reported by
+/// [`TorrentClient::connection_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// No connection has been established yet: the initial connect (or a
+    /// reconnect after the backend disappeared) is still in flight.
+    Connecting,
+    /// The transport is up; requests and pushed updates flow.
+    Connected,
+    /// The transport dropped — e.g. the backend process was closed — and the
+    /// client is retrying in the background.
+    Disconnected,
+}
+
 /// Where a torrent to add comes from, in UI terms. All three travel the
 /// wire (picked-file bytes included, so the browser client can add .torrent
 /// files through its file picker).
@@ -131,6 +145,14 @@ pub trait TorrentClient: 'static {
     /// Stream of pushed updates ([`PushUpdate::TorrentList`] and
     /// [`PushUpdate::SessionStats`]). Only consumed when [`Self::is_push`].
     fn updates(&self) -> LocalBoxStream<'static, PushUpdate> {
+        Box::pin(futures::stream::empty())
+    }
+
+    /// Stream of transport liveness ([`ConnectionState`]). Emits the current
+    /// state right away, then once per change. The default (in-process
+    /// clients) is an empty stream: the UI then assumes
+    /// [`ConnectionState::Connected`] forever.
+    fn connection_state(&self) -> LocalBoxStream<'static, ConnectionState> {
         Box::pin(futures::stream::empty())
     }
 }

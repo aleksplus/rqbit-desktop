@@ -32,7 +32,7 @@ use rqbit_protocol::{
 
 use futures::StreamExt as _;
 
-use crate::client::{AddTorrentRequest, ClientResult, TorrentClient, UiAddSource};
+use crate::client::{AddTorrentRequest, ClientResult, ConnectionState, TorrentClient, UiAddSource};
 use crate::host::UiHost;
 use crate::ui::add_torrent_dialog::{AddTorrentDialog, AddTorrentDialogEvent, AddTorrentEntry};
 
@@ -293,6 +293,13 @@ pub struct MainPanel {
     _stats_task: Option<Task<()>>,
     /// Keeps the push-update consumer alive for pushing clients.
     _updates_task: Option<Task<()>>,
+    /// Keeps the connection-state watcher alive (remote clients); the
+    /// in-process default is an empty stream, so the task ends immediately.
+    _connection_task: Option<Task<()>>,
+    /// Transport liveness, from `TorrentClient::connection_state`. Local
+    /// in-process clients never report otherwise. When not `Connected`, the
+    /// panel renders the disconnect placeholder on top of the (stale) UI.
+    connection: ConnectionState,
     /// Whether the window is currently active (focused). Only used to refresh
     /// immediately on re-activation; the periodic polling no longer depends
     /// on it.
@@ -375,6 +382,8 @@ impl MainPanel {
             }),
             _stats_task: None,
             _updates_task: None,
+            _connection_task: None,
+            connection: ConnectionState::Connected,
             window_active: true,
             focus_handle: cx.focus_handle(),
         };
@@ -474,11 +483,30 @@ impl MainPanel {
     /// that push updates get a push consumer; the rest (local in-process)
     /// get the classic 1-second polling loop.
     fn start_state_updates(&mut self, cx: &mut Context<Self>) {
+        self.start_connection_watch(cx);
         if self.client.is_push() {
             self.start_push_updates(cx);
         } else {
             self.start_stats_polling(cx);
         }
+    }
+
+    /// Track transport liveness for the disconnect placeholder. The default
+    /// (in-process clients) is an empty stream, so the watcher ends right
+    /// away and the panel stays `Connected` forever.
+    fn start_connection_watch(&mut self, cx: &mut Context<Self>) {
+        let mut states = self.client.connection_state();
+        let task = cx.spawn(async move |this, cx| {
+            while let Some(state) = states.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.connection != state {
+                        this.connection = state;
+                        cx.notify();
+                    }
+                });
+            }
+        });
+        self._connection_task = Some(task);
     }
 
     /// Periodically refresh session-wide stats (footer) and the torrent table.
@@ -596,11 +624,7 @@ impl MainPanel {
     fn fetch_torrents(&mut self, cx: &mut Context<Self>) {
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let list = client.list(true).await.ok();
-            let rows: Vec<TorrentRow> = list
-                .as_ref()
-                .map(|r| r.torrents.iter().map(TorrentRow::from_details).collect())
-                .unwrap_or_default();
+            let list = client.list(true).await;
             // Session default download folder — keeps default-folder torrents
             // out of destination-folder grouping. Best-effort: on error keep
             // whatever the delegate already knows.
@@ -612,8 +636,13 @@ impl MainPanel {
                         .delegate_mut()
                         .set_default_folder(default_folder.as_deref());
                 });
-                this.install_rows(rows, cx);
-                if let Some(list) = list {
+                // A failed fetch (e.g. the connection dropped) keeps the last
+                // good rows: the disconnect placeholder explains the staleness
+                // instead of the table silently emptying out.
+                if let Ok(list) = &list {
+                    let rows: Vec<TorrentRow> =
+                        list.torrents.iter().map(TorrentRow::from_details).collect();
+                    this.install_rows(rows, cx);
                     this.update_explorer(&list.torrents, cx);
                 }
             });
@@ -1191,6 +1220,12 @@ impl Render for MainPanel {
             })
             .child(self.render_content(cx))
             .child(self.render_footer(cx))
+            // The disconnect placeholder paints over the whole panel: the
+            // stale UI stays visible underneath, but nothing can be driven
+            // while the transport is down.
+            .when(self.connection != ConnectionState::Connected, |this| {
+                this.child(self.render_connection_placeholder(cx))
+            })
     }
 }
 
@@ -1358,6 +1393,63 @@ impl MainPanel {
                 .child(self.dock_area.clone())
                 .into_any_element(),
         })
+    }
+
+    /// Full-window placeholder shown while the transport is down (remote
+    /// clients): the last synced state stays visible underneath a translucent
+    /// backdrop, so the UI reads as "waiting for the app" instead of silently
+    /// frozen. Clicks are swallowed — nothing underneath can work anyway.
+    fn render_connection_placeholder(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (title, detail) = match self.connection {
+            ConnectionState::Connecting => (
+                "Connecting to the app…",
+                "Waiting for the rqbit app to accept the connection.",
+            ),
+            ConnectionState::Disconnected => (
+                "App is disconnected",
+                "The rqbit app seems to be closed. This page reconnects \
+                 automatically once it's running again.",
+            ),
+            // The overlay is only rendered when the transport is not up.
+            ConnectionState::Connected => return div().into_any_element(),
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .bg(theme.background.opacity(0.85))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+            .child(
+                v_flex()
+                    .max_w(px(420.))
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        Icon::default()
+                            .data(PLUG_SVG)
+                            .size(px(32.))
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(380.))
+                            .text_size(px(13.))
+                            .text_color(theme.muted_foreground)
+                            .child(detail),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Render the footer showing session-wide download/upload speed, DHT

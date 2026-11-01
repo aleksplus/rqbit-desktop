@@ -27,7 +27,7 @@ use rqbit_protocol::{
     TorrentList, TorrentStats,
 };
 
-use rqbit_ui::client::{AddTorrentRequest, ClientResult, TorrentClient};
+use rqbit_ui::client::{AddTorrentRequest, ClientResult, ConnectionState, TorrentClient};
 
 const RECONNECT_DELAY_MS: i32 = 2000;
 
@@ -52,6 +52,11 @@ struct State {
     /// Whether the log subscription should be re-sent after a reconnect.
     logs_subscribed: bool,
     pump_started: bool,
+    /// Current transport liveness, mirrored to `conn_tx` watchers on change.
+    connection: ConnectionState,
+    /// Created by `connection_state()`; the pump sends every state change
+    /// into it (only the latest subscriber is kept, mirroring `push_tx`).
+    conn_tx: Option<mpsc::UnboundedSender<ConnectionState>>,
 }
 
 impl RemoteClient {
@@ -67,6 +72,8 @@ impl RemoteClient {
                 log_tx: None,
                 logs_subscribed: false,
                 pump_started: false,
+                connection: ConnectionState::Connecting,
+                conn_tx: None,
             })),
         }
     }
@@ -131,6 +138,19 @@ fn fail_pending(state: &Rc<RefCell<State>>, message: &str) {
     }
 }
 
+/// Record a transport-liveness change and forward it to watchers. No-op when
+/// the state didn't actually change.
+fn set_connection(state: &Rc<RefCell<State>>, connection: ConnectionState) {
+    let mut st = state.borrow_mut();
+    if st.connection == connection {
+        return;
+    }
+    st.connection = connection;
+    if let Some(tx) = &st.conn_tx {
+        let _ = tx.unbounded_send(connection);
+    }
+}
+
 fn unexpected(payload: ResponsePayload, expected: &'static str) -> ProtoError {
     let got = match payload {
         ResponsePayload::List(_) => "List",
@@ -186,11 +206,14 @@ async fn pump_loop(
     mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     loop {
+        // Whether `connect_once` failed to connect or ran an established
+        // connection to its close, the socket is gone when it returns.
         if let Err(e) = connect_once(&url, &state, &mut out_rx).await {
             web_sys::console::error_1(
                 &format!("websocket error, retrying in {RECONNECT_DELAY_MS}ms: {e:?}").into(),
             );
         }
+        set_connection(&state, ConnectionState::Disconnected);
         fail_pending(&state, "connection lost");
         let _ = sleep_ms(RECONNECT_DELAY_MS).await;
     }
@@ -257,6 +280,8 @@ async fn connect_once(
             return Err(JsValue::from_str("connect aborted"));
         }
     }
+
+    set_connection(state, ConnectionState::Connected);
 
     // Connected: (re-)establish subscriptions. Client request frames queued
     // on `out_rx` while offline are flushed by the loop below.
@@ -434,6 +459,15 @@ impl TorrentClient for RemoteClient {
 
     fn is_push(&self) -> bool {
         true
+    }
+
+    fn connection_state(&self) -> LocalBoxStream<'static, ConnectionState> {
+        self.ensure_started();
+        let (tx, rx) = mpsc::unbounded::<ConnectionState>();
+        let mut st = self.state.borrow_mut();
+        let _ = tx.unbounded_send(st.connection);
+        st.conn_tx = Some(tx);
+        Box::pin(rx.map(|state| state))
     }
 
     fn updates(&self) -> LocalBoxStream<'static, PushUpdate> {
