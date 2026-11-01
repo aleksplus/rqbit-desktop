@@ -9,7 +9,10 @@
 //!    title and searched on api.myshows.me (JSON-RPC); the first result
 //!    carrying a poster wins. Cached per cleaned title.
 //! 3. Media preview — the largest completed video file's frame, extracted
-//!    with the system `ffmpeg` (an absent ffmpeg just disables this source).
+//!    with the system `ffmpeg` (looked up on `PATH`, falling back to the
+//!    known package-manager locations — see [`FFMPEG_FALLBACKS`] — since a
+//!    GUI launch inherits the system's minimal `PATH`; an absent ffmpeg just
+//!    disables this source).
 //!
 //! Every image a torrent ever resolved is kept as a *candidate* (at most
 //! one per source, ordered by priority): when a higher-priority source
@@ -88,6 +91,16 @@ const EXTRACT_TIMEOUT: Duration = Duration::from_secs(10);
 const PREVIEW_SEEK_SECS: u64 = 60;
 /// How long the artwork route waits for a lazy preview extraction.
 const EXTRACT_WAIT: Duration = Duration::from_secs(12);
+
+/// Where the preview stage looks for `ffmpeg` when a bare `ffmpeg` is not
+/// on `PATH`. GUI launches inherit the system's minimal PATH
+/// (`/usr/bin:/bin:…` on macOS), which misses the package-manager prefixes:
+/// Homebrew on Apple Silicon, Intel Homebrew, MacPorts.
+const FFMPEG_FALLBACKS: &[&str] = &[
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/opt/local/bin/ffmpeg",
+];
 
 /// Which artwork sources run. The hook poster is authoritative by
 /// construction (it is the user's own hook service answering); the MyShows
@@ -1144,7 +1157,10 @@ async fn extract_frame(path: &Path) -> Result<(Vec<u8>, &'static str), String> {
 async fn extract_frame_once(path: &Path, seek: bool) -> Result<(Vec<u8>, &'static str), String> {
     use std::process::Stdio;
 
-    let mut cmd = tokio::process::Command::new("ffmpeg");
+    let Some(ffmpeg) = find_ffmpeg() else {
+        return Err("ffmpeg not found".to_owned());
+    };
+    let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     if seek {
         cmd.args(["-ss", &PREVIEW_SEEK_SECS.to_string()]);
@@ -1177,6 +1193,44 @@ async fn extract_frame_once(path: &Path, seek: bool) -> Result<(Vec<u8>, &'stati
     detect_image(&output.stdout)
         .map(|content_type| (output.stdout, content_type))
         .ok_or_else(|| "ffmpeg produced no image".to_owned())
+}
+
+/// Locate `ffmpeg`: a hit on `PATH` first (shell sessions, custom installs),
+/// then the known package-manager locations — GUI launches inherit the
+/// system's minimal `PATH`, which misses them, and without the fallback the
+/// whole preview source silently never works in the app. Re-resolved per
+/// extraction rather than cached: a binary installed while the app runs
+/// must be picked up after the [`Failure::NoFfmpeg`] cooldown, and the
+/// lookup is a handful of stat calls.
+fn find_ffmpeg() -> Option<PathBuf> {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join("ffmpeg");
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    FFMPEG_FALLBACKS
+        .iter()
+        .map(Path::new)
+        .find(|p| is_executable(p))
+        .map(|p| {
+            tracing::info!(path = %p.display(), "ffmpeg found at a fallback path");
+            p.to_path_buf()
+        })
+}
+
+/// A regular file with an execute bit (unix); a regular file elsewhere.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
 }
 
 fn is_video_file(name: &str) -> bool {
@@ -1352,6 +1406,35 @@ mod tests {
         assert_eq!(detect_image(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(detect_image(b"RIFF1234WEBPVP8 "), Some("image/webp"));
         assert_eq!(detect_image(b"<html>"), None);
+    }
+
+    /// `is_executable` gates both the `PATH` scan and the fallback list:
+    /// a regular file without an execute bit (or a missing one) must not
+    /// resolve, one with the bit set must.
+    #[test]
+    fn is_executable_checks_the_execute_bit() {
+        let dir = std::env::temp_dir().join(format!(
+            "rqbit-ffmpeg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("ffmpeg");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(!is_executable(&exe));
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(is_executable(&exe));
+        // A directory named `ffmpeg` must not resolve either.
+        assert!(!is_executable(&dir));
+        assert!(!is_executable(&dir.join("missing")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The exact-match filter depends on `titleOriginal`: MyShows spells it
