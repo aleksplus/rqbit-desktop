@@ -165,7 +165,8 @@ impl Failure {
 struct ArtData {
     source: Source,
     /// Stable identity of the image within the source (URL hash, MyShows
-    /// show id, preview file index) — part of the UI cache key.
+    /// show id, info-hash-namespaced preview file index) — part of the UI
+    /// cache key, so it must not collide between different images.
     ident: String,
     /// Bumped when the image behind the same (source, ident) changes, so
     /// clients refetch.
@@ -546,7 +547,7 @@ impl ArtworkProvider {
         if self.opts.previews && self.entry_pending(hash, Source::Preview) {
             match self.preview_candidate(&torrent) {
                 Ok(Some((file_idx, path))) => {
-                    let ident = format!("f{file_idx}");
+                    let ident = preview_ident(hash, file_idx);
                     // A frame extracted by a previous run (or an earlier
                     // eviction) is served from the disk cache — no ffmpeg.
                     if let Some((bytes, content_type)) =
@@ -798,6 +799,7 @@ impl ArtworkProvider {
     /// learn artwork is coming; the route request triggers the extraction.
     /// Never downgrades a preview candidate whose bytes are already cached.
     fn advertise_preview(&self, hash: &str, file_idx: usize) {
+        let ident = preview_ident(hash, file_idx);
         let mut inner = self.inner.lock();
         let entry = inner.entries.entry(hash.to_owned()).or_default();
         if let Some(prev) = entry.candidate(Source::Preview) {
@@ -805,11 +807,10 @@ impl ArtworkProvider {
                 return;
             }
             // Already advertised for the same file — nothing to add.
-            if prev.ident == format!("f{file_idx}") {
+            if prev.ident == ident {
                 return;
             }
         }
-        let ident = format!("f{file_idx}");
         let rev = match entry.candidate(Source::Preview) {
             Some(prev) if prev.ident == ident => prev.rev,
             _ => 0,
@@ -836,7 +837,7 @@ impl ArtworkProvider {
         bytes: Vec<u8>,
         content_type: &'static str,
     ) {
-        let ident = format!("f{file_idx}");
+        let ident = preview_ident(hash, file_idx);
         let bytes: Arc<[u8]> = bytes.into();
         let mut inner = self.inner.lock();
         let Some(entry) = inner.entries.get_mut(hash) else {
@@ -1000,10 +1001,25 @@ fn priority(source: Source) -> u8 {
     }
 }
 
+/// The preview candidate's ident: the info-hash namespaces the file index.
+/// The ident is the whole image identity the UI caches by (its key is
+/// `source:ident#rev`, with no torrent of its own), so it must be globally
+/// unique across torrents — a bare `f{idx}` collides between any two
+/// torrents whose largest completed video is file 0, and the row then
+/// renders whichever torrent's image landed in that cache slot first.
+/// Hook idents (URL hash) and MyShows idents (`s{id}`) are unique already;
+/// the same ident on two torrents there means the same bytes (a shared
+/// poster), which is intended sharing. Hyphen, not `:` — idents end up in
+/// disk-cache filenames.
+fn preview_ident(hash: &str, file_idx: usize) -> String {
+    format!("{hash}-f{file_idx}")
+}
+
 /// Filename of one cached artwork candidate under the torrent's info-hash
 /// directory. Idents are filesystem-safe by construction (a hex hash, an
-/// `s{id}` show id, an `f{idx}` file index) and the info hash is validated
-/// to keep path traversal out even if a peer name ever leaked in.
+/// `s{id}` show id, an `{info-hash}-f{idx}` preview index) and the info
+/// hash is validated to keep path traversal out even if a peer name ever
+/// leaked in.
 fn cache_file(dir: &Path, hash: &str, source: Source, ident: &str) -> PathBuf {
     dir.join(hash)
         .join(format!("{}#{ident}.bin", source.as_str()))
@@ -1499,6 +1515,25 @@ mod tests {
         assert!(!valid_cache_hash(""));
         assert!(!valid_cache_hash("../../etc"));
         assert!(!valid_cache_hash(&"x".repeat(65)));
+    }
+
+    /// Preview idents must differ between torrents: the UI caches decoded
+    /// images by `source:ident#rev` alone, so a bare `f0` made two torrents'
+    /// preview candidates share one cache slot and the row rendered the
+    /// other torrent's poster. The info-hash namespaces the index; the
+    /// resulting disk-cache filename stays filesystem-safe.
+    #[test]
+    fn preview_idents_are_namespaced_per_torrent() {
+        assert_ne!(preview_ident("aaaa", 0), preview_ident("bbbb", 0));
+        assert_eq!(preview_ident("aaaa", 0), preview_ident("aaaa", 0));
+        assert_ne!(preview_ident("aaaa", 0), preview_ident("aaaa", 1));
+        let path = cache_file(
+            Path::new("/cache/artwork"),
+            "ab12",
+            Source::Preview,
+            &preview_ident("ab12", 3),
+        );
+        assert_eq!(path, Path::new("/cache/artwork/ab12/preview#ab12-f3.bin"));
     }
 
     #[test]
