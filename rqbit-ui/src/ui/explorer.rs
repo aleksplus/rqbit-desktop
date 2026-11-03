@@ -1020,9 +1020,18 @@ mod tests {
     #[test]
     fn disk_paths_join_and_require_a_folder() {
         assert_eq!(join_disk_path("", &["a".to_string()]), None);
+        // Expected through PathBuf: the separators are platform-native
+        // (`\` on Windows), which is what the open-folder and copy-path
+        // consumers want.
         assert_eq!(
             join_disk_path("/downloads", &["alpha", "b.txt"].map(String::from)),
-            Some("/downloads/alpha/b.txt".to_string())
+            Some(
+                PathBuf::from("/downloads")
+                    .join("alpha")
+                    .join("b.txt")
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
         // A torrent root (no components) joins to the folder itself.
         assert_eq!(
