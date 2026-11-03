@@ -14,7 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust_version: ["1.94", "1.97"]
+        # The GPUI dependency (gpui-pre >= 0.3.10) calls std::hint::cold_path,
+        # stabilized in Rust 1.98 — older toolchains can't compile it, and the
+        # crate has no feature to turn the profiler module off.
+        rust_version: ["1.98", "1.99"]
     steps:
       - name: rustup toolchain install ${{ matrix.rust_version }}
         run: |
@@ -78,6 +81,20 @@ jobs:
             libxkbcommon-x11-dev \
             libwayland-dev \
             libssl-dev
+
+      # Runner images no longer ship ffmpeg; the artwork tests need it to
+      # encode fixture videos (app-daemon/tests/artwork.rs `seeded_video`).
+      - name: Install ffmpeg
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg
+        if: ${{ matrix.os == 'macos-latest' }}
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: choco install ffmpeg -y --no-progress
 
       - name: Apply librqbit patch
         run: |

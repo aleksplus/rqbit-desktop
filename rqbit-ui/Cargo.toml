@@ -9,8 +9,8 @@ publish = false
 [dependencies]
 # gpui-kit pins the matching GPUI release (gpui-pre); the aliases below must
 # stay on the same exact versions as gpui-kit or the GPUI types would split.
-gpui = { package = "gpui-pre", version = "=0.3.10" }
-gpui-kit = "0.8.1"
+gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui-kit = "0.9.0"
 rqbit-protocol = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -21,7 +21,7 @@ serde_json = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
-gpui-kit = { version = "0.8.1", features = ["test-support"] }
+gpui-kit = { version = "0.9.0", features = ["test-support"] }
 
 [features]
 default = []
