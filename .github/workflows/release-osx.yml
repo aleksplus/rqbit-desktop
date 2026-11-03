@@ -1,12 +1,22 @@
 name: Release binaries for OSX
 
+# Releases are cut by pushing a tag, or manually from the Actions tab
+# ("Run workflow" with an existing tag). No builds on regular pushes.
 on:
   push:
     tags:
       - "*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. 0.0.9)"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
+  # The tag being released: the pushed tag, or the manually provided one.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   # Must match the `wasm-bindgen` crate version in Cargo.lock (see Makefile).
   WASM_BINDGEN_VERSION: 0.2.127
 
@@ -20,6 +30,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       # librqbit is used from crates.io with local patches (cargo-patch-crate):
       # materialize patched sources into target/patch/ before any build.
@@ -60,7 +72,7 @@ jobs:
       - name: Package arm64 app bundle and DMG
         run: |
           APP_NAME=rqbit-gpui-desktop
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           APP="target/artifacts/${APP_NAME}.app"
 
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -92,8 +104,45 @@ jobs:
           hdiutil create -volname "rqbit" -srcfolder "$APP" -ov -format UDZO \
             target/artifacts/desktop-gpui-osx-aarch64.dmg
 
+      # Human-readable changelog from commits since the previous tag, grouped
+      # by conventional prefix (fix:/feat:/...). generate_release_notes below
+      # appends GitHub's auto notes ("Full Changelog" link) on top of this body.
+      - name: Generate changelog
+        run: |
+          PREV=$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            RANGE="$PREV..$RELEASE_TAG"
+            echo "### Changes since $PREV" > release-body.md
+          else
+            RANGE="$RELEASE_TAG"
+            echo "### Changes" > release-body.md
+          fi
+          echo >> release-body.md
+          git log --no-merges --pretty=format:"%s (%h)" "$RANGE" > .release-commits.txt
+          # "|| true": grep exits non-zero when a category has no commits,
+          # which would kill the step under bash -eo pipefail.
+          feat=$(grep -E '^(feat|feature)(\(.*\))?[: ]' .release-commits.txt | sed -E 's/^(feat|feature)(\(.*\))?[: ]+/- /' || true)
+          fix=$(grep  -E '^fix(\(.*\))?[: ]' .release-commits.txt | sed -E 's/^fix(\(.*\))?[: ]+/- /' || true)
+          other=$(grep -Ev '^(feat|feature|fix)(\(.*\))?[: ]' .release-commits.txt | sed 's/^/- /' || true)
+          {
+            echo "### Features"
+            echo
+            echo "${feat:-(none)}"
+            echo
+            echo "### Bug fixes"
+            echo
+            echo "${fix:-(none)}"
+            echo
+            echo "### Other changes"
+            echo
+            echo "${other:-(none)}"
+            echo
+          } >> release-body.md
+
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          body_path: release-body.md
           generate_release_notes: true
           draft: true
           files: |
