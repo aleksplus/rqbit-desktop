@@ -45,7 +45,11 @@ jobs:
       - name: Apply librqbit patch
         run: |
           cargo install patch-crate --locked
-          cargo patch-crate
+          # --force re-applies onto a pristine copy: rust-cache can restore a
+          # target/ dir containing a stale or partial target/patch/, and the
+          # plain invocation then skips and leaves cargo's [patch.crates-io]
+          # path pointing at an unusable source.
+          cargo patch-crate --force
 
       - name: cargo check
         run: cargo check
@@ -99,7 +103,10 @@ jobs:
       - name: Apply librqbit patch
         run: |
           cargo install patch-crate --locked
-          cargo patch-crate
+          # --force re-applies onto a pristine copy: rust-cache restores the
+          # whole target/ dir (incl. target/patch/), and the plain invocation
+          # then skips, leaving a stale or partial patched source behind.
+          cargo patch-crate --force
 
       - name: Run tests
         if: ${{ matrix.os == 'windows-latest' }}
