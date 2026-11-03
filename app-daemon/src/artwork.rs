@@ -1219,11 +1219,21 @@ async fn extract_frame_once(path: &Path, seek: bool) -> Result<(Vec<u8>, &'stati
 /// must be picked up after the [`Failure::NoFfmpeg`] cooldown, and the
 /// lookup is a handful of stat calls.
 fn find_ffmpeg() -> Option<PathBuf> {
+    // Windows binaries carry a `.exe` suffix: `Command::new("ffmpeg")` gets
+    // it appended by the OS resolver, but this manual PATH scan must check
+    // the suffixed spelling itself.
+    let names: &[&str] = if cfg!(windows) {
+        &["ffmpeg.exe", "ffmpeg"]
+    } else {
+        &["ffmpeg"]
+    };
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("ffmpeg");
-            if is_executable(&candidate) {
-                return Some(candidate);
+            for name in names {
+                let candidate = dir.join(name);
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
             }
         }
     }
