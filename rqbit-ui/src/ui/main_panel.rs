@@ -653,6 +653,16 @@ impl MainPanel {
     /// Install a freshly fetched torrent list into the table, preserving the
     /// selection by torrent ID and re-applying filter + sort.
     fn install_rows(&mut self, rows: Vec<TorrentRow>, cx: &mut Context<Self>) {
+        // Close the detail panel when the torrent it displays no longer
+        // exists in the refreshed list — it was deleted or removed
+        // externally. Checked against the full list, not the filtered view,
+        // so a torrent merely hidden by the filter keeps its panel open.
+        if let Some(panel) = &self.detail_panel {
+            let shown = panel.read(cx).torrent_id();
+            if rows.iter().all(|r| r.id as usize != shown) {
+                self.close_details(cx);
+            }
+        }
         self.table_state.update(cx, |state, cx| {
             // Preserve selected torrent IDs across refresh by matching after update.
             let prev_selected_ids: HashSet<u64> = state

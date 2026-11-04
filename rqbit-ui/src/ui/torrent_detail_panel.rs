@@ -144,6 +144,11 @@ impl TorrentDetailPanel {
         this
     }
 
+    /// The torrent the panel is currently displaying.
+    pub fn torrent_id(&self) -> usize {
+        self.torrent_id
+    }
+
     /// Switch the panel to display a different torrent, refreshing data.
     pub fn switch_torrent(&mut self, torrent_id: usize, cx: &mut Context<Self>) {
         if self.torrent_id == torrent_id {
