@@ -37,15 +37,17 @@
 //! Values must be JSON scalars (string / number / bool); they are stored as
 //! strings. Column entries with empty or duplicate keys are dropped, the
 //! column count is capped, and value strings are truncated — a misbehaving
-//! hook cannot break the layout. Image-kind columns (`"kind": "image"`)
-//! carry `http(s)://` URLs (up to 512 chars): the torrent table renders them
-//! as thumbnails, and a torrent-level column keyed `poster` additionally
-//! becomes the torrent's artwork reference for `artwork.rs` (see the
-//! "Hook poster" priority there). An empty response body means "no columns
-//! right now" (the hook counts as connected). Errors flip the snapshot's
-//! `connected` flag to false (the UI then hides the columns and shows the
-//! offline plug) and are logged at `warn!` level, which reaches both UIs'
-//! log pages through the shared log broadcast.
+//! hook cannot break the layout. Image- and Link-kind columns
+//! (`"kind": "image"` / `"kind": "link"`) carry `http(s)://` URLs (up to
+//! 512 chars): the torrent table renders image cells as thumbnails and link
+//! cells as clickable links that open in the browser, and a torrent-level
+//! column keyed `poster` additionally becomes the torrent's artwork
+//! reference for `artwork.rs` (see the "Hook poster" priority there). An
+//! empty response body means "no columns right now" (the hook counts as
+//! connected). Errors flip the snapshot's `connected` flag to false (the UI
+//! then hides the columns and shows the offline plug) and are logged at
+//! `warn!` level, which reaches both UIs' log pages through the shared log
+//! broadcast.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -259,8 +261,9 @@ fn parse_snapshot(
 
 /// JSON scalars keyed by column key → stored strings. Unknown keys and
 /// non-scalar values (objects/arrays/null) are not renderable and are
-/// dropped. Image columns require `http(s)://` string values (they become
-/// artwork references) and allow a longer cap; other columns are plain text.
+/// dropped. Image and Link columns require `http(s)://` string values
+/// (artwork references / openable links) and allow a longer cap; other
+/// columns are plain text.
 fn sanitize_values(
     values: BTreeMap<String, serde_json::Value>,
     declared: &HashSet<&str>,
@@ -270,7 +273,9 @@ fn sanitize_values(
         .into_iter()
         .filter(|(k, _)| declared.contains(k.as_str()))
         .filter_map(|(k, v)| match kinds.get(k.as_str()) {
-            Some(CustomColumnKind::Image) => image_url_to_string(&v).map(|url| (k, url)),
+            Some(CustomColumnKind::Image | CustomColumnKind::Link) => {
+                http_url_to_string(&v).map(|url| (k, url))
+            }
             _ => scalar_to_string(&v).map(|v| (k, v)),
         })
         .collect()
@@ -287,9 +292,10 @@ fn scalar_to_string(v: &serde_json::Value) -> Option<String> {
     Some(truncate(&s, MAX_VALUE_LEN))
 }
 
-/// Image-column value → stored URL. Only `http(s)://` strings are kept
-/// (anything else cannot be fetched), capped at [`MAX_URL_VALUE_LEN`].
-fn image_url_to_string(v: &serde_json::Value) -> Option<String> {
+/// Image/Link-column value → stored URL. Only `http(s)://` strings are kept
+/// (anything else cannot be fetched or opened), capped at
+/// [`MAX_URL_VALUE_LEN`].
+fn http_url_to_string(v: &serde_json::Value) -> Option<String> {
     let serde_json::Value::String(s) = v else {
         return None;
     };
@@ -667,6 +673,60 @@ mod tests {
         assert_eq!(values.get("k").map(String::as_str), Some("42"));
         assert!(!values.contains_key("unknown"));
         assert!(!values.contains_key("obj"));
+    }
+
+    #[test]
+    fn link_values_validated_like_images() {
+        let body = json!({
+            "columns": [{ "key": "episode", "files": true, "kind": "link" }],
+            "torrents": {
+                "h1": {
+                    "episode": "https://myshows.me/view/episode/123/",
+                    "ftp": "ftp://example.com/x"
+                },
+                "h2": { "episode": "myshows.me/view/episode/5/" }
+            },
+            "files": {
+                "h1": [
+                    { "index": 0, "values": { "episode": "http://myshows.me/view/episode/9/" } },
+                    { "index": 1, "values": { "episode": "myshows.me/view/episode/10/" } },
+                    { "index": 2, "values": { "episode": 42 } }
+                ]
+            }
+        });
+        let snapshot = parse_snapshot("s", Some(&body)).unwrap();
+        // Torrent-level: the https URL is kept under the declared key; a
+        // value keyed by a non-declared key is dropped regardless of shape,
+        // and a scheme-less URL under the declared key is dropped too.
+        let torrent = &snapshot.torrent_values["h1"];
+        assert_eq!(
+            torrent.get("episode").map(String::as_str),
+            Some("https://myshows.me/view/episode/123/")
+        );
+        assert!(!torrent.contains_key("ftp"));
+        assert!(!snapshot.torrent_values.contains_key("h2"));
+        // Per-file: http kept; non-http(s) strings and non-strings dropped.
+        let files = &snapshot.file_values["h1"];
+        assert_eq!(
+            files[&0].get("episode").map(String::as_str),
+            Some("http://myshows.me/view/episode/9/")
+        );
+        assert!(!files.contains_key(&1));
+        assert!(!files.contains_key(&2));
+    }
+
+    #[test]
+    fn link_values_use_the_url_cap() {
+        let long = format!("https://myshows.me/view/episode/{}/", "9".repeat(600));
+        let body = json!({
+            "columns": [{ "key": "episode", "kind": "link" }],
+            "torrents": { "h1": { "episode": long } }
+        });
+        let snapshot = parse_snapshot("s", Some(&body)).unwrap();
+        assert_eq!(
+            snapshot.torrent_values["h1"]["episode"].len(),
+            MAX_URL_VALUE_LEN
+        );
     }
 
     #[test]

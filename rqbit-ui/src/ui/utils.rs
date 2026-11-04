@@ -2,12 +2,16 @@
 
 use std::sync::Arc;
 
-use gpui::{App, Div, ParentElement as _, Styled, div};
-use gpui_kit::component::{Theme, menu::PopupMenuItem};
+use gpui::{
+    App, Div, ElementId, InteractiveElement as _, ParentElement as _,
+    StatefulInteractiveElement as _, Styled, div,
+};
+use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, menu::PopupMenuItem};
 
 use rqbit_protocol::{ApiAddTorrent, CustomColumnKind, TorrentAction, TorrentId};
 
 use crate::client::{AddTorrentRequest, TorrentClient, UiAddSource};
+use crate::host::UiHost;
 use crate::ui::{add_torrent_dialog::AddTorrentEntry, file_table::FileRow};
 
 /// Binary unit multipliers (powers of 1024), computed once and reused.
@@ -118,6 +122,35 @@ pub fn render_custom_cell(value: &str, kind: CustomColumnKind, theme: &Theme) ->
         return div().text_color(color).child(value.to_string());
     }
     div().child(value.to_string())
+}
+
+/// Render one hook-provided Link-kind custom-column cell: a small link
+/// icon (theme link color) that opens the URL in the browser on click —
+/// the URL itself is not shown, the column header names the target. Values
+/// that don't look like http(s) URLs — or a missing host (the add-torrent
+/// dialog has none) — render as an empty cell; the daemon normally filters
+/// non-URL values out already.
+pub fn render_link_cell(
+    id: impl Into<ElementId>,
+    url: &str,
+    host: Option<&Arc<dyn UiHost>>,
+    theme: &Theme,
+) -> Div {
+    let openable = host.is_some() && (url.starts_with("http://") || url.starts_with("https://"));
+    if !openable {
+        return div().size_full();
+    }
+    let host = host.unwrap().clone();
+    let url = url.to_string();
+    div().size_full().flex().items_center().child(
+        div()
+            .id(id)
+            .cursor_pointer()
+            .text_color(theme.link)
+            .hover(|s| s.text_color(theme.link_hover))
+            .child(Icon::new(IconName::ExternalLink).small())
+            .on_click(move |_, _, _| host.open_url(&url)),
+    )
 }
 
 /// File extensions treated as playable media (video and audio), matching

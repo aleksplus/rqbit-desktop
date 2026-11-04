@@ -410,7 +410,7 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
   ```json
   {
     "columns": [ { "key": "sync_status", "name": "Sync", "files": false,
-                   "kind": "text" | "status" | "image", "width": 100 } ],
+                   "kind": "text" | "status" | "image" | "link", "width": 100 } ],
     "torrents": { "<info_hash>": { "sync_status": "synced" } },
     "files": { "<info_hash>": [ { "index": 0,
                                   "values": { "sync_status": "synced" } } ] }
@@ -422,9 +422,15 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
   must be JSON scalars and are truncated to 64 chars; value keys not
   matching a declared column are ignored. An empty 2xx body means
   "connected, no columns right now".
-* Image-kind columns: the value must be an `http(s)://` URL (anything else
-  is dropped) and is allowed to run to 512 chars. `text`/`status` cells
-  render as text; an `image` cell renders as a small thumbnail. A
+* Image- and Link-kind columns: the value must be an `http(s)://` URL
+  (anything else is dropped) and is allowed to run to 512 chars.
+  `text`/`status` cells render as text; an `image` cell renders as a small
+  thumbnail; a `link` cell renders as a small link icon (Overview: an
+  `Open` button with the URL as its tooltip) that opens the URL in the
+  browser — in the torrent list, in the file list (per-file values, e.g. a
+  MyShows episode link), and on the detail panel's Overview tab, which
+  shows every declared torrent-level column with a value (status values
+  tone-tinted). A
   torrent-level `image` column keyed **`poster`** additionally becomes the
   torrent's *artwork* — the daemon downloads the image, serves it from
   `/torrents/by-hash/{hash}/artwork` and decorates the payloads with
@@ -468,7 +474,9 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
     subscribers and decorates `List`/`Details` responses, giving the
     browser client the same data.
   * UI: dynamic columns are appended to the torrent and file tables only
-    while `connected` is true; the status bar shows a green plug + hook name
+    while `connected` is true; the detail Overview additionally shows the
+    torrent-level values (its "Links" section); the status bar shows a
+    green plug + hook name
     when connected, a gray one + "offline" when configured but unreachable,
     and nothing when no hook provides columns.
 * Logging: `info!("column hook connected")` on reconnect,

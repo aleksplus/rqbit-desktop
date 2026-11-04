@@ -20,7 +20,7 @@ use crate::host::UiHost;
 use crate::ui::artwork::{ArtworkShape, ROW_WEDGE_HEIGHT, ROW_WEDGE_WIDTH, masked_artwork};
 use crate::ui::main_panel::MainPanel;
 use crate::ui::utils::{
-    format_bytes, format_eta, format_speed, is_media_file, render_custom_cell,
+    format_bytes, format_eta, format_speed, is_media_file, render_custom_cell, render_link_cell,
     torrent_action_menu_item, torrent_bulk_action_menu_item,
 };
 
@@ -846,8 +846,8 @@ impl TableDelegate for TorrentTableDelegate {
             "up" => div().child(row.up_speed.clone()),
             "uploaded" => div().child(row.uploaded.clone()),
             "eta" => div().child(row.eta.clone()),
-            // Hook-provided dynamic columns: text, a tinted status badge, or
-            // a small thumbnail for Image-kind columns.
+            // Hook-provided dynamic columns: text, a tinted status badge, a
+            // small thumbnail for Image-kind columns, or a clickable link.
             _ => match self.custom_kinds.get(col.key.as_ref()).copied() {
                 Some(CustomColumnKind::Image) => self.render_image_cell(
                     row.custom
@@ -855,6 +855,15 @@ impl TableDelegate for TorrentTableDelegate {
                         .map(String::as_str)
                         .unwrap_or(""),
                     cx,
+                ),
+                Some(CustomColumnKind::Link) => render_link_cell(
+                    SharedString::from(format!("custom-link-{}-{row_ix}", col.key.as_ref())),
+                    row.custom
+                        .get(col.key.as_ref())
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    Some(&self.host),
+                    cx.theme(),
                 ),
                 Some(kind) => render_custom_cell(
                     row.custom

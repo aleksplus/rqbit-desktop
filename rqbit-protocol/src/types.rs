@@ -183,6 +183,13 @@ pub enum CustomColumnKind {
     /// `poster` is additionally promoted to the torrent's
     /// [`TorrentDetails::artwork`].
     Image,
+    /// The value is an `http(s)://` URL (validated by the daemon, same rules
+    /// as [`CustomColumnKind::Image`]); rendered as a clickable link that
+    /// opens in the browser (torrent list, file list, detail Overview).
+    ///
+    /// Appended last on purpose: postcard encodes variants by ordinal, so
+    /// reordering would break the wire against a running peer build.
+    Link,
 }
 
 /// Per-torrent artwork shown behind the detail panel's Overview tab and in

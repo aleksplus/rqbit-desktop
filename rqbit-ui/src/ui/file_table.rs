@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use rqbit_protocol::{CustomColumnKind, CustomColumnSpec, CustomColumnsState};
 
-use crate::ui::utils::{is_media_file, render_custom_cell};
+use crate::host::UiHost;
+use crate::ui::utils::{is_media_file, render_custom_cell, render_link_cell};
 
 /// A single row in a file-selection table.
 #[derive(Clone)]
@@ -57,6 +58,10 @@ pub struct FileTableDelegate {
     pub on_media_play: Option<OnMediaPlay>,
     /// Invoked when the user copies a media file's stream URL.
     pub on_copy_stream_url: Option<OnCopyStreamUrl>,
+    /// Host services, used to open Link-kind custom-column URLs in the
+    /// browser. `None` (the add-torrent dialog, which has no custom columns
+    /// either) renders link cells as inert text.
+    pub host: Option<Arc<dyn UiHost>>,
     /// Whether to show the per-file Progress column. Only enabled in the
     /// torrent detail panel (where live stats are available); the add-torrent
     /// dialog leaves this off.
@@ -92,6 +97,7 @@ impl FileTableDelegate {
             on_toggle_all: None,
             on_media_play: None,
             on_copy_stream_url: None,
+            host: None,
             show_progress: false,
             show_media_actions: false,
             custom_specs: Vec::new(),
@@ -394,7 +400,8 @@ impl TableDelegate for FileTableDelegate {
                     )
                     .into_any_element()
             }
-            // Hook-provided dynamic columns: text or a tinted status badge.
+            // Hook-provided dynamic columns: text, a tinted status badge, or
+            // a clickable link.
             _ => match self.custom_kinds.get(col.key.as_ref()).copied() {
                 Some(kind) => {
                     let value = row
@@ -402,7 +409,19 @@ impl TableDelegate for FileTableDelegate {
                         .get(col.key.as_ref())
                         .map(String::as_str)
                         .unwrap_or("");
-                    render_custom_cell(value, kind, cx.theme()).into_any_element()
+                    match kind {
+                        CustomColumnKind::Link => render_link_cell(
+                            SharedString::from(format!(
+                                "custom-link-{}-{row_ix}",
+                                col.key.as_ref()
+                            )),
+                            value,
+                            self.host.as_ref(),
+                            cx.theme(),
+                        )
+                        .into_any_element(),
+                        _ => render_custom_cell(value, kind, cx.theme()).into_any_element(),
+                    }
                 }
                 None => div().into_any_element(),
             },

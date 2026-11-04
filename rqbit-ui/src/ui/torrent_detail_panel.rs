@@ -14,13 +14,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rqbit_protocol::{PeerEntry, PeerStatsSnapshot, TorrentDetails, TorrentId, TorrentStats};
+use rqbit_protocol::{
+    CustomColumnKind, CustomColumnsState, PeerEntry, PeerStatsSnapshot, TorrentDetails, TorrentId,
+    TorrentStats,
+};
 
 use crate::client::TorrentClient;
 use crate::host::UiHost;
 use crate::ui::artwork::{ArtworkShape, DETAIL_ARTWORK_SIZE, masked_artwork};
 use crate::ui::file_table::{FileRow, FileTableDelegate};
-use crate::ui::utils::{format_bytes, format_speed};
+use crate::ui::utils::{StatusTone, format_bytes, format_speed, status_tone};
 
 /// Events emitted by [`TorrentDetailPanel`] to communicate with the parent view.
 #[derive(Clone, Debug)]
@@ -50,6 +53,9 @@ pub struct TorrentDetailPanel {
     stats: Option<TorrentStats>,
     comment: Option<String>,
     peer_stats: Option<PeerStatsSnapshot>,
+    /// Hook-provided column specs (kinds + labels), fetched alongside the
+    /// details so the Overview can render torrent-level custom values.
+    custom_columns: Option<CustomColumnsState>,
     file_table_state: Entity<TableState<FileTableDelegate>>,
     peer_table_state: Entity<TableState<PeerTableDelegate>>,
     focus_handle: FocusHandle,
@@ -79,6 +85,8 @@ impl TorrentDetailPanel {
             delegate.show_progress();
             delegate.show_media_actions();
             delegate.set_table(cx.entity().downgrade());
+            // Link-kind custom-column cells open their URLs via the host.
+            delegate.host = Some(host.clone());
             delegate.on_toggle = Some(Arc::new({
                 let panel = panel_weak.clone();
                 move |file_index, included, cx| {
@@ -133,6 +141,7 @@ impl TorrentDetailPanel {
             stats: None,
             comment: None,
             peer_stats: None,
+            custom_columns: None,
             file_table_state,
             peer_table_state,
             focus_handle: cx.focus_handle(),
@@ -176,6 +185,9 @@ impl TorrentDetailPanel {
             let custom_columns = client.custom_columns().await;
 
             let _ = this.update(cx, |this, cx| {
+                // Column specs for the Overview's torrent-level custom rows
+                // (the file table's copy lives on the delegate below).
+                this.custom_columns = custom_columns.clone();
                 if let Ok(d) = &details {
                     let file_progress = stats
                         .as_ref()
@@ -662,6 +674,7 @@ impl TorrentDetailPanel {
                             )
                     })),
             )
+            .children(self.render_custom_overview(cx))
             .child(
                 v_flex()
                     .gap_2()
@@ -701,6 +714,80 @@ impl TorrentDetailPanel {
                         ),
                 )
             })
+    }
+
+    /// The Overview's hook-provided section: every declared custom column
+    /// that carries a torrent-level value on the details payload — including
+    /// file-level columns that also carry a torrent-level value (a `movie`
+    /// column can link the torrent in the Overview and each file in the file
+    /// list). Link-kind values render an "Open" button (the URL in its
+    /// tooltip) that opens the browser, status values render
+    /// tone-tinted, the rest as plain text. (Image columns are skipped:
+    /// their URLs are already shown as the corner artwork.)
+    fn render_custom_overview(&self, cx: &Context<Self>) -> Option<Div> {
+        let custom = self.details.as_ref()?.custom.as_ref()?;
+        let specs = &self.custom_columns.as_ref()?.columns;
+        let rows: Vec<_> = specs
+            .iter()
+            .filter(|spec| spec.kind != CustomColumnKind::Image)
+            .filter_map(|spec| custom.get(&spec.key).map(|value| (spec, value)))
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        Some(
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Links"),
+                )
+                .children(rows.into_iter().map(|(spec, value)| {
+                    let label = div()
+                        .w(px(140.))
+                        .flex_shrink_0()
+                        .text_color(theme.muted_foreground)
+                        .child(spec.name.clone());
+                    match spec.kind {
+                        CustomColumnKind::Link => {
+                            let host = self.host.clone();
+                            let url = value.clone();
+                            h_flex().gap_2().items_center().child(label).child(
+                                Button::new(SharedString::from(format!(
+                                    "overview-link-{}",
+                                    spec.key
+                                )))
+                                .link()
+                                .label("Open")
+                                // The URL itself is not displayed — the
+                                // tooltip is where it stays inspectable.
+                                .tooltip(url.clone())
+                                .on_click(move |_, _, _| host.open_url(&url)),
+                            )
+                        }
+                        CustomColumnKind::Status => {
+                            let mut row = h_flex()
+                                .gap_2()
+                                .child(label)
+                                .child(div().flex_1().child(value.clone()));
+                            match status_tone(value) {
+                                Some(StatusTone::Success) => row = row.text_color(theme.success),
+                                Some(StatusTone::Warning) => row = row.text_color(theme.warning),
+                                Some(StatusTone::Danger) => row = row.text_color(theme.danger),
+                                None => {}
+                            }
+                            row
+                        }
+                        CustomColumnKind::Text | CustomColumnKind::Image => h_flex()
+                            .gap_2()
+                            .child(label)
+                            .child(div().flex_1().child(value.clone())),
+                    }
+                })),
+        )
     }
 
     fn render_trackers(&self, _cx: &mut Context<Self>) -> impl IntoElement {
