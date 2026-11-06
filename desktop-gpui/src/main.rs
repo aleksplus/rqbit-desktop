@@ -15,6 +15,7 @@ mod ui;
 mod web_settings;
 
 mod state;
+mod task_profiler;
 use crate::{
     desktop_host::DesktopHost, events::hold_to_quit_view::HoldToQuitView,
     local_client::LocalClient, state::State,
@@ -54,6 +55,8 @@ use librqbit::tracing_subscriber_config_utils::{InitLoggingOptions, init_logging
 
 #[tokio::main]
 async fn main() {
+    task_profiler::maybe_start();
+
     // Logging
     let init_logging_result = init_logging(InitLoggingOptions {
         default_rust_log_value: Some("info"),
