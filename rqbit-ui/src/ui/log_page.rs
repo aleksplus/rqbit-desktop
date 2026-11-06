@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::prelude::FluentBuilder as _;
@@ -17,6 +17,18 @@ use crate::client::TorrentClient;
 /// Maximum number of log lines kept in the viewer (and re-synced into the
 /// textarea). Older lines are dropped from the front.
 const MAX_LINES: usize = 10_000;
+
+/// Formatted lines collected per wake before applying what was collected. A
+/// lagging broadcast receiver replays the whole channel ring as
+/// immediately-ready items; without a cap a single wake would monopolize the
+/// main thread with one huge textarea insert. At the producer's
+/// one-line-per-chunk cadence this is 64 chunks per batch.
+const MAX_DRAIN_CHUNKS: usize = 64;
+
+/// Pause between capped drains while the stream stays saturated, so a lag
+/// storm cannot turn this task into a back-to-back main-thread loop and
+/// starve the rest of the foreground executor.
+const DRAIN_COOLDOWN: Duration = Duration::from_millis(50);
 
 /// Events emitted by [`LogPage`] to communicate with the parent view.
 #[derive(Clone, Debug)]
@@ -91,17 +103,27 @@ impl LogPage {
             };
             let mut ended = false;
             while !ended {
-                // Block until the first chunk arrives, then drain everything
-                // that is already ready so each wake applies a single batch.
+                // Block until the first chunk arrives, then drain up to
+                // MAX_DRAIN_CHUNKS of the chunks that are already ready so
+                // each wake applies a single batch.
                 let mut batch: Vec<String> = Vec::new();
                 match stream.next().await {
                     Some(bytes) => format_chunk(&bytes, &mut batch),
                     None => break,
                 }
+                let mut saturated = false;
                 loop {
                     match stream.next().now_or_never() {
                         None => break, // nothing more ready right now
-                        Some(Some(bytes)) => format_chunk(&bytes, &mut batch),
+                        Some(Some(bytes)) => {
+                            format_chunk(&bytes, &mut batch);
+                            if batch.len() >= MAX_DRAIN_CHUNKS {
+                                // More may be pending; apply this batch now
+                                // and pace the rest (see DRAIN_COOLDOWN).
+                                saturated = true;
+                                break;
+                            }
+                        }
                         Some(None) => {
                             ended = true;
                             break;
@@ -116,6 +138,9 @@ impl LogPage {
                 if res.is_err() {
                     // Window or page is gone; stop consuming.
                     break;
+                }
+                if saturated && !ended {
+                    cx.background_executor().timer(DRAIN_COOLDOWN).await;
                 }
             }
         });
