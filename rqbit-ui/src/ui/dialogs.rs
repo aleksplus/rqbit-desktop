@@ -1,4 +1,4 @@
-use gpui::*;
+use gpui_kit::*;
 use gpui_kit::component::{
     ActiveTheme as _, StyledExt as _,
     checkbox::Checkbox,

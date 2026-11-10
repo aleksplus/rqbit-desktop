@@ -7,7 +7,7 @@ use std::future::Future;
 
 use std::sync::Arc;
 
-use gpui::{AnyView, Context, Window};
+use gpui_kit::{AnyView, App, Context, Window};
 
 use crate::client::{TorrentClient, UiAddSource};
 use crate::ui::add_torrent_dialog::AddTorrentEntry;
@@ -154,7 +154,7 @@ pub trait UiHost: 'static {
     /// `Ok(vec![])` when the user cancels, `Err` when unsupported.
     fn pick_torrent_files(
         &self,
-        cx: &mut gpui::App,
+        cx: &mut App,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<PickedTorrentFile>, String>> + 'static>>
     {
         let _ = cx;

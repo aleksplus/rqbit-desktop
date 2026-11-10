@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use gpui::*;
+use gpui_kit::*;
 use gpui_kit::base::input as input_actions;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -22,7 +22,7 @@ use crate::{
 };
 use rqbit_ui::ui::dialogs::AboutInfo;
 use rqbit_ui::ui::main_panel::MainPanel;
-impl gpui::Global for State {}
+impl Global for State {}
 
 // App-menu actions, dispatched by the native macOS menu bar (see `set_menus`
 // below) and handled by the global listeners registered after the window
@@ -83,7 +83,7 @@ async fn main() {
     info!("GPUI application started – state ready");
 
     // Run GPUI
-    let platform = gpui_platform::application().with_assets(gpui_kit::assets::Assets);
+    let platform = platform::application().with_assets(assets::Assets);
     platform.run(move |cx: &mut App| {
         // Store the state globally so all windows/views can access it
         cx.set_global(shared_state.clone());

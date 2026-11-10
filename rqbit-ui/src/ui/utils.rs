@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{
+use gpui_kit::{
     App, Div, ElementId, InteractiveElement as _, ParentElement as _,
     StatefulInteractiveElement as _, Styled, div,
 };

@@ -1,7 +1,7 @@
 //! Torrent list table: row model, selection/sort state, and cell rendering.
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, checkbox::Checkbox, h_flex,

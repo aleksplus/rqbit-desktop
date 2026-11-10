@@ -1,5 +1,5 @@
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use gpui_kit::component::dock::{
     BasePanel, DockArea, DockLayout, DockPlacement, DockSkin, DockToggleEvent, NodeId, PaneRef,
     Panel as DockPanel, PanelControl, PanelEvent, PanelId, PanelStyle, panel_handle,

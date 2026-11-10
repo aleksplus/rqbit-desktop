@@ -8,7 +8,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{AnyView, App, AppContext as _, Context, Window};
+use gpui_kit::{AnyView, App, AppContext as _, Context, Window, PathPromptOptions};
 use rqbit_ui::client::TorrentClient;
 use rqbit_ui::host::{PickedTorrentFile, UiCapabilities, UiHost};
 use rqbit_ui::ui::add_torrent_dialog::AddTorrentEntry;
@@ -191,7 +191,7 @@ impl UiHost for DesktopHost {
         cx: &mut App,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<PickedTorrentFile>, String>> + 'static>>
     {
-        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: true,

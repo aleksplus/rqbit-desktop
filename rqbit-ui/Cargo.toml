@@ -1,27 +1,27 @@
 [package]
-name = "rqbit-ui"
-version.workspace = true
-edition = "2024"
 description = "GPUI views and client abstraction shared by the rqbit desktop app and the browser (wasm) client"
+edition = "2024"
 license = "MIT"
+name = "rqbit-ui"
 publish = false
+version.workspace = true
 
 [dependencies]
-# gpui-kit pins the matching GPUI release (gpui-pre); the aliases below must
-# stay on the same exact versions as gpui-kit or the GPUI types would split.
-gpui = { package = "gpui-pre", version = "=0.3.11" }
-gpui-kit = "0.9.0"
-rqbit-protocol = { workspace = true }
-async-trait = { workspace = true }
-futures = { workspace = true }
-serde_json = { workspace = true }
+# gpui-kit with "gpui-fast" feature selects gpui-fast 0.1.13 (aligned with gpui-pre 0.3.11)
+# This is the correct migration path for gpui-kit applications.
+# Types are re-exported from gpui_kit (gpui_kit::*, gpui_kit::platform, gpui_kit::web)
+async-trait = {workspace = true}
+futures = {workspace = true}
+gpui-kit = {version = "0.9.0", features = ["gpui-fast"]}
+rqbit-protocol = {workspace = true}
+serde_json = {workspace = true}
 # Artwork decoding + masking (posters/previews). Version must stay compatible
-# with gpui-pre's `image` dependency so `image::Frame` types unify with
+# with gpui-fast's `image` dependency so `image::Frame` types unify with
 # `RenderImage::new`.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = {version = "0.25", default-features = false, features = ["png", "jpeg", "webp"]}
 
 [dev-dependencies]
-gpui-kit = { version = "0.9.0", features = ["test-support"] }
+gpui-kit = {version = "0.9.0", features = ["test-support"]}
 
 [features]
 default = []

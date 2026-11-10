@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{
+use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div, px,
 };

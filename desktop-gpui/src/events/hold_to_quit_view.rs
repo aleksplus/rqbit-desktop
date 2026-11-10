@@ -1,4 +1,4 @@
-use gpui::*;
+use gpui_kit::*;
 use rqbit_ui::ui::main_panel::MainPanel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

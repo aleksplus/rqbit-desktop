@@ -1,12 +1,12 @@
 [workspace]
-resolver = "2"
 members = [
-    "desktop-gpui",
-    "app-daemon",
-    "rqbit-protocol",
-    "rqbit-ui",
-    "web-gpui",
+  "desktop-gpui",
+  "app-daemon",
+  "rqbit-protocol",
+  "rqbit-ui",
+  "web-gpui",
 ]
+resolver = "2"
 
 [workspace.package]
 version = "0.0.10"
@@ -15,28 +15,28 @@ version = "0.0.10"
 panic = "abort"
 
 [profile.release]
-panic = "abort"
 debug = false
 lto = "thin"
+panic = "abort"
 
 [profile.release-github]
 inherits = "release"
 lto = false
 
 [profile.release-debug]
-inherits = "release"
 debug = true
+inherits = "release"
 
 [workspace.dependencies]
 # Internal crates - keys are import names used in source code, package is the actual crate name
-rqbit-protocol = { path = "rqbit-protocol", version = "0.0.10" }
-rqbit-ui = { path = "rqbit-ui", version = "0.0.10" }
+rqbit-protocol = {path = "rqbit-protocol", version = "0.0.10"}
+rqbit-ui = {path = "rqbit-ui", version = "0.0.10"}
 
 # rqbit (librqbit) comes from crates.io. Local modifications are kept as a
 # cargo-patch-crate patch in patches/ - run `cargo patch-crate` before the
 # first build (see AGENTS.md).
-librqbit = { version = "=9.1.0", default-features = false }
-librqbit-core = { version = "9.1.0", default-features = false }
+librqbit = {version = "=9.1.0", default-features = false}
+librqbit-core = {version = "9.1.0", default-features = false}
 
 # External crates
 anyhow = "1"
@@ -49,16 +49,16 @@ futures = "0.3"
 gethostname = "1"
 http = "1"
 librqbit-dualstack-sockets = "0.7"
-metrics-exporter-prometheus = { version = "0.18", default-features = false }
+metrics-exporter-prometheus = {version = "0.18", default-features = false}
 mime_guess = "2"
 notify = "8"
 parking_lot = "0.12"
-reqwest = { version = "0.13", default-features = false }
+reqwest = {version = "0.13", default-features = false}
 serde = "1"
 serde_json = "1"
 serde_with = "3"
 tokio = "1"
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = {version = "0.7", features = ["io"]}
 tracing = "0.1"
 urlencoding = "2"
 walkdir = "2"
@@ -69,5 +69,7 @@ walkdir = "2"
 [workspace.metadata.patch]
 crates = ["librqbit"]
 
+# librqbit is patched locally via cargo-patch-crate (see patches/). After cloning,
+# run `cargo patch-crate` once to materialize it into target/patch/ before building.
 [patch.crates-io]
-librqbit = { path = "./target/patch/librqbit-9.1.0" }
+librqbit = {path = "./target/patch/librqbit-9.1.0"}

@@ -1,8 +1,8 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use futures::{FutureExt as _, StreamExt as _};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use gpui_kit::base::input::RopeExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, Size,

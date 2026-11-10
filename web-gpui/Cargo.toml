@@ -1,10 +1,10 @@
 [package]
-name = "web-gpui"
-version.workspace = true
-edition = "2024"
 description = "Browser (wasm32-unknown-unknown) build of the rqbit GPUI client, talking to app-daemon over the rqbit-protocol WebSocket"
+edition = "2024"
 license = "MIT"
+name = "web-gpui"
 publish = false
+version.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
@@ -12,44 +12,43 @@ crate-type = ["cdylib"]
 # Everything is wasm-only: on native hosts this crate compiles to an empty
 # shell so workspace-wide checks don't drag the web platform into macOS.
 [target.'cfg(target_family = "wasm")'.dependencies]
-# gpui-kit pins the matching GPUI release (gpui-pre); same exact versions as
-# the desktop so the shared views see identical GPUI types.
-gpui = { package = "gpui-pre", version = "=0.3.11" }
-gpui-kit = "0.9.0"
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11" }
-rqbit-ui = { workspace = true }
-rqbit-protocol = { workspace = true }
-urlencoding = { workspace = true }
-futures = { workspace = true }
+# gpui-kit with "gpui-fast" feature selects gpui-fast 0.1.13 (aligned with gpui-pre 0.3.11)
+# This is the correct migration path for gpui-kit applications.
+# Types are re-exported from gpui_kit (gpui_kit::*, gpui_kit::platform, gpui_kit::web)
+futures = {workspace = true}
+gpui-kit = {version = "0.9.0", features = ["gpui-fast"]}
+rqbit-protocol = {workspace = true}
+rqbit-ui = {workspace = true}
+urlencoding = {workspace = true}
 wasm-bindgen = "0.2"
-# The 0.4 series is the current one (matches gpui-pre-web); the ancient 0.2
+# The 0.4 series is the current one (matches gpui-fast-web); the ancient 0.2
 # line pulls js-sys 0.2.x, which does not compile against wasm-bindgen 0.2.1xx.
-wasm-bindgen-futures = "0.4"
+async-trait = {workspace = true}
 js-sys = "0.3"
-web-sys = { version = "0.3", features = [
-    "BinaryType",
-    "Blob",
-    "CloseEvent",
-    "console",
-    "Document",
-    "Element",
-    "ErrorEvent",
-    "EventTarget",
-    "File",
-    "FileList",
-    "HtmlElement",
-    "HtmlInputElement",
-    "Location",
-    "MessageEvent",
-    "Node",
-    "Request",
-    "RequestInit",
-    "Response",
-    "Url",
-    "Window",
-    "WebSocket",
-] }
-async-trait = { workspace = true }
+wasm-bindgen-futures = "0.4"
+web-sys = {version = "0.3", features = [
+  "BinaryType",
+  "Blob",
+  "CloseEvent",
+  "console",
+  "Document",
+  "Element",
+  "ErrorEvent",
+  "EventTarget",
+  "File",
+  "FileList",
+  "HtmlElement",
+  "HtmlInputElement",
+  "Location",
+  "MessageEvent",
+  "Node",
+  "Request",
+  "RequestInit",
+  "Response",
+  "Url",
+  "Window",
+  "WebSocket",
+]}
 
 [features]
 default = []

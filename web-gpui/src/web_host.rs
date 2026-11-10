@@ -12,7 +12,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use gpui::{AnyView, App, AppContext as _, Context, Window};
+use gpui_kit::{AnyView, App, AppContext as _, Context, Window};
 use rqbit_ui::client::TorrentClient;
 use rqbit_ui::host::{PickedTorrentFile, UiCapabilities, UiHost};
 use rqbit_ui::ui::add_torrent_dialog::AddTorrentEntry;

@@ -2,89 +2,88 @@
 name = "desktop-gpui"
 # The desktop app carries its own version, independent of the librqbit engine
 # version (the workspace default).
-version = "0.0.10"
 authors = ["aleksplus"]
-edition = "2024"
 description = "Native desktop for rqbit"
+edition = "2024"
 license = "MIT"
-repository = "https://github.com/aleksplus/rqbit"
 publish = false
+repository = "https://github.com/aleksplus/rqbit"
+version = "0.0.10"
 
 [package.metadata.bundle]
-name = "rqbit-gpui-desktop"
-identifier = "com.rqbit.gpui-desktop"
 icon = ["icons/icon.ico", "icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns"]
-version = "0.0.10"
-short_description = "Native desktop for rqbit"
+identifier = "com.rqbit.gpui-desktop"
 long_description = """https://github.com/aleksplus/rqbit"""
+name = "rqbit-gpui-desktop"
+short_description = "Native desktop for rqbit"
+version = "0.0.10"
 
 # Built in CI with:
 #   cargo deb -p desktop-gpui --no-build --profile release-github --target x86_64-unknown-linux-gnu
 # The `target/release/...` asset prefix is rewritten by cargo-deb to
 # target/<triple>/<profile>/ for the selected --target/--profile.
 [package.metadata.deb]
-section = "net"
-priority = "optional"
 extended-description = "rqbit desktop client: native GPUI interface plus an embedded web UI served by the built-in daemon."
+priority = "optional"
+section = "net"
 # Hard-linked libs beyond libc/libssl are declared explicitly (dpkg-shlibdeps
 # adds those when available); dlopen'd ones need to be listed here.
+assets = [
+  ["target/release/desktop-gpui", "usr/bin/desktop-gpui", "755"],
+  ["assets/rqbit-gpui-desktop.desktop", "usr/share/applications/rqbit-gpui-desktop.desktop", "644"],
+  ["icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/rqbit-gpui-desktop.png", "644"],
+  ["icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/rqbit-gpui-desktop.png", "644"],
+  ["icons/128x128@2x.png", "usr/share/icons/hicolor/256x256/apps/rqbit-gpui-desktop.png", "644"],
+]
 depends = "libfontconfig1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0"
 recommends = "libvulkan1, xdg-utils"
-assets = [
-    ["target/release/desktop-gpui", "usr/bin/desktop-gpui", "755"],
-    ["assets/rqbit-gpui-desktop.desktop", "usr/share/applications/rqbit-gpui-desktop.desktop", "644"],
-    ["icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/rqbit-gpui-desktop.png", "644"],
-    ["icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/rqbit-gpui-desktop.png", "644"],
-    ["icons/128x128@2x.png", "usr/share/icons/hicolor/256x256/apps/rqbit-gpui-desktop.png", "644"],
-]
 
 [dependencies]
-# gpui-kit pins the matching GPUI release (gpui-pre); the aliases below must
-# stay on the same exact versions as gpui-kit or the GPUI types would split.
-gpui-kit = "0.9.0"
-gpui = { package = "gpui-pre", version = "=0.3.11" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["font-kit"] }
-async-trait = { workspace = true }
+# gpui-kit with "gpui-fast" feature selects gpui-fast 0.1.13 (aligned with gpui-pre 0.3.11)
+# This is the correct migration path for gpui-kit applications.
+# Types are re-exported from gpui_kit (gpui_kit::*, gpui_kit::platform, gpui_kit::web)
+async-trait = {workspace = true}
+gpui-kit = {version = "0.9.0", features = ["gpui-fast"]}
 # The desktop app bundles the daemon's server (WS protocol + embedded web
 # client) so its own session is reachable from the browser — one librqbit
 # session serves both the native UI and the web view.
-app-daemon = { path = "../app-daemon" }
-axum = { workspace = true }
-rqbit-protocol = { workspace = true, features = ["librqbit"] }
-rqbit-ui = { workspace = true }
-librqbit = { workspace = true, features = [
-    "tracing-subscriber-utils",
-    "http-api",
-    "upnp-serve-adapter",
-    "prometheus",
-    "default-tls"
-] }
-librqbit-core = { workspace = true, features = ["sha1-crypto-hash"] }
-notify = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-anyhow = { workspace = true }
-reqwest = { workspace = true, features = ["json", "query"] }
-http = { workspace = true }
-directories = { workspace = true }
-futures = { workspace = true }
-tracing = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_with = { workspace = true }
-parking_lot = { workspace = true }
-gethostname = { workspace = true }
-metrics-exporter-prometheus = { workspace = true }
-librqbit-dualstack-sockets = { workspace = true }
-walkdir = { workspace = true }
+anyhow = {workspace = true}
+app-daemon = {path = "../app-daemon"}
+axum = {workspace = true}
+directories = {workspace = true}
+futures = {workspace = true}
+gethostname = {workspace = true}
+http = {workspace = true}
+librqbit = {workspace = true, features = [
+  "tracing-subscriber-utils",
+  "http-api",
+  "upnp-serve-adapter",
+  "prometheus",
+  "default-tls",
+]}
+librqbit-core = {workspace = true, features = ["sha1-crypto-hash"]}
+librqbit-dualstack-sockets = {workspace = true}
+metrics-exporter-prometheus = {workspace = true}
+notify = {workspace = true}
+parking_lot = {workspace = true}
+reqwest = {workspace = true, features = ["json", "query"]}
+rqbit-protocol = {workspace = true, features = ["librqbit"]}
+rqbit-ui = {workspace = true}
+serde = {workspace = true}
+serde_json = {workspace = true}
+serde_with = {workspace = true}
+tokio = {workspace = true, features = ["full"]}
+tracing = {workspace = true}
+walkdir = {workspace = true}
 # Cross-platform "open folder / URL" (macOS `open`, Linux `xdg-open`, Windows).
 # Already a transitive dep of gpui-pre-linux; declared here for `DesktopHost::open_folder`.
 open = "5"
 # URL-encoding of stream-URL filename segments.
-urlencoding = { workspace = true }
+urlencoding = {workspace = true}
 
 [dev-dependencies]
 # Headless UI tests (gpui_kit::test) need the kit's test-support feature.
-gpui-kit = { version = "0.9.0", features = ["test-support"] }
+gpui-kit = {version = "0.9.0", features = ["test-support"]}
 
 [features]
 default = []
@@ -92,4 +91,4 @@ disable-upload = ["librqbit/disable-upload"]
 # Opt-in GPUI task profiler: records every foreground-task poll with its
 # spawn site so a self-re-arming task (executor wake storm) can be named.
 # Pair with the RQBIT_TASK_PROFILER env var, see `src/task_profiler.rs`.
-task-profiler = ["gpui/profiler"]
+task-profiler = ["gpui-kit/profiler"]

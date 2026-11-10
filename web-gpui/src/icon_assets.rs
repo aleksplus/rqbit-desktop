@@ -7,7 +7,7 @@
 //! daemon may run offline), `build.rs` embeds the vendored SVGs from
 //! `assets/icons/` — the same default component set gpui-kit ships natively.
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui_kit::gpui::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
 include!(concat!(env!("OUT_DIR"), "/icons.rs"));

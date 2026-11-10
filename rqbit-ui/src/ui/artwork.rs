@@ -33,10 +33,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gpui::{App, Global, RenderImage};
+use gpui_kit::{App, Global, RenderImage, Hsla, Rgba as GpuiRgba};
 use gpui_kit::component::ActiveTheme as _;
 use image::imageops::FilterType;
-use image::{DynamicImage, Frame, ImageBuffer, Rgba};
+use image::{DynamicImage, Frame, ImageBuffer, Rgba as ImageRgba};
 use rqbit_protocol::types::TorrentArtwork;
 
 use crate::host::UiHost;
@@ -72,8 +72,8 @@ fn mask_disabled() -> bool {
 /// colored theme tints posters with its own hue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArtworkTint {
-    shadow: Rgba<u8>,
-    highlight: Rgba<u8>,
+    shadow: ImageRgba<u8>,
+    highlight: ImageRgba<u8>,
 }
 
 impl ArtworkTint {
@@ -95,9 +95,9 @@ impl ArtworkTint {
 }
 
 /// gpui colors are f32 HSLA; the mask/tint math runs on 8-bit RGBA.
-fn to_u8(color: gpui::Hsla) -> Rgba<u8> {
-    let rgba = gpui::Rgba::from(color);
-    Rgba([
+fn to_u8(color: Hsla) -> ImageRgba<u8> {
+    let rgba = GpuiRgba::from(color);
+    ImageRgba([
         (rgba.r * 255.0).round().clamp(0.0, 255.0) as u8,
         (rgba.g * 255.0).round().clamp(0.0, 255.0) as u8,
         (rgba.b * 255.0).round().clamp(0.0, 255.0) as u8,
@@ -105,7 +105,7 @@ fn to_u8(color: gpui::Hsla) -> Rgba<u8> {
     ])
 }
 
-fn pack(color: Rgba<u8>) -> u32 {
+fn pack(color: ImageRgba<u8>) -> u32 {
     u32::from_be_bytes(color.0)
 }
 
@@ -170,7 +170,7 @@ pub fn triangle_alpha(w: u32, h: u32, x: f32, y: f32) -> f32 {
 }
 
 /// Scale the image so it covers the target box, then center-crop to it.
-fn cover_crop(img: DynamicImage, w: u32, h: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+fn cover_crop(img: DynamicImage, w: u32, h: u32) -> ImageBuffer<ImageRgba<u8>, Vec<u8>> {
     let (iw, ih) = (img.width().max(1), img.height().max(1));
     let scale = (w as f32 / iw as f32).max(h as f32 / ih as f32);
     let sw = ((iw as f32 * scale).round() as u32).max(w).max(1);
@@ -181,7 +181,7 @@ fn cover_crop(img: DynamicImage, w: u32, h: u32) -> ImageBuffer<Rgba<u8>, Vec<u8
     scaled.crop_imm(x, y, w, h).to_rgba8()
 }
 
-fn apply_shape_mask(buf: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, shape: ArtworkShape) {
+fn apply_shape_mask(buf: &mut ImageBuffer<ImageRgba<u8>, Vec<u8>>, shape: ArtworkShape) {
     if shape == ArtworkShape::Rect {
         return;
     }
@@ -190,7 +190,7 @@ fn apply_shape_mask(buf: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, shape: ArtworkShap
         let [r, g, b, a] = pixel.0;
         let alpha = triangle_alpha(w, h, x as f32 + 0.5, y as f32 + 0.5);
         let masked = (f32::from(a) / 255.0 * alpha * 255.0).round() as u8;
-        *pixel = Rgba([r, g, b, masked]);
+        *pixel = ImageRgba([r, g, b, masked]);
     }
 }
 
@@ -214,7 +214,7 @@ fn build_image(
     let mut buf = cover_crop(img, bw, bh);
     if let Some(tint) = &tint {
         for pixel in buf.pixels_mut() {
-            *pixel = Rgba(tint_pixel(pixel.0, tint));
+            *pixel = ImageRgba(tint_pixel(pixel.0, tint));
         }
     }
     if !mask_disabled() {
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn build_image_produces_bgra_bytes() {
         let mut png = Vec::new();
-        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1, 1, Rgba([255, 0, 0, 255])))
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1, 1, ImageRgba([255, 0, 0, 255])))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         let img = build_image(&png, ArtworkShape::Rect, 1.0, 1.0, None).unwrap();
@@ -460,8 +460,8 @@ mod tests {
     #[test]
     fn tint_pixel_maps_luma_onto_ramp() {
         let tint = ArtworkTint {
-            shadow: Rgba([0, 0, 0, 255]),
-            highlight: Rgba([100, 200, 50, 255]),
+            shadow: ImageRgba([0, 0, 0, 255]),
+            highlight: ImageRgba([100, 200, 50, 255]),
         };
         assert_eq!(tint_pixel([0, 0, 0, 255], &tint), [0, 0, 0, 255]);
         assert_eq!(tint_pixel([255, 255, 255, 255], &tint), [100, 200, 50, 255]);
@@ -479,12 +479,12 @@ mod tests {
     #[test]
     fn build_image_applies_tint() {
         let mut png = Vec::new();
-        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1, 1, Rgba([255, 255, 255, 255])))
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1, 1, ImageRgba([255, 255, 255, 255])))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         let tint = ArtworkTint {
-            shadow: Rgba([10, 20, 30, 255]),
-            highlight: Rgba([40, 60, 80, 255]),
+            shadow: ImageRgba([10, 20, 30, 255]),
+            highlight: ImageRgba([40, 60, 80, 255]),
         };
         let img = build_image(&png, ArtworkShape::Rect, 1.0, 1.0, Some(tint)).unwrap();
         let bytes = img.as_bytes(0).unwrap();
@@ -493,8 +493,8 @@ mod tests {
         assert_eq!((bytes[0], bytes[1], bytes[2]), (80, 60, 40));
         // Different endpoints → different cache id.
         let other = ArtworkTint {
-            shadow: Rgba([10, 20, 30, 255]),
-            highlight: Rgba([41, 60, 80, 255]),
+            shadow: ImageRgba([10, 20, 30, 255]),
+            highlight: ImageRgba([41, 60, 80, 255]),
         };
         assert_ne!(tint.id(), other.id());
         assert_eq!(tint.id(), tint.id());
