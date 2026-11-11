@@ -1,0 +1,110 @@
+//! Native system tray integration designed specifically for GPUI.
+//!
+//! This vendored copy has been modified for rqbit to add a `gpui-fast` backend.
+//!
+//! Tray menus use [`gpui::MenuItem`] directly and dispatch ordinary GPUI
+//! actions. Create icons with [`Icon::from_rgba`] or [`Icon::from_gpui`], then attach
+//! them with [`TrayBuilder::icon`].
+//!
+//! Select exactly one UI dependency: `gpui` (the default) for upstream GPUI,
+//! `gpui-kit` for GPUI Kit's `gpui-pre` types, `gpui-fast` for GPUI Fast, or
+//! `gpui-ce` for GPUI Community Edition. Disable default features when selecting
+//! an alternative backend.
+
+#[cfg(any(
+    all(feature = "gpui", feature = "gpui-kit"),
+    all(feature = "gpui", feature = "gpui-fast"),
+    all(feature = "gpui", feature = "gpui-ce"),
+    all(feature = "gpui-kit", feature = "gpui-fast"),
+    all(feature = "gpui-kit", feature = "gpui-ce"),
+    all(feature = "gpui-fast", feature = "gpui-ce"),
+))]
+compile_error!(
+    "features `gpui`, `gpui-kit`, `gpui-fast`, and `gpui-ce` are mutually exclusive; use default-features = false and select exactly one backend"
+);
+
+#[cfg(not(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+)))]
+compile_error!("enable exactly one of the `gpui`, `gpui-kit`, `gpui-fast`, or `gpui-ce` features");
+
+#[cfg(all(
+    feature = "gpui-ce",
+    not(any(feature = "gpui", feature = "gpui-kit", feature = "gpui-fast"))
+))]
+extern crate gpui_ce_backend as gpui;
+#[cfg(feature = "gpui-fast")]
+extern crate gpui_fast_backend as gpui;
+#[cfg(all(feature = "gpui-kit", not(feature = "gpui")))]
+extern crate gpui_kit_backend as gpui;
+
+#[cfg(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+))]
+mod backend;
+#[cfg(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+))]
+mod error;
+#[cfg(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+))]
+mod icon;
+#[cfg(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+))]
+mod menu;
+#[cfg(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+))]
+mod tray;
+
+#[cfg(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+))]
+pub use error::{Error, Result};
+#[cfg(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+))]
+pub use icon::{BitmapIconBuilder, Icon};
+#[cfg(all(
+    target_os = "macos",
+    any(
+        feature = "gpui",
+        feature = "gpui-kit",
+        feature = "gpui-fast",
+        feature = "gpui-ce"
+    )
+))]
+pub use icon::{SymbolIconBuilder, SymbolScale, SymbolWeight};
+#[cfg(any(
+    feature = "gpui",
+    feature = "gpui-kit",
+    feature = "gpui-fast",
+    feature = "gpui-ce"
+))]
+pub use tray::{Tray, TrayBuilder};

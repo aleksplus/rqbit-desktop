@@ -53,7 +53,9 @@ axum = {workspace = true}
 directories = {workspace = true}
 futures = {workspace = true}
 gethostname = {workspace = true}
+gpui-tray = {path = "../vendor/gpui-tray", default-features = false, features = ["gpui-fast"]}
 http = {workspace = true}
+image = {version = "0.25", default-features = false, features = ["png"]}
 librqbit = {workspace = true, features = [
   "tracing-subscriber-utils",
   "http-api",

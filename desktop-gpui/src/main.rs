@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use gpui_kit::*;
 use gpui_kit::base::input as input_actions;
+use gpui_kit::*;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
@@ -11,6 +11,7 @@ mod events;
 mod folder_watcher;
 mod hooks;
 mod local_client;
+mod system_tray;
 mod ui;
 mod web_settings;
 
@@ -18,16 +19,15 @@ mod state;
 mod task_profiler;
 use crate::{
     desktop_host::DesktopHost, events::hold_to_quit_view::HoldToQuitView,
-    local_client::LocalClient, state::State,
+    local_client::LocalClient, state::State, system_tray::SystemTray,
 };
 use rqbit_ui::ui::dialogs::AboutInfo;
 use rqbit_ui::ui::main_panel::MainPanel;
 impl Global for State {}
 
-// App-menu actions, dispatched by the native macOS menu bar (see `set_menus`
-// below) and handled by the global listeners registered after the window
-// opens.
-gpui_kit::actions!(rqbit_desktop, [About, Settings, Quit]);
+// App-menu and tray actions, dispatched by the native menu bar or system tray
+// and handled by the global listeners registered below.
+gpui_kit::actions!(rqbit_desktop, [About, Settings, Open, Quit]);
 
 /// Author of the rqbit engine (librqbit crate metadata). The crate exposes no
 /// runtime accessor for it, so it is pinned here.
@@ -49,6 +49,81 @@ fn about_info() -> AboutInfo {
         desktop_name: "rqbit-desktop".into(),
         desktop_author: env!("CARGO_PKG_AUTHORS").into(),
     }
+}
+
+#[derive(Clone)]
+struct MainWindow {
+    handle: AnyWindowHandle,
+    main_panel: WeakEntity<MainPanel>,
+}
+
+type SharedMainWindow = Arc<Mutex<Option<MainWindow>>>;
+
+/// Activates the existing main window, or recreates it after the user closed it
+/// to the tray. The librqbit session lives in `State`, not in the window, so
+/// recreating the UI does not interrupt downloads or the bundled web view.
+fn open_main_window(
+    shared_state: &State,
+    state_arc: &Arc<State>,
+    main_window: &SharedMainWindow,
+    cx: &mut App,
+) -> WeakEntity<MainPanel> {
+    let existing = main_window.lock().unwrap().clone();
+    if let Some(existing) = existing
+        && existing
+            .handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    {
+        cx.activate(true);
+        return existing.main_panel;
+    }
+
+    let window_options = WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some("rqbit".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(13.), px(13.))),
+        }),
+        window_bounds: Some(WindowBounds::centered(size(px(1000.), px(800.)), cx)),
+        window_decorations: Some(WindowDecorations::Server),
+        window_min_size: Some(size(px(600.), px(400.))),
+        // The custom `TitleBar` drags and zooms the window itself. Without
+        // this, AppKit also treats the title-bar strip as its own drag
+        // region and zooms the window on any double-click there, including
+        // double-clicks on the title-bar buttons.
+        app_owns_titlebar_drag: true,
+        ..Default::default()
+    };
+
+    // Hold-to-quit: keep cmd-q / ctrl-c held for 1 second to exit. Releasing
+    // either the key or the modifier early drops the countdown task,
+    // cancelling the quit. The key listeners are attached to the root
+    // element, so they are registered during paint (safe) and cleared each
+    // frame.
+    let quit_countdown: Arc<Mutex<Option<Task<()>>>> = Arc::new(Mutex::new(None));
+
+    cx.activate(true);
+    let (handle, root) = gpui_kit::open_window(window_options, cx, |window, cx| {
+        let client = Arc::new(LocalClient::new(
+            shared_state.shared(),
+            shared_state.hooks(),
+        ));
+        let host = Arc::new(DesktopHost::new(state_arc.clone()));
+        let main_panel = cx.new(|cx| MainPanel::new(client, host, window, cx));
+        cx.new(|_cx| HoldToQuitView {
+            main_panel,
+            quit_countdown: quit_countdown.clone(),
+        })
+    })
+    .expect("Failed to open window");
+
+    let main_panel = root.read(cx).main_panel.downgrade();
+    *main_window.lock().unwrap() = Some(MainWindow {
+        handle,
+        main_panel: main_panel.clone(),
+    });
+    main_panel
 }
 
 use librqbit::tracing_subscriber_config_utils::{InitLoggingOptions, init_logging};
@@ -82,14 +157,14 @@ async fn main() {
 
     info!("GPUI application started – state ready");
 
-    // Run GPUI
-    let platform = platform::application().with_assets(assets::Assets);
+    // The tray keeps the session alive without a window. Exiting is explicit
+    // through the tray menu, native application menu, or hold-to-quit shortcut.
+    let platform = platform::application()
+        .with_assets(assets::Assets)
+        .with_quit_mode(QuitMode::Explicit);
     platform.run(move |cx: &mut App| {
         // Store the state globally so all windows/views can access it
         cx.set_global(shared_state.clone());
-
-        // Bring the app to the foreground on launch (macOS: activateIgnoringOtherApps).
-        cx.activate(true);
 
         gpui_kit::init(cx);
 
@@ -102,43 +177,13 @@ async fn main() {
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
         }
 
-        let window_options = WindowOptions {
-            titlebar: Some(TitlebarOptions {
-                title: Some("rqbit".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(13.), px(13.))),
-            }),
-            window_bounds: Some(WindowBounds::centered(size(px(1000.), px(800.)), cx)),
-            window_decorations: Some(WindowDecorations::Server),
-            window_min_size: Some(size(px(600.), px(400.))),
-            // The custom `TitleBar` drags and zooms the window itself. Without
-            // this, AppKit also treats the title-bar strip as its own drag
-            // region and zooms the window on any double-click there, including
-            // double-clicks on the title-bar buttons.
-            app_owns_titlebar_drag: true,
-            ..Default::default()
-        };
+        let main_window = SharedMainWindow::default();
+        open_main_window(&shared_state, &state_arc, &main_window, cx);
 
-        // Hold-to-quit: keep cmd-q / ctrl-c held for 1 second to exit. Releasing
-        // either the key or the modifier early drops the countdown task,
-        // cancelling the quit. The key listeners are attached to the root
-        // element, so they are registered during paint (safe) and cleared each
-        // frame.
-        let quit_countdown: Arc<Mutex<Option<Task<()>>>> = Arc::new(Mutex::new(None));
-
-        let (_, root) = gpui_kit::open_window(window_options, cx, |window, cx| {
-            let client = Arc::new(LocalClient::new(
-                shared_state.shared(),
-                shared_state.hooks(),
-            ));
-            let host = Arc::new(DesktopHost::new(state_arc.clone()));
-            let main_panel = cx.new(|cx| MainPanel::new(client, host, window, cx));
-            cx.new(|_cx| HoldToQuitView {
-                main_panel,
-                quit_countdown: quit_countdown.clone(),
-            })
-        })
-        .expect("Failed to open window");
+        match system_tray::build(cx) {
+            Ok(tray) => cx.set_global(SystemTray(tray)),
+            Err(error) => warn!(%error, "failed to create system tray; window close will quit"),
+        }
 
         // Native macOS menu bar (the "top panel"). Menu items dispatch GPUI
         // actions to the active window; anything the views don't handle falls
@@ -162,29 +207,66 @@ async fn main() {
             ]),
         ]);
 
-        let main_panel = root.read(cx).main_panel.downgrade();
-
         cx.on_action({
-            let main_panel = main_panel.clone();
+            let shared_state = shared_state.clone();
+            let state_arc = state_arc.clone();
+            let main_window = main_window.clone();
+            move |_: &Open, cx| {
+                open_main_window(&shared_state, &state_arc, &main_window, cx);
+            }
+        });
+        cx.on_action({
+            let shared_state = shared_state.clone();
+            let state_arc = state_arc.clone();
+            let main_window = main_window.clone();
             move |_: &About, cx| {
-                main_panel
+                open_main_window(&shared_state, &state_arc, &main_window, cx)
                     .update(cx, |panel, cx| panel.open_about(about_info(), cx))
                     .ok();
             }
         });
         cx.on_action({
-            let main_panel = main_panel.clone();
+            let shared_state = shared_state.clone();
+            let state_arc = state_arc.clone();
+            let main_window = main_window.clone();
             move |_: &Settings, cx| {
-                main_panel
+                open_main_window(&shared_state, &state_arc, &main_window, cx)
                     .update(cx, |panel, cx| panel.open_settings_page(cx))
                     .ok();
             }
         });
-        cx.on_action(|_: &Quit, cx| cx.quit());
-
-        // Quit the app when the window is closed (native close button).
-        cx.on_window_closed(move |cx: &mut App, _window_id| {
+        cx.on_action(|_: &Quit, cx| {
+            if let Some(tray) = cx.try_global::<SystemTray>() {
+                let tray = tray.0.clone();
+                if let Err(error) = tray.close(cx) {
+                    warn!(%error, "failed to close system tray");
+                }
+            }
             cx.quit();
+        });
+
+        // Closing the main window leaves the torrent session running in the
+        // tray. If the native tray was unavailable, preserve the old behavior
+        // instead of leaving a windowless app with no obvious way to exit.
+        cx.on_window_closed({
+            let main_window = main_window.clone();
+            move |cx: &mut App, window_id| {
+                let main_window_closed = {
+                    let mut slot = main_window.lock().unwrap();
+                    if slot
+                        .as_ref()
+                        .is_some_and(|main| main.handle.window_id() == window_id)
+                    {
+                        *slot = None;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if main_window_closed && cx.try_global::<SystemTray>().is_none() {
+                    cx.quit();
+                }
+            }
         })
         .detach();
     });
