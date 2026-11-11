@@ -55,7 +55,7 @@ pub fn maybe_start() {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(2)
             .clamp(1, 3600);
-        gpui::profiler::set_trace_enabled(true);
+        gpui_kit::profiler::set_trace_enabled(true);
         info!(path = %out_path.display(), secs, "gpui task profiler enabled");
         let thread = std::thread::Builder::new()
             .name("task-profiler-dump".into())
@@ -91,7 +91,7 @@ fn dump_loop(out_path: PathBuf, interval: Duration) {
 fn summarize(last_pushed: &mut HashMap<std::thread::ThreadId, u64>, interval: Duration) -> String {
     use std::fmt::Write as _;
 
-    let timings = gpui::profiler::get_all_timings(gpui::TasksIncluded::CompletedAndRunning);
+    let timings = gpui_kit::profiler::get_all_timings(gpui_kit::TasksIncluded::CompletedAndRunning);
     let mut out = String::new();
     let unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
