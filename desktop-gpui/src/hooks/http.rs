@@ -51,14 +51,17 @@ pub(crate) async fn send(
 #[cfg(test)]
 pub(crate) mod testutil {
     //! Minimal one-shot HTTP server for tests: accepts a single request,
-    //! returns the raw bytes, and replies with `respond_body`.
+    //! returns the raw bytes, and replies with the configured response.
 
-    pub(crate) async fn serve_once(
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_once_inner(
         listener: tokio::net::TcpListener,
+        status: &'static str,
         respond_body: &'static str,
+        request_seen: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
@@ -87,13 +90,52 @@ pub(crate) mod testutil {
             }
         }
         let raw = String::from_utf8_lossy(&buf).into_owned();
+        if let Some(request_seen) = request_seen {
+            let _ = request_seen.send(());
+        }
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             respond_body.len(),
             respond_body
         );
         sock.write_all(response.as_bytes()).await.unwrap();
         raw
+    }
+
+    pub(crate) async fn serve_once(
+        listener: tokio::net::TcpListener,
+        respond_body: &'static str,
+    ) -> String {
+        serve_once_inner(listener, "200 OK", respond_body, None, None).await
+    }
+
+    pub(crate) async fn serve_once_with_status(
+        listener: tokio::net::TcpListener,
+        status: &'static str,
+        respond_body: &'static str,
+    ) -> String {
+        serve_once_inner(listener, status, respond_body, None, None).await
+    }
+
+    /// Hold the response until `release`, notifying the test once the request
+    /// has arrived so it can inspect the pending torrent state.
+    pub(crate) async fn serve_once_gated(
+        listener: tokio::net::TcpListener,
+        respond_body: &'static str,
+        request_seen: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> String {
+        serve_once_inner(
+            listener,
+            "200 OK",
+            respond_body,
+            Some(request_seen),
+            Some(release),
+        )
+        .await
     }
 }
 
@@ -130,6 +172,7 @@ mod tests {
             name: "test".into(),
             enabled: true,
             events: vec![HookEvent::TorrentAdded],
+            autoload_file_selection: false,
             method: HttpMethod::Post,
             url: format!("http://{addr}/hook"),
             timeout_secs: 5,
@@ -170,6 +213,7 @@ mod tests {
             name: "test".into(),
             enabled: true,
             events: vec![HookEvent::TorrentAdded],
+            autoload_file_selection: false,
             method: HttpMethod::Get,
             url: format!("http://{addr}/hook"),
             timeout_secs: 5,

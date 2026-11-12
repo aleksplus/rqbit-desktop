@@ -68,8 +68,9 @@ Items, in fixed order:
 | 5 | `Timeout (seconds)` | `SettingField::number_input` (min 1, max 86400) | `h.timeout_secs as f64` | `h.timeout_secs = v as u64`; unparsable intermediates are not committed while typing, out-of-range values are clamped by the input widget on blur | horizontal |
 | 6 | `Poll (seconds)` | `SettingField::number_input` (min 2, max 86400) | `h.poll_secs as f64` | `h.poll_secs = v as u64` | horizontal; "Polling interval for the "Torrent columns" event." |
 | 7 | `Events` | `SettingField::render` → row of 4 checkboxes | `h.events.contains(e)` | toggle: remove if present, else `push` | vertical; "Which lifecycle events trigger this hook." |
-| 8 | `Headers (one per line, "Key: Value")` | `SettingField::render` → auto-growing textarea (1–6 rows) | `headers_to_text(h)` | `set_headers_text(h, text)` | vertical |
-| 9 | `""` (empty label) | `SettingField::render` → outline button **Remove Hook** | — | `remove_hook(ix)` | vertical |
+| 8 | `Auto-load file selection` | `SettingField::switch` | `h.autoload_file_selection` | `h.autoload_file_selection = v` | horizontal; opts a Torrent columns hook into strict `file_selection` requests for watched-folder adds |
+| 9 | `Headers (one per line, "Key: Value")` | `SettingField::render` → auto-growing textarea (1–6 rows) | `headers_to_text(h)` | `set_headers_text(h, text)` | vertical |
+| 10 | `""` (empty label) | `SettingField::render` → outline button **Remove Hook** | — | `remove_hook(ix)` | vertical |
 
 Field helper signatures (all in `settings_page.rs`):
 
@@ -86,7 +87,8 @@ fn add_hook_field    (config)     -> impl Fn(&RenderOptions, &mut Window, &mut A
 
 Getter/setter pairs passed into the generic helpers (`:783-810`):
 `get/set_hook_enabled`, `get/set_hook_name`, `get/set_hook_url`,
-`get/set_hook_timeout`, `get/set_hook_poll`.
+`get/set_hook_timeout`, `get/set_hook_poll`, and
+`get/set_hook_autoload_file_selection`.
 
 ### 1.2 Events checkboxes (`hook_events_field`)
 
@@ -171,6 +173,7 @@ pub struct HookConfig {                                             // :29
     pub name: String,                      // default "New hook"
     pub enabled: bool,                     // default true
     pub events: Vec<HookEvent>,            // default [TorrentAdded]
+    pub autoload_file_selection: bool,     // default false; columns hooks only
     pub method: HttpMethod,                // default Post
     pub url: String,                       // default ""
     pub timeout_secs: u64,                 // default 10
@@ -194,6 +197,7 @@ Shape inside `config.json`:
         "name": "notify",
         "enabled": true,
         "events": ["torrent_added", "torrent_completed", "torrent_deleted", "file_selection"],
+        "autoload_file_selection": false,
         "method": "post",
         "url": "http://127.0.0.1:8080/hook",
         "timeout_secs": 10,
@@ -216,6 +220,9 @@ Rules:
 * `headers` is a `BTreeMap`, so it round-trips with sorted keys.
 * `timeout_secs = 0` is accepted in the file; it is clamped to 1 s at request
   time (§5) and the UI setter also clamps on edit.
+* `autoload_file_selection` defaults to `false` in old configs. It opt-in only
+  affects enabled `torrent_columns` hooks; explicit `file_selection`
+  subscribers always participate in watched-folder selection.
 * Round trip is lossless and `PartialEq`-stable (test `hooks_roundtrip`,
   `config.rs:391`).
 
@@ -316,8 +323,8 @@ envelope degrades to `{ "event": "<wire name>" }`.
 | `torrent_added` | `HookDispatcher::add_and_dispatch_added` (`dispatcher.rs:155`) — both the add dialog (`local_client.rs:203`) and the autoload folder watcher (`folder_watcher.rs:203`) | `files_total: usize`, `files_selected: usize` (count of `included` files in the API response), `selected_indices: [usize] \| null` (echo of the request's `only_files`; `null` = no restriction requested) | no |
 | `torrent_deleted` | `LocalClient::dispatch_deleted` (`local_client.rs:47`), called from the `Forget`/`Delete` action handler (`local_client.rs:160-188`) only after the API call succeeded; calls `hooks.forget(id)` first | `delete_files: bool` (true = files removed from disk, false = forgotten) | no |
 | `torrent_completed` | completion watcher (`HookDispatcher::start`, `dispatcher.rs:289`) | none | no |
-| `file_selection` | `HookDispatcher::apply_file_selection` (`dispatcher.rs:246`) while the add dialog is being prepared (`desktop_host.rs:117` ← `main_panel.rs:102`), and from `HookDispatcher::file_selection_only_files` (`dispatcher.rs`) just before the folder watcher adds an autoloaded `.torrent` (magnets are added unrestricted — their file list is not known before the add) | `torrent.id` is `null`; `files: [{ "index": usize, "name": string, "length": u64 }]` | **yes** |
-| `torrent_columns` | `ColumnsProvider` poll loop (`app-daemon/src/columns.rs`), started with the session (`state.rs` `api_from_config`); every `poll_secs` | full torrent list (see §6.6); `files` arrays included only after the hook declared a file-level column | **yes** |
+| `file_selection` | `HookDispatcher::apply_file_selection` while preparing the add dialog; `HookDispatcher::resolve_autoload_selection` after a fresh watched-folder add has initialized | Dialog: `torrent.id` is `null`; auto-load: numeric post-add ID. `files: [{ "index": usize, "name": string, "length": u64 }]` | **yes** |
+| `torrent_columns` | `ColumnsProvider` poll loop (`app-daemon/src/columns.rs`), started with the session (`state.rs` `api_from_config`); every `poll_secs`. With `autoload_file_selection=true`, the same hook also receives on-demand `file_selection` requests for auto-load | full torrent list (see §6.6); `files` arrays included only after the hook declared a file-level column | **yes**; columns values are display-only and never change desired files |
 
 `torrent_added` conditions: fired only when the API returned an `id` **and**
 the dispatcher did not already know that id (`is_known`); re-adding a managed
@@ -384,6 +391,38 @@ numeric id, the payload carries `"id": 0`.
 * Return value: names of hooks that changed the selection. The UI joins them
   with `", "` into `AddTorrentEntry.hook_note`, shown as a hint in the add
   dialog; the user can still edit the selection before confirming.
+
+### 6.5 Strict watched-folder selection
+
+Auto-load uses the same `file_selection` wire request and response, but with
+fail-closed sequencing rather than the dialog's best-effort pre-selection:
+
+* Relevant hooks are enabled explicit `file_selection` subscribers plus enabled
+  `torrent_columns` hooks whose `autoload_file_selection` setting is true. Each
+  config entry runs once even if it subscribes to both events. Unrelated
+  columns hooks are not contacted.
+* With no relevant hooks, the existing immediate behavior is unchanged. With
+  relevant hooks, a fresh add starts paused with `only_files = []` (never
+  `null`, which means all files). Source archiving still happens after the
+  successful add; duplicate adds do not rerun selection.
+* Each source is processed independently so magnet metadata resolution cannot
+  block other watched files. librqbit resolves magnet metadata before
+  registering the add; a metadata-resolution failure therefore leaves the
+  source unadded rather than producing an unrestricted torrent.
+* After initialization, hooks run sequentially over an in-memory list that
+  starts with all files included. `torrent.id` is the numeric post-add ID. No
+  session update occurs until every hook has returned a valid response.
+* Strict responses must contain at least one of `include`, `exclude`,
+  `include_patterns`, or `exclude_patterns`, and all explicit indices must be
+  in range. Empty bodies, HTTP/timeout errors, malformed JSON, missing
+  directives, and invalid indices are failures.
+* On complete success, `UpdateOnlyFiles` persists the computed selection. A
+  nonempty selection auto-starts only when `auto_add_paused=false`; an empty
+  selection is valid and always remains paused-empty.
+* On any initialization, hook, decoding, or selection-update failure, no
+  fallback to all files occurs and the torrent is not started. The original
+  paused-empty state remains, and a structured warning identifies the source,
+  torrent ID, and failing hook.
 
 ### 6.6 `torrent_columns` request/response (`app-daemon/src/columns.rs`)
 
@@ -544,10 +583,11 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
 | Area | Tests |
 |---|---|
 | Config serde | `config.rs`: `hooks_roundtrip`, `hook_defaults` |
-| Selection logic | `payload.rs`: `wildcard_matching`, `apply_include_exclude`, `apply_patterns`, `empty_response_keeps_selection`, `selects_nothing_detection`, `response_deserializes_partial_json` |
+| Selection logic | `payload.rs`: wildcard/include/exclude/pattern tests, `selects_nothing_detection`, `strict_validation_requires_directives_and_valid_indices` |
 | Transport | `http.rs`: `get_and_post_hit_test_server` (POST body + custom header; GET `?payload=`; empty body → `None`) |
 | `torrent_columns` provider | `app-daemon/src/columns.rs`: response parsing/sanitization (full response, empty body, unknown keys, dup/empty keys + cap, width clamp + truncation), snapshot decoration, connected/failure transitions + rate limiting, `needs_files` tracking, POST round-trip over a local axum server, non-2xx error |
 | Watcher | `dispatcher.rs`: `seeds_silently_on_first_observation`, `fires_on_not_finished_to_finished_transition`, `unfinishes_when_selection_grows`, `primed_torrent_completing_before_first_poll_fires`, `primed_torrent_unfinished_on_first_poll_is_quiet`, `deleted_torrents_are_pruned`, `reset_clears_everything` |
 | End-to-end | `dispatcher.rs`: `file_selection_end_to_end_over_http`, `disabled_hook_is_not_contacted`, `dispatch_delivers_torrent_added_over_http` (asserts `x-rqbit-event`), `manual_add_moves_source_file`, `manual_add_keeps_source_without_move_folder` |
+| Strict auto-load | `dispatcher.rs`: opt-in/deduplication resolver tests; `folder_watcher.rs`: delayed response and pending state, auto-start ordering, configured pause, failure/timeout matrix, valid empty selection, multi-hook atomicity, opt-out columns, source archiving, and magnet metadata failure |
 | Custom-column UI logic | `rqbit-ui/src/ui/utils.rs`: `status_tone` mapping tests |
 | Settings UI (hooks) | none |

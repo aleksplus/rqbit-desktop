@@ -2,18 +2,20 @@
 //! watches the session for torrent completion.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
-use librqbit::{AddTorrent, AddTorrentOptions, Api, ApiError, api::ApiAddTorrentResponse};
+use librqbit::{
+    AddTorrent, AddTorrentOptions, Api, ApiError,
+    api::{ApiAddTorrentResponse, TorrentIdOrHash},
+};
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, warn};
 
 use crate::config::HookConfig;
 use crate::state::SharedState;
-use rqbit_protocol::ApiAddTorrent;
-use rqbit_ui::client::UiAddSource;
 use rqbit_ui::ui::add_torrent_dialog::AddTorrentEntry;
-use rqbit_ui::ui::utils::entry_from_list_only;
+use rqbit_ui::ui::file_table::FileRow;
 
 use super::HookEvent;
 use super::payload::{
@@ -43,6 +45,65 @@ struct WatcherInner {
 pub(crate) struct ObservedTorrent {
     pub info: TorrentInfo,
     pub finished: bool,
+}
+
+pub(crate) struct AutoloadAddOutcome {
+    pub response: ApiAddTorrentResponse,
+    pub fresh_id: Option<usize>,
+}
+
+#[derive(Debug)]
+enum AutoloadSelectionError {
+    Api {
+        action: &'static str,
+        source: ApiError,
+    },
+    Initialize(anyhow::Error),
+    MissingFiles,
+    Request {
+        hook: String,
+        source: anyhow::Error,
+    },
+    EmptyResponse {
+        hook: String,
+    },
+    InvalidResponse {
+        hook: String,
+        reason: String,
+    },
+}
+
+impl fmt::Display for AutoloadSelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Api { action, source } => write!(f, "{action}: {source}"),
+            Self::Initialize(source) => write!(f, "torrent initialization failed: {source}"),
+            Self::MissingFiles => write!(f, "initialized torrent has no file list"),
+            Self::Request { hook, source } => {
+                write!(f, "file selection hook {hook:?} failed: {source}")
+            }
+            Self::EmptyResponse { hook } => {
+                write!(f, "file selection hook {hook:?} returned an empty response")
+            }
+            Self::InvalidResponse { hook, reason } => {
+                write!(
+                    f,
+                    "file selection hook {hook:?} returned an invalid response: {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AutoloadSelectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Api { source, .. } => Some(source),
+            Self::Initialize(source) => Some(source.as_ref()),
+            Self::Request { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 impl WatcherInner {
@@ -99,6 +160,26 @@ fn matching_hooks(shared: &Arc<RwLock<SharedState>>, event: HookEvent) -> Vec<Ho
         .collect()
 }
 
+/// Hooks that must select files for a watched-folder add. Explicit
+/// `file_selection` subscribers retain their existing auto-load role;
+/// columns providers participate only through the explicit opt-in.
+fn autoload_selection_hooks(shared: &Arc<RwLock<SharedState>>) -> Vec<HookConfig> {
+    shared
+        .read()
+        .config()
+        .hooks
+        .hooks
+        .iter()
+        .filter(|hook| {
+            hook.enabled
+                && (hook.events.contains(&HookEvent::FileSelection)
+                    || (hook.autoload_file_selection
+                        && hook.events.contains(&HookEvent::TorrentColumns)))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Fire-and-forget delivery of an event to all matching hooks: one tokio task
 /// per hook, so a slow endpoint cannot delay the others.
 fn spawn_deliveries(
@@ -150,12 +231,12 @@ impl HookDispatcher {
     /// one and a move folder is configured). This is the shared add path: the
     /// add-torrent dialog and the folder watcher both call it, so
     /// watcher-added torrents behave identically to UI-added ones. `paused`
-    /// starts the torrent in a paused state (the folder watcher passes the
-    /// configured `auto_add_paused` flag; dialog adds pass `false`). The hook
+    /// is the requested initial state; the watcher forces it while strict file
+    /// selection is pending, and dialog adds pass `false`. The hook
     /// is skipped when the torrent was already managed (the API response
     /// does not distinguish that case, so the watcher's known-ID set
     /// decides); the source file is moved regardless, as cleanup.
-    pub async fn add_and_dispatch_added(
+    async fn add_and_dispatch_added_outcome(
         &self,
         api: &Api,
         add: AddTorrent<'static>,
@@ -163,7 +244,7 @@ impl HookDispatcher {
         overwrite: bool,
         paused: bool,
         source_path: Option<std::path::PathBuf>,
-    ) -> Result<ApiAddTorrentResponse, ApiError> {
+    ) -> Result<AutoloadAddOutcome, ApiError> {
         let opts = Some(AddTorrentOptions {
             only_files: only_files.clone(),
             overwrite,
@@ -171,9 +252,8 @@ impl HookDispatcher {
             ..Default::default()
         });
         let response = api.api_add_torrent(add, opts).await?;
-        if let Some(id) = response.id
-            && !self.is_known(id)
-        {
+        let fresh_id = response.id.filter(|id| !self.is_known(*id));
+        if let Some(id) = fresh_id {
             self.prime_added(id);
             let files = response.details.files.as_deref().unwrap_or(&[]);
             self.dispatch(
@@ -216,7 +296,37 @@ impl HookDispatcher {
                 }
             }
         }
-        Ok(response)
+        Ok(AutoloadAddOutcome { response, fresh_id })
+    }
+
+    /// Add through the shared manual/UI path, discarding the watcher's
+    /// fresh-add metadata.
+    pub async fn add_and_dispatch_added(
+        &self,
+        api: &Api,
+        add: AddTorrent<'static>,
+        only_files: Option<Vec<usize>>,
+        overwrite: bool,
+        paused: bool,
+        source_path: Option<std::path::PathBuf>,
+    ) -> Result<ApiAddTorrentResponse, ApiError> {
+        self.add_and_dispatch_added_outcome(api, add, only_files, overwrite, paused, source_path)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    /// Watcher variant that also reports whether this was a fresh session add.
+    pub(crate) async fn add_autoload(
+        &self,
+        api: &Api,
+        add: AddTorrent<'static>,
+        only_files: Option<Vec<usize>>,
+        overwrite: bool,
+        paused: bool,
+        source_path: Option<std::path::PathBuf>,
+    ) -> Result<AutoloadAddOutcome, ApiError> {
+        self.add_and_dispatch_added_outcome(api, add, only_files, overwrite, paused, source_path)
+            .await
     }
 
     /// Whether the watcher already knows this torrent ID (it existed in the
@@ -285,66 +395,151 @@ impl HookDispatcher {
         applied
     }
 
-    /// Resolve a torrent's file list (via a list-only add, nothing is added
-    /// to the session) and run the `file_selection` hooks over it, returning
-    /// the `only_files` restriction the torrent should be added with (`None`
-    /// = all files / no restriction). This is the autoload counterpart of the
-    /// add-dialog flow, which runs the same hooks while preparing the dialog.
-    /// Only torrent *bytes* can be listed without adding; magnets would need
-    /// network metadata resolution, so they are added unrestricted — their
-    /// file list is not known before the add. Any failure (list-only add,
-    /// hook delivery) degrades to "no restriction": the torrent is still
-    /// added.
-    pub async fn file_selection_only_files(
+    pub(crate) fn autoload_hooks(&self) -> Vec<HookConfig> {
+        autoload_selection_hooks(&self.shared)
+    }
+
+    /// Finalize a fresh watched-folder add without blocking the watcher on
+    /// HTTP requests or magnet metadata resolution.
+    pub(crate) fn spawn_autoload_selection(
+        self: &Arc<Self>,
+        api: Arc<Api>,
+        selection_hooks: Vec<HookConfig>,
+        id: usize,
+        auto_add_paused: bool,
+        source: String,
+    ) {
+        let this = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let cancel = api.session().cancellation_token().clone();
+            let result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    debug!(torrent_id = id, path = %source, "autoload selection cancelled with its session");
+                    return;
+                }
+                result = this.finish_autoload_selection(&api, id, &selection_hooks, auto_add_paused) => result,
+            };
+            if let Err(error) = result {
+                warn!(
+                    torrent_id = id,
+                    path = %source,
+                    error = %error,
+                    "autoload finalization failed; torrent was not started"
+                );
+            }
+        });
+    }
+
+    async fn finish_autoload_selection(
         &self,
         api: &Api,
-        add: &AddTorrent<'_>,
-    ) -> Option<Vec<usize>> {
-        // Skip the list-only add entirely when nothing listens.
-        if matching_hooks(&self.shared, HookEvent::FileSelection).is_empty() {
-            return None;
-        }
-        let bytes = match add {
-            AddTorrent::TorrentFileBytes(bytes) => bytes.clone(),
-            AddTorrent::Url(_) => return None,
-        };
-        let response = match api
-            .api_add_torrent(
-                AddTorrent::from_bytes(bytes),
-                Some(AddTorrentOptions {
-                    list_only: true,
-                    ..Default::default()
-                }),
-            )
+        id: usize,
+        selection_hooks: &[HookConfig],
+        auto_add_paused: bool,
+    ) -> Result<(), AutoloadSelectionError> {
+        let selected = self
+            .resolve_autoload_selection(api, id, selection_hooks)
+            .await?;
+        let is_empty = selected.is_empty();
+        let selected: HashSet<usize> = selected.into_iter().collect();
+        api.api_torrent_action_update_only_files(TorrentIdOrHash::Id(id), &selected)
             .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                warn!(error = %e, "could not resolve file list for file selection hooks");
-                return None;
+            .map_err(|source| AutoloadSelectionError::Api {
+                action: "updating watched torrent file selection",
+                source,
+            })?;
+        if is_empty || auto_add_paused {
+            return Ok(());
+        }
+        api.api_torrent_action_start(TorrentIdOrHash::Id(id))
+            .await
+            .map_err(|source| AutoloadSelectionError::Api {
+                action: "starting watched torrent after file selection",
+                source,
+            })?;
+        Ok(())
+    }
+
+    async fn resolve_autoload_selection(
+        &self,
+        api: &Api,
+        id: usize,
+        selection_hooks: &[HookConfig],
+    ) -> Result<Vec<usize>, AutoloadSelectionError> {
+        let handle = api.mgr_handle(TorrentIdOrHash::Id(id)).map_err(|source| {
+            AutoloadSelectionError::Api {
+                action: "resolving watched torrent handle",
+                source,
             }
-        };
-        // The entry only carries the file list through
-        // `apply_file_selection`, which never reads its `source`.
-        let mut entry = entry_from_list_only(
-            &ApiAddTorrent::from(&response),
-            UiAddSource::Bytes(Vec::new()),
-        );
-        if self.apply_file_selection(&mut entry).await.is_empty() {
-            return None;
-        }
-        let selected: Vec<usize> = entry
+        })?;
+        handle
+            .wait_until_initialized()
+            .await
+            .map_err(AutoloadSelectionError::Initialize)?;
+        let details = api
+            .api_torrent_details(TorrentIdOrHash::Id(id))
+            .map_err(|source| AutoloadSelectionError::Api {
+                action: "reading initialized watched torrent details",
+                source,
+            })?;
+        let mut files: Vec<FileRow> = details
             .files
+            .as_deref()
+            .ok_or(AutoloadSelectionError::MissingFiles)?
             .iter()
-            .filter(|f| f.included)
-            .map(|f| f.file_index)
+            .enumerate()
+            .map(|(index, file)| FileRow {
+                file_index: index,
+                name: file.name.clone(),
+                length: file.length,
+                // The persisted pending state is empty, but hook responses
+                // compose from an unrestricted in-memory selection.
+                included: true,
+                exists: false,
+                progress: 0,
+                custom: Default::default(),
+            })
             .collect();
-        // Never add with nothing selected: despite the per-response guard in
-        // `apply_file_selection`, fall back to "all files" if it happens.
-        if selected.is_empty() || selected.len() == entry.files.len() {
-            return None;
+        let torrent = TorrentInfo {
+            id: Some(id),
+            name: details.name.clone(),
+            info_hash: details.info_hash.clone(),
+            output_folder: details.output_folder.clone(),
+        };
+
+        for hook in selection_hooks {
+            let request = FileSelectionRequest::new(torrent.clone(), &files);
+            let payload = envelope(HookEvent::FileSelection, request);
+            let body = super::http::send(&self.client, hook, HookEvent::FileSelection, &payload)
+                .await
+                .map_err(|source| AutoloadSelectionError::Request {
+                    hook: hook.name.clone(),
+                    source,
+                })?
+                .ok_or_else(|| AutoloadSelectionError::EmptyResponse {
+                    hook: hook.name.clone(),
+                })?;
+            let response: FileSelectionResponse =
+                serde_json::from_value(body).map_err(|error| {
+                    AutoloadSelectionError::InvalidResponse {
+                        hook: hook.name.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+            response.validate_strict(files.len()).map_err(|reason| {
+                AutoloadSelectionError::InvalidResponse {
+                    hook: hook.name.clone(),
+                    reason,
+                }
+            })?;
+            response.apply(&mut files);
         }
-        Some(selected)
+
+        Ok(files
+            .iter()
+            .filter(|file| file.included)
+            .map(|file| file.file_index)
+            .collect())
     }
 
     /// Spawn the background completion watcher on the tokio runtime. It polls
@@ -592,6 +787,7 @@ mod tests {
             name: "selector".into(),
             enabled: true,
             events: vec![HookEvent::FileSelection],
+            autoload_file_selection: false,
             method: HttpMethod::Post,
             url: format!("http://{addr}/select"),
             timeout_secs: 5,
@@ -630,67 +826,58 @@ mod tests {
         assert!(entry.files.iter().all(|f| f.included));
     }
 
-    // ── Autoload file selection (`file_selection_only_files`) ─────────────
+    // ── Autoload selection hook resolution ─────────────────────────────────
 
-    use crate::folder_watcher::tests::multi_file_torrent_bytes;
+    #[tokio::test]
+    async fn autoload_hooks_use_opt_in_and_deduplicate_events() {
+        let dispatcher = test_dispatcher(vec![
+            HookConfig {
+                name: "both".into(),
+                events: vec![HookEvent::FileSelection, HookEvent::TorrentColumns],
+                autoload_file_selection: true,
+                ..Default::default()
+            },
+            HookConfig {
+                name: "columns-without-opt-in".into(),
+                events: vec![HookEvent::TorrentColumns],
+                ..Default::default()
+            },
+            HookConfig {
+                name: "columns-opted-in".into(),
+                events: vec![HookEvent::TorrentColumns],
+                autoload_file_selection: true,
+                ..Default::default()
+            },
+            HookConfig {
+                name: "selection".into(),
+                events: vec![HookEvent::FileSelection],
+                ..Default::default()
+            },
+            HookConfig {
+                name: "disabled".into(),
+                enabled: false,
+                events: vec![HookEvent::FileSelection],
+                ..Default::default()
+            },
+        ])
+        .await;
 
-    fn selection_hook(addr: std::net::SocketAddr) -> HookConfig {
-        HookConfig {
-            name: "selector".into(),
-            enabled: true,
-            events: vec![HookEvent::FileSelection],
-            method: HttpMethod::Post,
-            url: format!("http://{addr}/select"),
-            timeout_secs: 5,
-            headers: Default::default(),
-            poll_secs: 10,
-        }
+        let names: Vec<String> = dispatcher
+            .autoload_hooks()
+            .into_iter()
+            .map(|hook| hook.name)
+            .collect();
+        assert_eq!(names, ["both", "columns-opted-in", "selection"]);
     }
 
-    /// The autoload path: the file list is resolved via a list-only add (the
-    /// session stays empty) and the hook's response becomes the
-    /// `only_files` restriction.
     #[tokio::test]
-    async fn file_selection_only_files_applies_hook_response() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = serve_once(listener, r#"{"exclude": [1]}"#);
-
-        let (dispatcher, api) = test_dispatcher_with_api(vec![selection_hook(addr)]).await;
-        let add = AddTorrent::from_bytes(multi_file_torrent_bytes());
-        let (only_files, raw_request) =
-            tokio::join!(dispatcher.file_selection_only_files(&api, &add), server);
-
-        assert_eq!(only_files, Some(vec![0]), "bbb.nfo should be excluded");
-        assert!(raw_request.contains("aaa.mkv"), "hook got the file list");
-        assert_eq!(
-            api.api_torrent_list_ext(librqbit::api::ApiTorrentListOpts { with_stats: false })
-                .torrents
-                .len(),
-            0,
-            "the list-only add must not add the torrent"
-        );
-    }
-
-    /// Without any `file_selection` hook there is no restriction — and no
-    /// list-only add at all.
-    #[tokio::test]
-    async fn file_selection_only_files_without_hooks_is_none() {
-        let (dispatcher, api) = test_dispatcher_with_api(vec![]).await;
-        let add = AddTorrent::from_bytes(multi_file_torrent_bytes());
-        assert_eq!(dispatcher.file_selection_only_files(&api, &add).await, None);
-    }
-
-    /// Magnets have no locally known file list, so they are added
-    /// unrestricted even when a `file_selection` hook is configured.
-    #[tokio::test]
-    async fn file_selection_only_files_skips_magnets() {
-        let (dispatcher, api) =
-            test_dispatcher_with_api(vec![selection_hook("127.0.0.1:1".parse().unwrap())]).await;
-        let add = AddTorrent::from_url(
-            "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&dn=x",
-        );
-        assert_eq!(dispatcher.file_selection_only_files(&api, &add).await, None);
+    async fn autoload_hooks_empty_without_selection_providers() {
+        let dispatcher = test_dispatcher(vec![HookConfig {
+            events: vec![HookEvent::TorrentColumns],
+            ..Default::default()
+        }])
+        .await;
+        assert!(dispatcher.autoload_hooks().is_empty());
     }
 
     #[tokio::test]
@@ -703,6 +890,7 @@ mod tests {
             name: "notify".into(),
             enabled: true,
             events: vec![HookEvent::TorrentAdded],
+            autoload_file_selection: false,
             method: HttpMethod::Post,
             url: format!("http://{addr}/added"),
             timeout_secs: 5,

@@ -22,17 +22,20 @@
 //!   `finished` flag. Fires exactly once per torrent on the
 //!   not-finished → finished transition; torrents that were already finished
 //!   when the app started never fire it.
-//! - [`HookEvent::FileSelection`] — the only request/response event. While
-//!   preparing the add-torrent dialog, the resolved file list is sent to the
-//!   hook and the JSON response decides which files are pre-selected. The
-//!   user can still adjust the selection before confirming.
+//! - [`HookEvent::FileSelection`] — while preparing the add-torrent dialog,
+//!   the resolved file list is sent to the hook and the JSON response decides
+//!   which files are pre-selected. Watched-folder adds also use this request
+//!   after metadata initialization; their selection is strict and is applied
+//!   before automatic start.
 //! - [`HookEvent::TorrentColumns`] — a polled request/response event: every
 //!   `HookConfig::poll_secs` the torrent list (optionally with per-torrent
 //!   file lists) is sent to the hook, and the response declares custom
-//!   columns with per-torrent/per-file values rendered by the UIs. Handled
-//!   by `app_daemon::columns::ColumnsProvider` so the browser client gets
-//!   the same data over the WebSocket protocol; see that module's docs for
-//!   the payload contract.
+//!   columns with per-torrent/per-file values rendered by the UIs. With
+//!   `HookConfig::autoload_file_selection`, a columns hook also answers
+//!   `file_selection` for watched-folder adds. Column values themselves never
+//!   alter desired files. Handled by `app_daemon::columns::ColumnsProvider` so
+//!   the browser client gets the same data over the WebSocket protocol; see
+//!   that module's docs for the payload contract.
 //!
 //! # Payloads
 //!
@@ -51,9 +54,10 @@
 //! }
 //! ```
 //!
-//! A `file_selection` request sends `torrent` (with `id: null`) plus a
-//! `files` array of `{index, name, length}`. The response body, if present,
-//! must be a JSON object with any of:
+//! A `file_selection` request sends `torrent` plus a `files` array of
+//! `{index, name, length}`. The dialog uses `id: null`; a watched-folder add
+//! uses its numeric post-add ID. The response body, if present, must be a JSON
+//! object with any of:
 //!
 //! ```json
 //! {
@@ -67,9 +71,10 @@
 //! `include`/`include_patterns` are whitelists (unlisted files are
 //! deselected), `exclude`/`exclude_patterns` clear matching files, and the
 //! fields are applied in the order shown. Patterns support `*` and `?` and
-//! match against the file name. An empty body or an error leaves the current
-//! selection unchanged, and a response that would deselect everything is
-//! ignored (it would otherwise add a torrent with nothing to download).
+//! match against the file name. In the add dialog, an empty body or an error
+//! leaves the current selection unchanged, and a response that would deselect
+//! everything is ignored. Strict auto-load instead leaves failures paused with
+//! no files selected, and accepts an explicitly empty selection.
 
 mod dispatcher;
 mod http;

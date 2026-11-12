@@ -31,6 +31,9 @@ pub struct HookConfig {
     pub enabled: bool,
     /// Events this hook subscribes to (see [`HookEvent`]).
     pub events: Vec<HookEvent>,
+    /// Also use a `torrent_columns` hook for strict watched-folder file
+    /// selection. The hook must answer `file_selection` requests.
+    pub autoload_file_selection: bool,
     pub method: HttpMethod,
     pub url: String,
     /// Request timeout in seconds.
@@ -48,6 +51,7 @@ impl Default for HookConfig {
             name: "New hook".to_string(),
             enabled: true,
             events: vec![HookEvent::TorrentAdded],
+            autoload_file_selection: false,
             method: HttpMethod::Post,
             url: String::new(),
             timeout_secs: 10,
@@ -449,6 +453,7 @@ mod tests {
                         HookEvent::FileSelection,
                         HookEvent::TorrentColumns,
                     ],
+                    autoload_file_selection: true,
                     method: HttpMethod::Get,
                     url: "http://127.0.0.1:9999/hook".into(),
                     timeout_secs: 3,
@@ -463,6 +468,7 @@ mod tests {
         assert!(s.contains(r#""file_selection""#));
         assert!(s.contains(r#""torrent_columns""#));
         assert!(s.contains(r#""poll_secs":5"#));
+        assert!(s.contains(r#""autoload_file_selection":true"#));
         let back: RqbitDesktopConfig = serde_json::from_str(&s).unwrap();
         assert!(cfg == back);
     }
@@ -475,5 +481,6 @@ mod tests {
         assert_eq!(h.method, HttpMethod::Post);
         assert_eq!(h.events, vec![HookEvent::TorrentAdded]);
         assert_eq!(h.poll_secs, 10);
+        assert!(!h.autoload_file_selection);
     }
 }

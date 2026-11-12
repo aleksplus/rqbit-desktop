@@ -1,5 +1,3 @@
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::*;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, Size, Theme, ThemeMode,
     button::{Button, ButtonVariants},
@@ -14,6 +12,8 @@ use gpui_kit::component::{
     },
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use std::{collections::BTreeMap, num::NonZeroU32, sync::Arc};
 
 use crate::{
@@ -834,6 +834,12 @@ fn get_hook_enabled(h: &HookConfig) -> bool {
 fn set_hook_enabled(h: &mut HookConfig, v: bool) {
     h.enabled = v;
 }
+fn get_hook_autoload_file_selection(h: &HookConfig) -> bool {
+    h.autoload_file_selection
+}
+fn set_hook_autoload_file_selection(h: &mut HookConfig, v: bool) {
+    h.autoload_file_selection = v;
+}
 fn get_hook_name(h: &HookConfig) -> String {
     h.name.clone()
 }
@@ -925,6 +931,18 @@ fn hook_groups(config: ConfigArc) -> Vec<SettingGroup> {
                 )
                 .layout(Axis::Vertical)
                 .description("Which lifecycle events trigger this hook."),
+                SettingItem::new(
+                    "Auto-load file selection",
+                    hook_switch_field(
+                        config.clone(),
+                        ix,
+                        get_hook_autoload_file_selection,
+                        set_hook_autoload_file_selection,
+                    ),
+                )
+                .description(
+                    "For Torrent columns hooks, also answer File selection requests for watched-folder adds. Downloads wait for selection; failures leave torrents paused.",
+                ),
                 SettingItem::new(
                     "Headers (one per line, \"Key: Value\")",
                     SettingField::render(hook_headers_field(config.clone(), ix)),

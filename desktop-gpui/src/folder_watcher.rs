@@ -1,13 +1,14 @@
 //! Watches the configured "autoload torrents" folder and feeds new
 //! `.torrent` / `.magnet` files through the same add path as the add-torrent
-//! dialog ([`HookDispatcher::add_and_dispatch_added`]). Like the dialog, the
-//! file list of `.torrent` files is resolved first and the `file_selection`
-//! hooks run over it, so a hook's pre-selection (e.g. watched files
-//! unchecked) applies to autoloaded torrents too. The shared callback
-//! also moves the source file to the configured "move added torrents to"
-//! folder after the add, for both watcher- and dialog-originated files.
-//! Watched torrents are added paused when `auto_add_paused` is set in the
-//! config (the default), so they can be reviewed before downloading.
+//! dialog ([`HookDispatcher::add_and_dispatch_added`]). When file-selection
+//! hooks apply, a fresh torrent is first added paused with an explicitly empty
+//! selection. Hooks run after metadata initialization, and the torrent starts
+//! only after their selection is persisted (unless `auto_add_paused` keeps it
+//! paused). Hook failures leave the pending paused-empty state intact.
+//! The shared callback also moves the source file to the configured "move
+//! added torrents to" folder after the add, for both watcher- and
+//! dialog-originated files. Each source is processed independently so slow
+//! magnet metadata resolution cannot block other watched files.
 //! When the move folder is configured inside the watch folder, it is
 //! excluded from watching so moved files are not picked up again.
 //!
@@ -136,7 +137,7 @@ pub fn start_folder_watcher(shared: Arc<RwLock<SharedState>>, hooks: Arc<HookDis
         {
             let path = entry.into_path();
             if is_torrent_or_magnet(&path) && !opts.skips(&path) {
-                process_file(&api, &hooks, opts.auto_add_paused, path).await;
+                spawn_process_file(&api, &hooks, opts.auto_add_paused, path);
             }
         }
 
@@ -164,7 +165,12 @@ fn is_torrent_or_magnet(path: &Path) -> bool {
     )
 }
 
-async fn handle_event(api: &Arc<Api>, hooks: &HookDispatcher, opts: &WatchOpts, ev: notify::Event) {
+async fn handle_event(
+    api: &Arc<Api>,
+    hooks: &Arc<HookDispatcher>,
+    opts: &WatchOpts,
+    ev: notify::Event,
+) {
     if !matches!(
         ev.kind,
         notify::EventKind::Create(_) | notify::EventKind::Modify(_)
@@ -173,19 +179,40 @@ async fn handle_event(api: &Arc<Api>, hooks: &HookDispatcher, opts: &WatchOpts, 
     }
     for path in ev.paths {
         if is_torrent_or_magnet(&path) && !opts.skips(&path) {
-            process_file(api, hooks, opts.auto_add_paused, path).await;
+            spawn_process_file(api, hooks, opts.auto_add_paused, path);
         }
     }
 }
 
+/// Process each source independently. In particular, librqbit resolves magnet
+/// metadata inside `api_add_torrent`, so awaiting that inline would block every
+/// other watched file behind one slow magnet.
+fn spawn_process_file(
+    api: &Arc<Api>,
+    hooks: &Arc<HookDispatcher>,
+    auto_add_paused: bool,
+    path: PathBuf,
+) {
+    let api = api.clone();
+    let hooks = hooks.clone();
+    let cancel = api.session().cancellation_token().clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = process_file(&api, &hooks, auto_add_paused, path) => {}
+        }
+    });
+}
+
 /// Add one source file through the shared add path (which also moves it to
 /// the configured folder on success). `auto_add_paused` comes from the
-/// config the watcher was started with and starts the torrent paused. The
-/// file is kept when the add fails, so the user can inspect it; it is
-/// retried on the next filesystem event.
+/// config the watcher was started with. Selection hooks force an initial
+/// paused-empty state even when automatic start is enabled. The source is
+/// kept when the add fails, so the user can inspect it; it is retried on the
+/// next filesystem event.
 async fn process_file(
     api: &Arc<Api>,
-    hooks: &HookDispatcher,
+    hooks: &Arc<HookDispatcher>,
     auto_add_paused: bool,
     path: PathBuf,
 ) {
@@ -200,19 +227,32 @@ async fn process_file(
             return;
         }
     };
-    // Run the `file_selection` hooks against the resolved file list, so
-    // autoloaded torrents get the same pre-selection as ones added through
-    // the dialog (e.g. watched files unchecked). Magnets have no local file
-    // list and are added unrestricted (see
-    // [`HookDispatcher::file_selection_only_files`]).
-    let only_files = hooks.file_selection_only_files(api, &add).await;
+    let selection_hooks = hooks.autoload_hooks();
+    let waits_for_selection = !selection_hooks.is_empty();
+    // An explicit empty selection is the fail-closed pending state. `None`
+    // would mark every file for download before the hooks responded.
+    let only_files = waits_for_selection.then(Vec::new);
+    let paused = waits_for_selection || auto_add_paused;
     // overwrite: true, matching librqbit's own folder watcher.
     let from = path.display().to_string();
-    if let Err(e) = hooks
-        .add_and_dispatch_added(api, add, only_files, true, auto_add_paused, Some(path))
+    match hooks
+        .add_autoload(api, add, only_files, true, paused, Some(path))
         .await
     {
-        warn!(path = %from, error = %e, "error adding torrent from watch folder");
+        Ok(outcome) => {
+            if waits_for_selection && let Some(id) = outcome.fresh_id {
+                hooks.spawn_autoload_selection(
+                    api.clone(),
+                    selection_hooks,
+                    id,
+                    auto_add_paused,
+                    from,
+                );
+            }
+        }
+        Err(e) => {
+            warn!(path = %from, error = %e, "error adding torrent from watch folder");
+        }
     }
 }
 
@@ -630,24 +670,12 @@ pub(crate) mod tests {
         assert_eq!(torrents[0].name.as_deref(), Some("hello"));
     }
 
-    /// A watched `.torrent` has its file selection adjusted by the
-    /// `file_selection` hooks before the add — here the hook excludes the
-    /// second file, and the session ends up with only the first file
-    /// included (the same pre-selection the add dialog applies).
-    #[tokio::test]
-    async fn watched_folder_applies_file_selection_hooks() {
-        use crate::config::{HookConfig, HttpMethod, RqbitDesktopConfigHooks};
-        use crate::hooks::HookEvent;
-        use crate::hooks::testutil::serve_once;
+    use crate::config::{HookConfig, HttpMethod, RqbitDesktopConfigHooks};
+    use crate::hooks::HookEvent;
+    use crate::hooks::testutil::{serve_once, serve_once_gated, serve_once_with_status};
+    use librqbit::api::TorrentIdOrHash;
 
-        let watch_dir = TempDir::new("watch-sel");
-        let move_dir = TempDir::new("move-sel");
-        let src = watch_dir.path().join("multi.torrent");
-        std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
+    async fn selection_test_api() -> Arc<Api> {
         let session = librqbit::Session::new_with_opts(
             std::env::temp_dir(),
             librqbit::SessionOptions {
@@ -660,21 +688,40 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let api = Arc::new(Api::new(session, None, None));
+        Arc::new(Api::new(session, None, None))
+    }
+
+    fn selection_hook(
+        addr: std::net::SocketAddr,
+        events: Vec<HookEvent>,
+        autoload_file_selection: bool,
+    ) -> HookConfig {
+        HookConfig {
+            name: "selector".into(),
+            enabled: true,
+            events,
+            autoload_file_selection,
+            method: HttpMethod::Post,
+            url: format!("http://{addr}/select"),
+            timeout_secs: 5,
+            headers: Default::default(),
+            poll_secs: 10,
+        }
+    }
+
+    fn start_selection_watcher(
+        api: &Arc<Api>,
+        watch_dir: &TempDir,
+        move_dir: &TempDir,
+        hook_configs: Vec<HookConfig>,
+        auto_add_paused: bool,
+    ) {
         let config = crate::config::RqbitDesktopConfig {
             load_torrents_folder: watch_dir.path().to_path_buf(),
             move_torrents_folder: move_dir.path().to_path_buf(),
+            auto_add_paused,
             hooks: RqbitDesktopConfigHooks {
-                hooks: vec![HookConfig {
-                    name: "selector".into(),
-                    enabled: true,
-                    events: vec![HookEvent::FileSelection],
-                    method: HttpMethod::Post,
-                    url: format!("http://{addr}/select"),
-                    timeout_secs: 10,
-                    headers: Default::default(),
-                    poll_secs: 10,
-                }],
+                hooks: hook_configs,
             },
             ..Default::default()
         };
@@ -683,42 +730,331 @@ pub(crate) mod tests {
             shared.clone(),
             tokio::runtime::Handle::current(),
         ));
-
-        // The hook runs inside the watcher task; serve the one-shot response
-        // concurrently.
-        tokio::spawn(serve_once(listener, r#"{"exclude": [1]}"#));
-
         start_folder_watcher(shared, hooks);
+    }
 
+    async fn only_torrent_id(api: &Api) -> usize {
+        let mut torrents = Vec::new();
         for _ in 0..100 {
-            if api
+            torrents = api
                 .api_torrent_list_ext(ApiTorrentListOpts { with_stats: false })
-                .torrents
-                .len()
-                == 1
-            {
+                .torrents;
+            if torrents.len() == 1 {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        let torrents = api
-            .api_torrent_list_ext(ApiTorrentListOpts { with_stats: false })
-            .torrents;
         assert_eq!(torrents.len(), 1, "the torrent should have been added");
-        let files = api
-            .api_torrent_details(librqbit::api::TorrentIdOrHash::Id(torrents[0].id.unwrap()))
+        torrents[0].id.unwrap()
+    }
+
+    fn included_files(api: &Api, id: usize) -> Vec<bool> {
+        api.api_torrent_details(TorrentIdOrHash::Id(id))
             .unwrap()
             .files
+            .unwrap()
+            .iter()
+            .map(|file| file.included)
+            .collect()
+    }
+
+    async fn wait_for_selection(api: &Api, id: usize, expected: &[bool]) {
+        let mut actual = Vec::new();
+        for _ in 0..100 {
+            actual = included_files(api, id);
+            if actual == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(actual, expected);
+    }
+
+    async fn wait_for_state(api: &Api, id: usize, expected: &str) {
+        let mut state = String::new();
+        for _ in 0..100 {
+            state = api
+                .api_stats_v1(TorrentIdOrHash::Id(id))
+                .unwrap()
+                .state
+                .to_string();
+            if state == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(state, expected);
+    }
+
+    fn assert_paused_empty(api: &Api, id: usize) {
+        assert!(
+            api.mgr_handle(TorrentIdOrHash::Id(id)).unwrap().is_paused(),
+            "torrent must remain paused"
+        );
+        assert_eq!(included_files(api, id), [false, false]);
+    }
+
+    /// Explicit file-selection hooks apply their response after the pending
+    /// add, while the configured paused setting remains in effect.
+    #[tokio::test]
+    async fn watched_folder_applies_file_selection_hooks() {
+        let watch_dir = TempDir::new("watch-sel");
+        let move_dir = TempDir::new("move-sel");
+        let src = watch_dir.path().join("multi.torrent");
+        std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api = selection_test_api().await;
+        let server = tokio::spawn(serve_once(listener, r#"{"exclude": [1]}"#));
+        start_selection_watcher(
+            &api,
+            &watch_dir,
+            &move_dir,
+            vec![selection_hook(addr, vec![HookEvent::FileSelection], false)],
+            true,
+        );
+
+        server.await.unwrap();
+        let id = only_torrent_id(&api).await;
+        wait_for_selection(&api, id, &[true, false]).await;
+        assert!(api.mgr_handle(TorrentIdOrHash::Id(id)).unwrap().is_paused());
+        assert!(move_dir.path().join("multi.torrent").exists());
+    }
+
+    /// A columns-only moviesync-style hook opts into strict selection. The
+    /// torrent is visibly paused-empty while the response is held, then starts
+    /// only after the desired files have been persisted.
+    #[tokio::test]
+    async fn watched_columns_hook_delays_selection_and_auto_start() {
+        let watch_dir = TempDir::new("watch-delayed");
+        let move_dir = TempDir::new("move-delayed");
+        let src = watch_dir.path().join("multi.torrent");
+        std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api = selection_test_api().await;
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_once_gated(
+            listener,
+            r#"{"exclude": [1]}"#,
+            seen_tx,
+            release_rx,
+        ));
+        start_selection_watcher(
+            &api,
+            &watch_dir,
+            &move_dir,
+            vec![selection_hook(addr, vec![HookEvent::TorrentColumns], true)],
+            false,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx)
+            .await
+            .unwrap()
             .unwrap();
-        assert_eq!(files.len(), 2);
-        assert!(files[0].included, "aaa.mkv should stay selected");
+        let id = only_torrent_id(&api).await;
+        assert_paused_empty(&api, id);
+        release_tx.send(()).unwrap();
+        let raw_request = server.await.unwrap();
+        assert!(raw_request.contains(r#""event":"file_selection""#));
         assert!(
-            !files[1].included,
-            "bbb.nfo should have been deselected by the hook"
+            raw_request
+                .to_lowercase()
+                .contains("x-rqbit-event: file_selection")
         );
+        wait_for_selection(&api, id, &[true, false]).await;
+        wait_for_state(&api, id, "live").await;
+        assert!(!api.mgr_handle(TorrentIdOrHash::Id(id)).unwrap().is_paused());
+    }
+
+    /// Every invalid/failing response leaves the original pending selection
+    /// intact. The successful add still archives its source file.
+    #[tokio::test]
+    async fn watched_folder_selection_failures_stay_paused_empty() {
+        for (tag, status, body) in [
+            ("empty", "200 OK", ""),
+            ("malformed", "200 OK", "not json"),
+            ("missing-directives", "200 OK", r#"{"unknown": true}"#),
+            ("invalid-index", "200 OK", r#"{"exclude": [2]}"#),
+            (
+                "http-error",
+                "500 Internal Server Error",
+                r#"{"exclude": [1]}"#,
+            ),
+        ] {
+            let watch_dir = TempDir::new(&format!("watch-failure-{tag}"));
+            let move_dir = TempDir::new(&format!("move-failure-{tag}"));
+            let src = watch_dir.path().join("multi.torrent");
+            std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let api = selection_test_api().await;
+            let server = tokio::spawn(serve_once_with_status(listener, status, body));
+            start_selection_watcher(
+                &api,
+                &watch_dir,
+                &move_dir,
+                vec![selection_hook(addr, vec![HookEvent::TorrentColumns], true)],
+                false,
+            );
+
+            server.await.unwrap();
+            let id = only_torrent_id(&api).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_paused_empty(&api, id);
+            assert!(move_dir.path().join("multi.torrent").exists(), "{tag}");
+        }
+    }
+
+    #[tokio::test]
+    async fn watched_folder_hook_timeout_stays_paused_empty() {
+        let watch_dir = TempDir::new("watch-timeout");
+        let move_dir = TempDir::new("move-timeout");
+        let src = watch_dir.path().join("multi.torrent");
+        std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api = selection_test_api().await;
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_once_gated(
+            listener,
+            r#"{"exclude": [1]}"#,
+            seen_tx,
+            release_rx,
+        ));
+        let mut hook = selection_hook(addr, vec![HookEvent::FileSelection], false);
+        hook.timeout_secs = 1;
+        start_selection_watcher(&api, &watch_dir, &move_dir, vec![hook], false);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let id = only_torrent_id(&api).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_paused_empty(&api, id);
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn watched_folder_valid_empty_selection_does_not_auto_start() {
+        let watch_dir = TempDir::new("watch-empty-selection");
+        let move_dir = TempDir::new("move-empty-selection");
+        let src = watch_dir.path().join("multi.torrent");
+        std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api = selection_test_api().await;
+        let server = tokio::spawn(serve_once(listener, r#"{"include": []}"#));
+        start_selection_watcher(
+            &api,
+            &watch_dir,
+            &move_dir,
+            vec![selection_hook(addr, vec![HookEvent::FileSelection], false)],
+            false,
+        );
+
+        server.await.unwrap();
+        let id = only_torrent_id(&api).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_paused_empty(&api, id);
+    }
+
+    /// Columns providers that have not opted in retain the old immediate add
+    /// behavior and are never contacted for file selection.
+    #[tokio::test]
+    async fn watched_columns_hook_without_opt_in_uses_immediate_auto_start() {
+        let watch_dir = TempDir::new("watch-no-opt-in");
+        let move_dir = TempDir::new("move-no-opt-in");
+        let src = watch_dir.path().join("multi.torrent");
+        std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api = selection_test_api().await;
+        start_selection_watcher(
+            &api,
+            &watch_dir,
+            &move_dir,
+            vec![selection_hook(addr, vec![HookEvent::TorrentColumns], false)],
+            false,
+        );
+
+        let id = only_torrent_id(&api).await;
+        wait_for_selection(&api, id, &[true, true]).await;
+        wait_for_state(&api, id, "live").await;
+    }
+
+    /// A later hook failure cannot leave an earlier hook's partial selection
+    /// persisted or trigger auto-start.
+    #[tokio::test]
+    async fn watched_folder_multiple_hooks_are_atomic() {
+        let watch_dir = TempDir::new("watch-atomic");
+        let move_dir = TempDir::new("move-atomic");
+        let src = watch_dir.path().join("multi.torrent");
+        std::fs::write(&src, multi_file_torrent_bytes()).unwrap();
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let api = selection_test_api().await;
+        let first_server = tokio::spawn(serve_once(first, r#"{"exclude": [1]}"#));
+        let second_server = tokio::spawn(serve_once(second, "not json"));
+        start_selection_watcher(
+            &api,
+            &watch_dir,
+            &move_dir,
+            vec![
+                selection_hook(first_addr, vec![HookEvent::FileSelection], false),
+                selection_hook(second_addr, vec![HookEvent::TorrentColumns], true),
+            ],
+            false,
+        );
+
+        first_server.await.unwrap();
+        second_server.await.unwrap();
+        let id = only_torrent_id(&api).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_paused_empty(&api, id);
+    }
+
+    /// librqbit resolves magnet metadata before registering the torrent. If
+    /// resolution is impossible, auto-load must not retry an unrestricted add
+    /// or archive the source as though selection had succeeded.
+    #[tokio::test]
+    async fn watched_magnet_metadata_failure_does_not_add_unrestricted() {
+        let watch_dir = TempDir::new("watch-magnet-pending");
+        let move_dir = TempDir::new("move-magnet-pending");
+        let src = watch_dir.path().join("pending.magnet");
+        // Hybrid magnet: librqbit currently requires the v1 hash for magnet
+        // adds, while the v2 hash preserves BEP 52 identity.
+        let magnet = format!(
+            "magnet:?xt=urn:btih:{}&xt=urn:btmh:1220{}&dn=pending",
+            "0".repeat(40),
+            "0".repeat(64)
+        );
+        std::fs::write(&src, magnet).unwrap();
+        assert!(read_and_validate(&src).is_ok());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api = selection_test_api().await;
+        start_selection_watcher(
+            &api,
+            &watch_dir,
+            &move_dir,
+            vec![selection_hook(addr, vec![HookEvent::TorrentColumns], true)],
+            false,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
-            move_dir.path().join("multi.torrent").exists(),
-            "source file should have been moved after the add"
+            api.api_torrent_list_ext(ApiTorrentListOpts { with_stats: false })
+                .torrents
+                .is_empty()
         );
+        assert!(src.exists());
+        assert!(!move_dir.path().join("pending.magnet").exists());
     }
 }

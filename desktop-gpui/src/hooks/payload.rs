@@ -74,8 +74,8 @@ pub(crate) struct FileSelectionFile<'a> {
     length: u64,
 }
 
-/// Payload for the [`HookEvent::FileSelection`] request. The torrent is not
-/// part of the session yet, so its `id` is `None`.
+/// Payload for the [`HookEvent::FileSelection`] request. Dialog previews use
+/// `id: None`; watched-folder finalization uses the numeric post-add ID.
 #[derive(Serialize)]
 pub(crate) struct FileSelectionRequest<'a> {
     pub torrent: TorrentInfo,
@@ -116,6 +116,32 @@ pub struct FileSelectionResponse {
 }
 
 impl FileSelectionResponse {
+    /// Validate a response used for strict auto-load selection. Unlike the
+    /// add-dialog flow, an empty directive set or invalid index must not be
+    /// silently interpreted as an unrestricted selection.
+    pub fn validate_strict(&self, file_count: usize) -> Result<(), String> {
+        if self.include.is_none()
+            && self.exclude.is_none()
+            && self.include_patterns.is_none()
+            && self.exclude_patterns.is_none()
+        {
+            return Err("response contains no file selection directives".to_string());
+        }
+        for (field, indices) in [
+            ("include", self.include.as_ref()),
+            ("exclude", self.exclude.as_ref()),
+        ] {
+            if let Some(index) =
+                indices.and_then(|indices| indices.iter().find(|&&index| index >= file_count))
+            {
+                return Err(format!(
+                    "{field} index {index} is out of range for {file_count} files"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether applying this response to `files` would leave nothing
     /// selected.
     pub fn selects_nothing(&self, files: &[FileRow]) -> bool {
@@ -319,5 +345,26 @@ mod tests {
         let resp: FileSelectionResponse = serde_json::from_str(r#"{"exclude": [3]}"#).unwrap();
         assert_eq!(resp.exclude, Some(vec![3]));
         assert!(resp.include.is_none());
+    }
+
+    #[test]
+    fn strict_validation_requires_directives_and_valid_indices() {
+        assert!(FileSelectionResponse::default().validate_strict(2).is_err());
+        let out_of_range = FileSelectionResponse {
+            exclude: Some(vec![2]),
+            ..Default::default()
+        };
+        assert!(out_of_range.validate_strict(2).is_err());
+
+        // An explicit empty whitelist is valid and intentionally selects no
+        // files in the strict auto-load flow.
+        let empty = FileSelectionResponse {
+            include: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(empty.validate_strict(2).is_ok());
+        let mut files = vec![row(0, "a", true), row(1, "b", true)];
+        empty.apply(&mut files);
+        assert!(files.iter().all(|file| !file.included));
     }
 }
