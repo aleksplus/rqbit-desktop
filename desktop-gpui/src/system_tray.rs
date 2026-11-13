@@ -26,7 +26,7 @@ fn tray_menu() -> Vec<MenuItem> {
 
 fn tray_icon() -> gpui_tray::Result<Icon> {
     let image = image::load_from_memory_with_format(
-        include_bytes!("../icons/32x32.png"),
+        include_bytes!("../icons/tray@128x128.png"),
         image::ImageFormat::Png,
     )
     .map_err(|error| {
@@ -36,7 +36,7 @@ fn tray_icon() -> gpui_tray::Result<Icon> {
     let (width, height) = image.dimensions();
     let builder = Icon::from_rgba(image.into_raw(), width, height);
     #[cfg(target_os = "macos")]
-    let builder = builder.scale_factor(2.0);
+    let builder = builder.scale_factor(8.0);
     builder.build()
 }
 
