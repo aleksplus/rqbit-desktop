@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "gpui-agent": {
+      "type": "stdio",
+      "command": "gpui-agent",
+      "args": [
+        "--connect",
+        "rqbit-desktop-fixture",
+        "mcp"
+      ],
+      "env": {
+        "GPUI_AGENT_ADDR": "127.0.0.1:17421",
+        "GPUI_AGENT_TOKEN": "${GPUI_AGENT_TOKEN:-dev-secret}"
+      }
+    }
+  }
+}
