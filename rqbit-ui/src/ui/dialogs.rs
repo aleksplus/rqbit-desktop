@@ -1,4 +1,3 @@
-use gpui_kit::*;
 use gpui_kit::component::{
     ActiveTheme as _, StyledExt as _,
     checkbox::Checkbox,
@@ -6,6 +5,9 @@ use gpui_kit::component::{
     input::{Input, InputState},
     v_flex,
 };
+use gpui_kit::*;
+
+use crate::ui::agent::{AutomationRegistry, SharedAutomationRegistry};
 
 /// A modal alert body for confirming torrent deletion.
 ///
@@ -17,6 +19,8 @@ pub struct DeleteDialog {
     ids: Vec<usize>,
     names: Vec<String>,
     delete_files: bool,
+    /// Painted-bounds registry (disabled in production builds).
+    automation: SharedAutomationRegistry,
 }
 
 impl DeleteDialog {
@@ -30,7 +34,15 @@ impl DeleteDialog {
             ids,
             names,
             delete_files: true,
+            automation: AutomationRegistry::disabled(),
         }
+    }
+
+    /// Attach a painted-bounds registry (agent-testing). The default is a
+    /// disabled registry, so production callers keep using [`Self::new`].
+    pub fn with_automation(mut self, automation: SharedAutomationRegistry) -> Self {
+        self.automation = automation;
+        self
     }
 
     /// Whether this dialog confirms deletion of multiple torrents. Derived
@@ -43,6 +55,20 @@ impl DeleteDialog {
     /// files should be deleted along with the torrent entries.
     pub fn confirmation(&self) -> (Vec<usize>, bool) {
         (self.ids.clone(), self.delete_files)
+    }
+
+    /// The current "also delete downloaded files" checkbox state.
+    #[cfg(feature = "agent-testing")]
+    pub fn delete_files(&self) -> bool {
+        self.delete_files
+    }
+
+    /// Set the "also delete downloaded files" checkbox (agent dispatch path;
+    /// mirrors the checkbox's own click handler).
+    #[cfg(feature = "agent-testing")]
+    pub fn set_delete_files(&mut self, delete_files: bool, cx: &mut Context<Self>) {
+        self.delete_files = delete_files;
+        cx.notify();
     }
 
     /// Dialog title text.
@@ -76,32 +102,39 @@ impl DeleteDialog {
 impl Render for DeleteDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let automation = self.automation.clone();
 
-        v_flex()
-            .gap_3()
-            .child(
-                div()
-                    .rounded_md()
-                    .bg(theme.muted)
-                    .p_3()
-                    .max_h(px(200.))
-                    .overflow_y_hidden()
-                    .children(
-                        self.names
-                            .iter()
-                            .map(|name| div().text_color(theme.foreground).child(name.clone())),
-                    ),
-            )
-            .child(
-                Checkbox::new("delete-files")
-                    .checked(self.delete_files)
-                    .label("Also delete downloaded files")
-                    .on_click(
-                        cx.listener(|this: &mut DeleteDialog, checked: &bool, _, _| {
-                            this.delete_files = *checked;
-                        }),
-                    ),
-            )
+        AutomationRegistry::track(
+            &automation,
+            "dialog-delete",
+            v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .rounded_md()
+                        .bg(theme.muted)
+                        .p_3()
+                        .max_h(px(200.))
+                        .overflow_y_hidden()
+                        .children(
+                            self.names
+                                .iter()
+                                .map(|name| div().text_color(theme.foreground).child(name.clone())),
+                        ),
+                )
+                .child(AutomationRegistry::track_wrapped(
+                    &automation,
+                    "delete-files",
+                    Checkbox::new("delete-files")
+                        .checked(self.delete_files)
+                        .label("Also delete downloaded files")
+                        .on_click(
+                            cx.listener(|this: &mut DeleteDialog, checked: &bool, _, _| {
+                                this.delete_files = *checked;
+                            }),
+                        ),
+                )),
+        )
     }
 }
 
@@ -111,6 +144,8 @@ impl Render for DeleteDialog {
 /// (see `MainPanel::on_add_magnet`).
 pub struct MagnetDialog {
     input_state: Entity<InputState>,
+    /// Painted-bounds registry (disabled in production builds).
+    automation: SharedAutomationRegistry,
 }
 
 impl MagnetDialog {
@@ -118,7 +153,15 @@ impl MagnetDialog {
         Self {
             input_state: cx
                 .new(|cx| InputState::new(window, cx).placeholder("magnet:?xt=urn:btih:...")),
+            automation: AutomationRegistry::disabled(),
         }
+    }
+
+    /// Attach a painted-bounds registry (agent-testing). The default is a
+    /// disabled registry, so production callers keep using [`Self::new`].
+    pub fn with_automation(mut self, automation: SharedAutomationRegistry) -> Self {
+        self.automation = automation;
+        self
     }
 
     /// The trimmed magnet URL entered so far, or `None` when the field is
@@ -127,17 +170,52 @@ impl MagnetDialog {
         let value = self.input_state.read(cx).value().trim().to_string();
         (!value.is_empty()).then_some(value)
     }
+
+    /// The raw (untrimmed) input text, for agent snapshots.
+    #[cfg(feature = "agent-testing")]
+    pub fn magnet_value(&self, cx: &App) -> String {
+        self.input_state.read(cx).value().to_string()
+    }
+
+    /// Replace the input text (agent dispatch path). Like the human editing
+    /// path, this only mutates the field; the hosting dialog's Confirm
+    /// decides what happens with the value.
+    #[cfg(feature = "agent-testing")]
+    pub fn set_magnet(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.input_state.clone();
+        input.update(cx, |state, cx| {
+            state.set_value(value.to_string(), window, cx)
+        });
+    }
+
+    /// Focus handle of the magnet input, for agent focus dispatch.
+    #[cfg(feature = "agent-testing")]
+    pub fn input_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input_state.read(cx).focus_handle(cx)
+    }
 }
 
 impl Render for MagnetDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let automation = self.automation.clone();
 
-        v_flex().gap_3().child(Input::new(&self.input_state)).child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme.muted_foreground)
-                .child("Tip: paste a magnet link or a 40-char info hash."),
+        AutomationRegistry::track(
+            &automation,
+            "dialog-magnet",
+            v_flex()
+                .gap_3()
+                .child(AutomationRegistry::track_wrapped(
+                    &automation,
+                    "magnet-input",
+                    Input::new(&self.input_state),
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child("Tip: paste a magnet link or a 40-char info hash."),
+                ),
         )
     }
 }
@@ -168,11 +246,23 @@ pub struct AboutInfo {
 /// `Dialog` component (see `MainPanel::create_about_dialog`).
 pub struct AboutDialog {
     info: AboutInfo,
+    /// Painted-bounds registry (disabled in production builds).
+    automation: SharedAutomationRegistry,
 }
 
 impl AboutDialog {
     pub fn new(info: AboutInfo, _window: &mut Window, _cx: &mut Context<Self>) -> Self {
-        Self { info }
+        Self {
+            info,
+            automation: AutomationRegistry::disabled(),
+        }
+    }
+
+    /// Attach a painted-bounds registry (agent-testing). The default is a
+    /// disabled registry, so production callers keep using [`Self::new`].
+    pub fn with_automation(mut self, automation: SharedAutomationRegistry) -> Self {
+        self.automation = automation;
+        self
     }
 
     pub fn info(&self) -> &AboutInfo {
@@ -184,64 +274,69 @@ impl Render for AboutDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let info = &self.info;
+        let automation = self.automation.clone();
 
-        v_flex()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(theme.muted_foreground)
-                    .child(format!("Version {}", info.version)),
-            )
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child(info.description.clone()),
-            )
-            .child(div().h(px(1.)).w_full().bg(theme.border))
-            .child(
-                // Version/author rows: name + version on the left, author on
-                // the right.
-                v_flex()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(div().font_medium().child(info.engine_name.clone()))
-                                    .child(
-                                        div()
-                                            .text_color(theme.muted_foreground)
-                                            .child(info.engine_version.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child(info.engine_author.clone()),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(div().font_medium().child(info.desktop_name.clone()))
-                                    .child(
-                                        div()
-                                            .text_color(theme.muted_foreground)
-                                            .child(info.version.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child(info.desktop_author.clone()),
-                            ),
-                    ),
-            )
+        AutomationRegistry::track(
+            &automation,
+            "dialog-about",
+            v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("Version {}", info.version)),
+                )
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(info.description.clone()),
+                )
+                .child(div().h(px(1.)).w_full().bg(theme.border))
+                .child(
+                    // Version/author rows: name + version on the left, author on
+                    // the right.
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().font_medium().child(info.engine_name.clone()))
+                                        .child(
+                                            div()
+                                                .text_color(theme.muted_foreground)
+                                                .child(info.engine_version.clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(theme.muted_foreground)
+                                        .child(info.engine_author.clone()),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().font_medium().child(info.desktop_name.clone()))
+                                        .child(
+                                            div()
+                                                .text_color(theme.muted_foreground)
+                                                .child(info.version.clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(theme.muted_foreground)
+                                        .child(info.desktop_author.clone()),
+                                ),
+                        ),
+                ),
+        )
     }
 }

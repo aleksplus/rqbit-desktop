@@ -1,12 +1,13 @@
 //! Torrent list table: row model, selection/sort state, and cell rendering.
 
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::*;
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, checkbox::Checkbox, h_flex,
     menu::PopupMenuItem, notification::Notification, progress::Progress,
 };
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use rqbit_protocol::{
 
 use crate::client::TorrentClient;
 use crate::host::UiHost;
+use crate::ui::agent::SharedAutomationRegistry;
 use crate::ui::artwork::{ArtworkShape, ROW_WEDGE_HEIGHT, ROW_WEDGE_WIDTH, masked_artwork};
 use crate::ui::main_panel::MainPanel;
 use crate::ui::utils::{
@@ -440,6 +442,7 @@ pub struct TorrentTableDelegate {
     /// Data source and host services for the context-menu actions.
     client: Arc<dyn TorrentClient>,
     host: Arc<dyn UiHost>,
+    automation: SharedAutomationRegistry,
 }
 
 impl TorrentTableDelegate {
@@ -494,6 +497,7 @@ impl TorrentTableDelegate {
         main_panel: WeakEntity<MainPanel>,
         client: Arc<dyn TorrentClient>,
         host: Arc<dyn UiHost>,
+        automation: SharedAutomationRegistry,
     ) -> Self {
         Self {
             all_rows: Vec::new(),
@@ -511,6 +515,7 @@ impl TorrentTableDelegate {
             main_panel,
             client,
             host,
+            automation,
         }
     }
 
@@ -520,6 +525,13 @@ impl TorrentTableDelegate {
     pub fn set_filter(&mut self, search: String, status: String) {
         self.filter = TorrentFilter { search, status };
         self.apply_filter();
+    }
+
+    /// Set the shift-click anchor by torrent id. Agent row clicks mirror a
+    /// plain mouse click, which records the anchor alongside the selection.
+    #[cfg(feature = "agent-testing")]
+    pub fn set_anchor(&mut self, id: u64) {
+        self.anchor_id = Some(id);
     }
 
     /// Record the session's default download folder (normalized), keeping
@@ -984,8 +996,16 @@ impl TableDelegate for TorrentTableDelegate {
                     cx,
                 )
             });
+        let automation = self.automation.clone();
+        let torrent_id = self.rows.get(row_ix).map_or(row_ix as u64, |row| row.id);
         div()
-            .id(("torrent-row", row_ix))
+            .id(("torrent-row", torrent_id))
+            .on_prepaint(move |bounds, _window, _cx| {
+                automation
+                    .lock()
+                    .unwrap()
+                    .record(format!("torrent-{torrent_id}"), bounds);
+            })
             .relative()
             .when(is_paused, |this| this.text_color(dimmed_text))
             .when(is_child, |this| this.border_l_1().border_color(child_guide))

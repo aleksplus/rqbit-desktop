@@ -1,4 +1,3 @@
-use gpui_kit::*;
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -7,6 +6,7 @@ use gpui_kit::component::{
     progress::Progress,
     table::{Column, ColumnSort, TableDelegate, TableState},
 };
+use gpui_kit::*;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 

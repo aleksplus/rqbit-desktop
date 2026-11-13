@@ -1,4 +1,5 @@
 pub mod add_torrent_dialog;
+pub mod agent;
 pub mod artwork;
 pub mod dialogs;
 pub mod explorer;

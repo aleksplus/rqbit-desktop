@@ -1843,6 +1843,7 @@ dependencies = [
  "directories",
  "futures",
  "gethostname",
+ "gpui-agent",
  "gpui-kit",
  "gpui-tray",
  "http",
@@ -1852,8 +1853,10 @@ dependencies = [
  "librqbit-dualstack-sockets",
  "metrics-exporter-prometheus",
  "notify",
+ "objc",
  "open",
  "parking_lot",
+ "raw-window-handle",
  "reqwest",
  "rqbit-protocol",
  "rqbit-ui",
@@ -2816,6 +2819,19 @@ dependencies = [
  "presser",
  "thiserror 2.0.20",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "gpui-agent"
+version = "0.1.0"
+source = "git+https://github.com/hexuria/gpui-agent?rev=b0007f2904b56d0ba44e48bd301da43d7bd286f2#b0007f2904b56d0ba44e48bd301da43d7bd286f2"
+dependencies = [
+ "hmac",
+ "png 0.17.16",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

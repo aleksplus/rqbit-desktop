@@ -82,6 +82,17 @@ walkdir = {workspace = true}
 open = "5"
 # URL-encoding of stream-URL filename segments.
 urlencoding = {workspace = true}
+# Optional: gpui-agent harness for automated agent-driven UI testing.
+# Pinned to a specific upstream revision; only pulled in by `agent-testing`.
+gpui-agent = {git = "https://github.com/hexuria/gpui-agent", rev = "b0007f2904b56d0ba44e48bd301da43d7bd286f2", optional = true}
+# Optional: raw window handle access, needed by the agent bridge to expose
+# native window handles to gpui-agent.
+raw-window-handle = {version = "0.6", optional = true}
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Optional: Objective-C runtime bindings, needed by the agent bridge on macOS
+# to reach the NSWindow behind a GPUI window.
+objc = {version = "0.2.7", optional = true}
 
 [dev-dependencies]
 # Headless UI tests (gpui_kit::test) need the kit's test-support feature.
@@ -94,3 +105,8 @@ disable-upload = ["librqbit/disable-upload"]
 # spawn site so a self-re-arming task (executor wake storm) can be named.
 # Pair with the RQBIT_TASK_PROFILER env var, see `src/task_profiler.rs`.
 task-profiler = ["gpui-kit/profiler"]
+# Opt-in agent-driven UI testing: compiles the `agent_bridge` module, which
+# wires gpui-agent to the desktop app's windows. Default-off; pulls in the
+# optional gpui-agent / raw-window-handle / (macOS) objc dependencies and the
+# matching rqbit-ui hooks.
+agent-testing = ["dep:gpui-agent", "dep:raw-window-handle", "dep:objc", "rqbit-ui/agent-testing"]

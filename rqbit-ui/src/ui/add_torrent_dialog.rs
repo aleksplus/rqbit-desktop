@@ -1,13 +1,14 @@
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::*;
 use gpui_kit::component::{
     ActiveTheme as _,
     checkbox::Checkbox,
     table::{DataTable, TableState},
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use crate::client::UiAddSource;
+use crate::ui::agent::{AutomationRegistry, SharedAutomationRegistry};
 use crate::ui::file_table::{FileRow, FileTableDelegate};
 
 /// Events emitted by [`AddTorrentDialog`].
@@ -50,6 +51,7 @@ pub struct AddTorrentDialog {
     table_state: Entity<TableState<FileTableDelegate>>,
     /// Whether to overwrite existing files (required to resume/seed into them).
     overwrite: bool,
+    automation: SharedAutomationRegistry,
 }
 
 impl EventEmitter<AddTorrentDialogEvent> for AddTorrentDialog {}
@@ -67,9 +69,15 @@ impl AddTorrentDialog {
             current: 0,
             table_state,
             overwrite: true,
+            automation: AutomationRegistry::disabled(),
         };
         this.load_current(cx);
         this
+    }
+
+    pub fn with_automation(mut self, automation: SharedAutomationRegistry) -> Self {
+        self.automation = automation;
+        self
     }
 
     /// Whether any of the current torrent's files already exist on disk.
@@ -188,62 +196,69 @@ impl Render for AddTorrentDialog {
             .get(self.current)
             .and_then(|e| e.hook_note.clone());
 
-        v_flex()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(theme.muted_foreground)
-                    .child(name),
-            )
-            .when_some(hook_note, |this, note| {
-                this.child(
+        let automation = self.automation.clone();
+        AutomationRegistry::track_wrapped(
+            &automation,
+            "dialog-add",
+            v_flex()
+                .gap_3()
+                .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(theme.muted_foreground)
-                        .child(format!(
-                            "File selection adjusted by hook: {note}. You can still change it."
-                        )),
+                        .child(name),
                 )
-            })
-            .when(has_existing, |this| {
-                this.child(
-                    div()
-                        .p_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(gpui::rgb(0xb45309))
-                        .bg(gpui::rgb(0x422006))
-                        .text_color(gpui::rgb(0xfbbf24))
-                        .text_size(px(12.))
-                        .child(
-                            "Some files already exist at the destination. They will be kept \
+                .when_some(hook_note, |this, note| {
+                    this.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "File selection adjusted by hook: {note}. You can still change it."
+                            )),
+                    )
+                })
+                .when(has_existing, |this| {
+                    this.child(
+                        div()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(gpui::rgb(0xb45309))
+                            .bg(gpui::rgb(0x422006))
+                            .text_color(gpui::rgb(0xfbbf24))
+                            .text_size(px(12.))
+                            .child(
+                                "Some files already exist at the destination. They will be kept \
                              and only missing pieces downloaded. Enable \"Overwrite existing \
                              files\" below to replace them instead (also required to resume/seed).",
+                            ),
+                    )
+                })
+                .child(if has_files {
+                    div()
+                        .flex_1()
+                        .min_h(px(200.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded_md()
+                        .overflow_hidden()
+                        .child(DataTable::new(&self.table_state))
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_color(gpui::rgb(0x888888))
+                        .child("No file selection available – all files will be downloaded.")
+                        .into_any_element()
+                })
+                .child(
+                    Checkbox::new("overwrite-existing")
+                        .checked(self.overwrite)
+                        .label("Overwrite existing files")
+                        .on_click(
+                            cx.listener(|this, _checked, _, cx| this.on_toggle_overwrite(cx)),
                         ),
-                )
-            })
-            .child(if has_files {
-                div()
-                    .flex_1()
-                    .min_h(px(200.))
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded_md()
-                    .overflow_hidden()
-                    .child(DataTable::new(&self.table_state))
-                    .into_any_element()
-            } else {
-                div()
-                    .text_color(gpui::rgb(0x888888))
-                    .child("No file selection available – all files will be downloaded.")
-                    .into_any_element()
-            })
-            .child(
-                Checkbox::new("overwrite-existing")
-                    .checked(self.overwrite)
-                    .label("Overwrite existing files")
-                    .on_click(cx.listener(|this, _checked, _, cx| this.on_toggle_overwrite(cx))),
-            )
+                ),
+        )
     }
 }

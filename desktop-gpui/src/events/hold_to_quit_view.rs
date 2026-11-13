@@ -42,7 +42,7 @@ impl Render for HoldToQuitView {
                             executor.timer(Duration::from_secs(1)).await;
                             async_cx.update(|cx| {
                                 info!("1 second elapsed! Exiting…");
-                                cx.quit();
+                                crate::request_quit(cx);
                             });
                         }
                     });

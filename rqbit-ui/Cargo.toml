@@ -25,3 +25,7 @@ gpui-kit = {version = "0.9.0", features = ["test-support"]}
 
 [features]
 default = []
+# Opt-in agent-driven UI testing hooks. Default-off; enabled by the desktop
+# app's `agent-testing` feature. Carries no dependencies on its own — it only
+# gates instrumentation code inside rqbit-ui.
+agent-testing = []

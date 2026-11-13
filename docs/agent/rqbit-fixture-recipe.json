@@ -1,0 +1,227 @@
+{
+  "v": 1,
+  "name": "rqbit-fixture-smoke",
+  "app": "rqbit-desktop-fixture",
+  "steps": [
+    { "id": "wait", "op": "wait" },
+    {
+      "id": "search-alpha",
+      "op": "type",
+      "target": "torrent-search",
+      "text": "Alpha",
+      "delivery": "virtual",
+      "needs": ["wait"]
+    },
+    {
+      "id": "search-filtered",
+      "op": "wait_until",
+      "timeout_ms": 2000,
+      "target": "torrent-2",
+      "exists": false,
+      "needs": ["search-alpha"]
+    },
+    {
+      "id": "alpha-visible",
+      "op": "assert",
+      "target": "torrent-1",
+      "exists": true,
+      "visible": true,
+      "name": "Fixture Alpha",
+      "needs": ["search-filtered"]
+    },
+    {
+      "id": "clear-search",
+      "op": "set_value",
+      "target": "torrent-search",
+      "value": "",
+      "needs": ["alpha-visible"]
+    },
+    {
+      "id": "beta-restored",
+      "op": "wait_until",
+      "timeout_ms": 2000,
+      "target": "torrent-2",
+      "exists": true,
+      "visible": true,
+      "needs": ["clear-search"]
+    },
+    {
+      "id": "open-alpha",
+      "op": "click",
+      "target": "torrent-1",
+      "needs": ["beta-restored"]
+    },
+    {
+      "id": "details-visible",
+      "op": "wait_until",
+      "timeout_ms": 2000,
+      "target": "torrent-detail-1",
+      "exists": true,
+      "visible": true,
+      "screenshot": true,
+      "needs": ["open-alpha"]
+    },
+    {
+      "id": "files-tab",
+      "op": "click",
+      "target": "detail-tab-files",
+      "needs": ["details-visible"]
+    },
+    {
+      "id": "exclude-first-file",
+      "op": "click",
+      "target": "torrent-1-file-0",
+      "needs": ["files-tab"]
+    },
+    {
+      "id": "first-file-excluded",
+      "op": "wait_until",
+      "timeout_ms": 2000,
+      "target": "torrent-1-file-0",
+      "checked": false,
+      "needs": ["exclude-first-file"]
+    },
+    {
+      "id": "pause-alpha",
+      "op": "click",
+      "target": "pause",
+      "needs": ["first-file-excluded"]
+    },
+    {
+      "id": "alpha-paused",
+      "op": "wait_until",
+      "timeout_ms": 3000,
+      "target": "torrent-1-status",
+      "name": "paused",
+      "needs": ["pause-alpha"]
+    },
+    {
+      "id": "reselect-for-start",
+      "op": "click",
+      "target": "torrent-1",
+      "needs": ["alpha-paused"]
+    },
+    {
+      "id": "start-alpha",
+      "op": "click",
+      "target": "start",
+      "needs": ["reselect-for-start"]
+    },
+    {
+      "id": "alpha-live",
+      "op": "wait_until",
+      "timeout_ms": 3000,
+      "target": "torrent-1-status",
+      "name": "live",
+      "needs": ["start-alpha"]
+    },
+    {
+      "id": "reselect-for-delete",
+      "op": "click",
+      "target": "torrent-1",
+      "needs": ["alpha-live"]
+    },
+    {
+      "id": "open-delete",
+      "op": "click",
+      "target": "delete",
+      "needs": ["reselect-for-delete"]
+    },
+    {
+      "id": "delete-visible",
+      "op": "wait_until",
+      "timeout_ms": 2000,
+      "target": "dialog-delete",
+      "visible": true,
+      "needs": ["open-delete"]
+    },
+    {
+      "id": "keep-files",
+      "op": "click",
+      "target": "delete-files",
+      "needs": ["delete-visible"]
+    },
+    {
+      "id": "keep-files-checked",
+      "op": "assert",
+      "target": "delete-files",
+      "checked": false,
+      "needs": ["keep-files"]
+    },
+    {
+      "id": "confirm-forget",
+      "op": "click",
+      "target": "delete-confirm",
+      "needs": ["keep-files-checked"]
+    },
+    {
+      "id": "alpha-forgotten",
+      "op": "wait_until",
+      "timeout_ms": 3000,
+      "target": "torrent-1",
+      "exists": false,
+      "needs": ["confirm-forget"]
+    },
+    {
+      "id": "open-magnet",
+      "op": "click",
+      "target": "add-magnet",
+      "delivery": "virtual",
+      "needs": ["alpha-forgotten"]
+    },
+    {
+      "id": "magnet-visible",
+      "op": "wait_until",
+      "timeout_ms": 2000,
+      "target": "dialog-magnet",
+      "visible": true,
+      "needs": ["open-magnet"]
+    },
+    {
+      "id": "blank-magnet",
+      "op": "set_value",
+      "target": "magnet-input",
+      "value": "   ",
+      "needs": ["magnet-visible"]
+    },
+    {
+      "id": "reject-blank-magnet",
+      "op": "click",
+      "target": "magnet-add",
+      "needs": ["blank-magnet"]
+    },
+    {
+      "id": "magnet-still-open",
+      "op": "assert",
+      "target": "dialog-magnet",
+      "visible": true,
+      "needs": ["reject-blank-magnet"]
+    },
+    {
+      "id": "cancel-magnet",
+      "op": "click",
+      "target": "magnet-cancel",
+      "needs": ["magnet-still-open"]
+    },
+    {
+      "id": "toggle-explorer",
+      "op": "click",
+      "target": "explorer-toggle",
+      "needs": ["cancel-magnet"]
+    },
+    {
+      "id": "explorer-visible",
+      "op": "assert",
+      "target": "explorer",
+      "visible": true,
+      "needs": ["toggle-explorer"]
+    },
+    {
+      "id": "toggle-theme",
+      "op": "click",
+      "target": "theme",
+      "delivery": "virtual",
+      "needs": ["explorer-visible"]
+    }
+  ]
+}

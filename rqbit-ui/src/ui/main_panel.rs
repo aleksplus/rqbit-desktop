@@ -1,5 +1,3 @@
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::*;
 use gpui_kit::component::dock::{
     BasePanel, DockArea, DockLayout, DockPlacement, DockSkin, DockToggleEvent, NodeId, PaneRef,
     Panel as DockPanel, PanelControl, PanelEvent, PanelId, PanelStyle, panel_handle,
@@ -20,6 +18,8 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -35,6 +35,13 @@ use futures::StreamExt as _;
 use crate::client::{AddTorrentRequest, ClientResult, ConnectionState, TorrentClient, UiAddSource};
 use crate::host::UiHost;
 use crate::ui::add_torrent_dialog::{AddTorrentDialog, AddTorrentDialogEvent, AddTorrentEntry};
+#[cfg(feature = "agent-testing")]
+use crate::ui::agent::{
+    AutomationNode, AutomationRole, AutomationSnapshot, parse_detail_tab_target,
+    parse_torrent_detail_target, parse_torrent_file_target, parse_torrent_row_target,
+    parse_torrent_status_target,
+};
+use crate::ui::agent::{AutomationRegistry, SharedAutomationRegistry};
 
 use crate::ui::dialogs::{AboutDialog, AboutInfo, DeleteDialog, MagnetDialog};
 use crate::ui::explorer::{ExplorerEvent, ExplorerPanel};
@@ -243,6 +250,60 @@ fn center_group_node(area: &DockArea, panel_id: PanelId) -> Option<NodeId> {
     found
 }
 
+/// Which full page currently replaces the main content, for agent snapshots
+/// (`page-settings` / `page-logs`; `None` is `page-main`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivePageKind {
+    Settings,
+    Logs,
+}
+
+/// Modal dialog identity, for agent dispatch validation and error messages.
+#[cfg(feature = "agent-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModalKind {
+    Magnet,
+    Delete,
+    Add,
+    About,
+}
+
+#[cfg(feature = "agent-testing")]
+impl ModalKind {
+    fn name(self) -> &'static str {
+        match self {
+            ModalKind::Magnet => "magnet",
+            ModalKind::Delete => "delete",
+            ModalKind::Add => "add",
+            ModalKind::About => "about",
+        }
+    }
+}
+
+/// The open modal dialog, with the body entity the agent snapshot reads
+/// state from and dispatch acts on. Cleared through the hosting dialog's
+/// `on_close`, so any close path (Confirm, Cancel, Escape, close button)
+/// resets it. The entities are only read with `agent-testing` enabled.
+#[cfg_attr(not(feature = "agent-testing"), allow(dead_code))]
+enum ActiveModal {
+    Magnet(Entity<MagnetDialog>),
+    Delete(Entity<DeleteDialog>),
+    Add(Entity<AddTorrentDialog>),
+    About(Entity<AboutDialog>),
+}
+
+#[cfg(feature = "agent-testing")]
+impl ActiveModal {
+    fn kind(&self) -> ModalKind {
+        match self {
+            ActiveModal::Magnet(_) => ModalKind::Magnet,
+            ActiveModal::Delete(_) => ModalKind::Delete,
+            ActiveModal::Add(_) => ModalKind::Add,
+            ActiveModal::About(_) => ModalKind::About,
+        }
+    }
+}
+
 /// Main panel that displays the list of torrents.
 pub struct MainPanel {
     client: Arc<dyn TorrentClient>,
@@ -259,6 +320,10 @@ pub struct MainPanel {
     torrents_panel: Entity<TorrentsPanel>,
     /// Host-provided full page (settings) or the shared log page, when open.
     active_page: Option<AnyView>,
+    /// Which kind of full page `active_page` holds (for agent snapshots).
+    active_page_kind: Option<ActivePageKind>,
+    /// The currently open modal dialog (for agent snapshots and dispatch).
+    active_modal: Option<ActiveModal>,
     detail_panel: Option<Entity<TorrentDetailPanel>>,
     /// Torrent ID waiting for detail panel creation (deferred until window is available in render).
     pending_detail_id: Option<usize>,
@@ -293,7 +358,7 @@ pub struct MainPanel {
     _stats_task: Option<Task<()>>,
     /// Keeps the push-update consumer alive for pushing clients.
     _updates_task: Option<Task<()>>,
-    /// Keeps the connection-state watcher alive (remote clients); the
+    /// Keeps the periodic connection-state watcher alive (remote clients); the
     /// in-process default is an empty stream, so the task ends immediately.
     _connection_task: Option<Task<()>>,
     /// Transport liveness, from `TorrentClient::connection_state`. Local
@@ -305,6 +370,7 @@ pub struct MainPanel {
     /// on it.
     window_active: bool,
     focus_handle: FocusHandle,
+    automation: SharedAutomationRegistry,
 }
 
 impl MainPanel {
@@ -313,6 +379,26 @@ impl MainPanel {
         host: Arc<dyn UiHost>,
         window: &mut Window,
         cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_inner(client, host, window, cx, AutomationRegistry::disabled())
+    }
+
+    #[cfg(feature = "agent-testing")]
+    pub fn new_with_agent(
+        client: Arc<dyn TorrentClient>,
+        host: Arc<dyn UiHost>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_inner(client, host, window, cx, AutomationRegistry::enabled())
+    }
+
+    fn new_inner(
+        client: Arc<dyn TorrentClient>,
+        host: Arc<dyn UiHost>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        automation: SharedAutomationRegistry,
     ) -> Self {
         let weak = cx.entity().downgrade();
 
@@ -324,7 +410,7 @@ impl MainPanel {
 
         let table_state = cx.new(|cx| {
             TableState::new(
-                TorrentTableDelegate::new(weak, client.clone(), host.clone()),
+                TorrentTableDelegate::new(weak, client.clone(), host.clone(), automation.clone()),
                 window,
                 cx,
             )
@@ -356,6 +442,8 @@ impl MainPanel {
             explorer,
             torrents_panel,
             active_page: None,
+            active_page_kind: None,
+            active_modal: None,
             detail_panel: None,
             pending_detail_id: None,
             pending_add_entries: None,
@@ -386,6 +474,7 @@ impl MainPanel {
             connection: ConnectionState::Connected,
             window_active: true,
             focus_handle: cx.focus_handle(),
+            automation,
         };
 
         // Open/update detail panel when a row is selected in the table, and
@@ -826,6 +915,7 @@ impl MainPanel {
     /// the host when its own page emits "Back".
     pub fn close_page(&mut self, cx: &mut Context<Self>) {
         self.active_page = None;
+        self.active_page_kind = None;
         cx.notify();
     }
 
@@ -893,7 +983,9 @@ impl MainPanel {
     }
 
     fn on_add_magnet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dialog = cx.new(|cx| MagnetDialog::new(window, cx));
+        let dialog =
+            cx.new(|cx| MagnetDialog::new(window, cx).with_automation(self.automation.clone()));
+        self.active_modal = Some(ActiveModal::Magnet(dialog.clone()));
         let panel = cx.entity();
         window.open_dialog(cx, {
             let dialog = dialog.clone();
@@ -911,6 +1003,12 @@ impl MainPanel {
                             None => false,
                         }
                     }))
+                    .on_close({
+                        let panel = panel.clone();
+                        move |_, _, cx| {
+                            panel.update(cx, |this, _| this.active_modal = None);
+                        }
+                    })
                     .footer(
                         DialogFooter::new()
                             .child(dialog_cancel_button("magnet-cancel"))
@@ -956,7 +1054,11 @@ impl MainPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dialog = cx.new(|cx| AddTorrentDialog::new(entries, window, cx));
+        let dialog = cx.new(|cx| {
+            AddTorrentDialog::new(entries, window, cx).with_automation(self.automation.clone())
+        });
+        self.active_modal = Some(ActiveModal::Add(dialog.clone()));
+        let panel = cx.entity();
         cx.subscribe(
             &dialog,
             |this, _entity, event: &AddTorrentDialogEvent, cx| match event {
@@ -996,6 +1098,12 @@ impl MainPanel {
                                 }
                             }),
                     )
+                    .on_close({
+                        let panel = panel.clone();
+                        move |_, _, cx| {
+                            panel.update(cx, |this, _| this.active_modal = None);
+                        }
+                    })
                     .footer(
                         DialogFooter::new()
                             .child(dialog_cancel_button("add-cancel"))
@@ -1115,6 +1223,7 @@ impl MainPanel {
                 self.client.clone(),
                 self.host.clone(),
             )
+            .with_automation(self.automation.clone())
         });
         cx.subscribe(
             &panel,
@@ -1153,6 +1262,7 @@ impl MainPanel {
     fn on_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(page) = self.host.open_settings(self.client.clone(), _window, cx) {
             self.active_page = Some(page);
+            self.active_page_kind = Some(ActivePageKind::Settings);
             cx.notify();
         }
     }
@@ -1167,6 +1277,7 @@ impl MainPanel {
         )
         .detach();
         self.active_page = Some(page.into());
+        self.active_page_kind = Some(ActivePageKind::Logs);
         cx.notify();
     }
 
@@ -1221,21 +1332,25 @@ impl Render for MainPanel {
             self.on_settings(_window, cx);
         }
 
-        v_flex()
-            .size_full()
-            .gap_0()
-            .child(self.render_title_bar(cx))
-            .when(self.active_page.is_none(), |this| {
-                this.child(self.render_toolbar(cx))
-            })
-            .child(self.render_content(cx))
-            .child(self.render_footer(cx))
-            // The disconnect placeholder paints over the whole panel: the
-            // stale UI stays visible underneath, but nothing can be driven
-            // while the transport is down.
-            .when(self.connection != ConnectionState::Connected, |this| {
-                this.child(self.render_connection_placeholder(cx))
-            })
+        let automation = self.automation.clone();
+        AutomationRegistry::track_window(
+            &automation,
+            v_flex()
+                .size_full()
+                .gap_0()
+                .child(self.render_title_bar(cx))
+                .when(self.active_page.is_none(), |this| {
+                    this.child(self.render_toolbar(cx))
+                })
+                .child(self.render_content(cx))
+                .child(self.render_footer(cx))
+                // The disconnect placeholder paints over the whole panel: the
+                // stale UI stays visible underneath, but nothing can be driven
+                // while the transport is down.
+                .when(self.connection != ConnectionState::Connected, |this| {
+                    this.child(self.render_connection_placeholder(cx))
+                }),
+        )
     }
 }
 
@@ -1247,6 +1362,7 @@ impl MainPanel {
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let caps = self.host.capabilities();
+        let automation = self.automation.clone();
         TitleBar::new()
             .child(
                 div()
@@ -1273,14 +1389,16 @@ impl MainPanel {
                                 })),
                         )
                     })
-                    .child(
+                    .child(AutomationRegistry::track(
+                        &automation,
+                        "add-magnet",
                         Button::new("add-magnet")
                             .label("Add Magnet…")
                             .small()
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.on_add_magnet(window, cx)),
                             ),
-                    )
+                    ))
                     .when(caps.settings_page, |this| {
                         this.child(
                             Button::new("settings")
@@ -1304,7 +1422,9 @@ impl MainPanel {
                                 ),
                         )
                     })
-                    .child(
+                    .child(AutomationRegistry::track(
+                        &automation,
+                        "theme",
                         Button::new("theme")
                             .icon(if cx.theme().is_dark() {
                                 IconName::Sun
@@ -1316,7 +1436,7 @@ impl MainPanel {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_theme(window, cx);
                             })),
-                    ),
+                    )),
             )
             .pr(px(10.))
     }
@@ -1325,6 +1445,7 @@ impl MainPanel {
     /// status filter on the right. Extra left padding for macOS traffic lights.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let automation = self.automation.clone();
         h_flex()
             .gap_2()
             .bg(theme.background)
@@ -1337,21 +1458,27 @@ impl MainPanel {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(
+                    .child(AutomationRegistry::track(
+                        &automation,
+                        "start",
                         Button::new("start")
                             .label("Start")
                             .icon(IconName::Play)
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| this.on_start(cx))),
-                    )
-                    .child(
+                    ))
+                    .child(AutomationRegistry::track(
+                        &automation,
+                        "pause",
                         Button::new("pause")
                             .label("Pause")
                             .icon(IconName::Pause)
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| this.on_pause(cx))),
-                    )
-                    .child(
+                    ))
+                    .child(AutomationRegistry::track(
+                        &automation,
+                        "delete",
                         Button::new("delete")
                             .label("Delete")
                             .icon(IconName::CircleX)
@@ -1359,35 +1486,41 @@ impl MainPanel {
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.on_delete(window, cx)),
                             ),
-                    )
+                    ))
                     .child(
-                        div().pl_4().child(
+                        div().pl_4().child(AutomationRegistry::track(
+                            &automation,
+                            "refresh",
                             Button::new("refresh")
                                 .tooltip("Refresh")
                                 .icon(IconName::LoaderCircle)
                                 .small()
                                 .on_click(cx.listener(|this, _, _, cx| this.on_refresh(cx))),
-                        ),
+                        )),
                     ),
             )
             .child(h_flex().flex_grow_1().size_full())
             .child(
                 h_flex()
                     .gap_2()
-                    .child(
+                    .child(AutomationRegistry::track_wrapped(
+                        &automation,
+                        "status-filter",
                         Select::new(&self.status_filter)
                             .cleanable(true)
                             .with_size(Size::Small)
                             .placeholder("All statuses")
                             .w(px(160.)),
-                    )
-                    .child(
+                    ))
+                    .child(AutomationRegistry::track_wrapped(
+                        &automation,
+                        "torrent-search",
                         Input::new(&self.search_input)
                             .with_size(Size::Small)
                             .cleanable(true)
                             .min_w(px(200.))
                             .w(px(200.)),
-                    ),
+                    )),
             )
     }
 
@@ -1469,6 +1602,7 @@ impl MainPanel {
     /// (download, upload, DHT) and a right-pinned uptime, separated by
     /// vertical dividers.
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let automation = self.automation.clone();
         let (down_speed, up_speed, fetched, uploaded, uptime) = match &self.footer_stats {
             Some(stats) => (
                 stats.download_speed.mbps,
@@ -1529,7 +1663,9 @@ impl MainPanel {
             // ← Explorer dock toggle, far left like Zed's status bar. Lit
             // while the tree is on screen (the zoomed torrents panel covers
             // the dock, so visibility is zoom + dock-open).
-            .left(
+            .left(AutomationRegistry::track(
+                &automation,
+                "explorer-toggle",
                 Button::new("explorer-toggle")
                     .tooltip("Toggle Explorer")
                     .icon(IconName::PanelLeft)
@@ -1539,7 +1675,7 @@ impl MainPanel {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_explorer(window, cx);
                     })),
-            )
+            ))
             .left(Separator::vertical())
             // ↓ Download speed (and total fetched)
             .left(
@@ -1607,7 +1743,10 @@ impl MainPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dialog = cx.new(|cx| DeleteDialog::new(ids, names, window, cx));
+        let dialog = cx.new(|cx| {
+            DeleteDialog::new(ids, names, window, cx).with_automation(self.automation.clone())
+        });
+        self.active_modal = Some(ActiveModal::Delete(dialog.clone()));
         let panel = cx.entity();
         window.open_alert_dialog(cx, {
             let dialog = dialog.clone();
@@ -1632,6 +1771,12 @@ impl MainPanel {
                             true
                         }
                     }))
+                    .on_close({
+                        let panel = panel.clone();
+                        move |_, _, cx| {
+                            panel.update(cx, |this, _| this.active_modal = None);
+                        }
+                    })
                     .child(dialog.clone())
             }
         });
@@ -1645,12 +1790,21 @@ impl MainPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dialog = cx.new(|cx| AboutDialog::new(info, window, cx));
+        let dialog = cx
+            .new(|cx| AboutDialog::new(info, window, cx).with_automation(self.automation.clone()));
+        self.active_modal = Some(ActiveModal::About(dialog.clone()));
+        let panel = cx.entity();
         window.open_dialog(cx, {
             let dialog = dialog.clone();
             move |d, _, cx| {
                 let app_name = dialog.read(cx).info().app_name.clone();
                 d.title(app_name)
+                    .on_close({
+                        let panel = panel.clone();
+                        move |_, _, cx| {
+                            panel.update(cx, |this, _| this.active_modal = None);
+                        }
+                    })
                     .footer(DialogFooter::new().child(dialog_confirm_button(
                         "about-close",
                         "Close",
@@ -1665,6 +1819,517 @@ impl MainPanel {
 impl Focusable for MainPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// Agent-testing surface (feature `agent-testing`): a neutral semantic
+/// snapshot of the window plus dispatch methods that drive it through the
+/// same code paths as human input. Unknown, unavailable, or ambiguous
+/// targets return typed error strings — they never silently succeed.
+#[cfg(feature = "agent-testing")]
+impl MainPanel {
+    /// Semantic snapshot of the window. `fixture` is reported back verbatim
+    /// (the bridge knows which backend the window runs against). `ready`
+    /// flips true once the first frame has been painted (the registry's
+    /// window-root prepaint marks it), so callers can wait for a settled UI.
+    pub fn agent_snapshot(&self, fixture: bool, cx: &App) -> AutomationSnapshot {
+        // While a modal is open the page behind it is a background: present
+        // but not drivable, so it is marked invisible.
+        let modal_open = self.active_modal.is_some();
+        let page = match self.active_page_kind {
+            None => self.agent_main_page_node(!modal_open, cx),
+            Some(ActivePageKind::Settings) => {
+                AutomationNode::new(AutomationRole::Page, "page-settings", "Settings")
+                    .visible(!modal_open)
+                    .child(AutomationNode::new(AutomationRole::Button, "back", "Back"))
+            }
+            Some(ActivePageKind::Logs) => {
+                AutomationNode::new(AutomationRole::Page, "page-logs", "Logs")
+                    .visible(!modal_open)
+                    .child(AutomationNode::new(AutomationRole::Button, "back", "Back"))
+            }
+        };
+        let page = page.visible_deep(!modal_open);
+        let mut window =
+            AutomationNode::new(AutomationRole::Window, "rqbit-window", "rqbit").child(page);
+        if let Some(modal) = &self.active_modal {
+            window = window.child(self.agent_modal_node(modal, cx));
+        }
+        let ready = self.automation.lock().unwrap().first_paint();
+        AutomationSnapshot {
+            app: if fixture {
+                "rqbit-desktop-fixture".to_string()
+            } else {
+                "rqbit-desktop".to_string()
+            },
+            fixture,
+            ready,
+            nodes: vec![window.with_bounds_from(&self.automation)],
+        }
+    }
+
+    /// The `page-main` subtree: title-bar and toolbar controls, search and
+    /// status filter, the explorer (included while hidden), the filtered
+    /// torrent list, and the open detail panel.
+    fn agent_main_page_node(&self, visible: bool, cx: &App) -> AutomationNode {
+        let caps = self.host.capabilities();
+        let mut children = vec![AutomationNode::new(
+            AutomationRole::Button,
+            "add-magnet",
+            "Add Magnet…",
+        )];
+        if caps.settings_page {
+            children.push(AutomationNode::new(
+                AutomationRole::Button,
+                "settings",
+                "Settings",
+            ));
+        }
+        if caps.logs_page {
+            children.push(AutomationNode::new(AutomationRole::Button, "logs", "Logs"));
+        }
+        children.push(
+            AutomationNode::new(AutomationRole::Button, "theme", "Theme").value(
+                if cx.theme().is_dark() {
+                    "dark"
+                } else {
+                    "light"
+                },
+            ),
+        );
+        for (id, name) in [
+            ("start", "Start"),
+            ("pause", "Pause"),
+            ("delete", "Delete"),
+            ("refresh", "Refresh"),
+        ] {
+            children.push(AutomationNode::new(AutomationRole::Button, id, name));
+        }
+        let explorer_visible = self.explorer_visible(cx);
+        children.push(
+            AutomationNode::new(AutomationRole::Button, "explorer-toggle", "Toggle Explorer")
+                .checked(explorer_visible),
+        );
+        // The explorer container is listed even while hidden, so agents can
+        // tell "toggled off" apart from "missing".
+        children.push(
+            AutomationNode::new(AutomationRole::Navigation, "explorer", "Explorer")
+                .visible(explorer_visible),
+        );
+        children.push(
+            AutomationNode::new(AutomationRole::TextBox, "torrent-search", "Search torrents")
+                .value(self.search_input.read(cx).value().to_string()),
+        );
+        children.push(
+            AutomationNode::new(AutomationRole::Button, "status-filter", "Status filter").value(
+                self.status_filter
+                    .read(cx)
+                    .selected_value()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            ),
+        );
+        children.push(self.agent_torrent_list_node(cx));
+        if let Some(panel) = &self.detail_panel {
+            let panel = panel.read(cx);
+            let id = panel.torrent_id();
+            children.push(
+                AutomationNode::new(
+                    AutomationRole::Page,
+                    format!("torrent-detail-{id}"),
+                    format!("Torrent {id}"),
+                )
+                .children(panel.agent_nodes(cx)),
+            );
+        }
+        AutomationNode::new(AutomationRole::Page, "page-main", "Torrents")
+            .visible(visible)
+            .children(children)
+    }
+
+    /// The torrent list: one `torrent-{id}` row per currently visible
+    /// (filtered) row, each with a `torrent-{id}-status` child.
+    fn agent_torrent_list_node(&self, cx: &App) -> AutomationNode {
+        let delegate = self.table_state.read(cx).delegate();
+        AutomationNode::new(AutomationRole::List, "torrent-list", "Torrent list").children(
+            delegate
+                .rows
+                .iter()
+                .map(|row| {
+                    AutomationNode::new(
+                        AutomationRole::ListItem,
+                        format!("torrent-{}", row.id),
+                        row.name.clone(),
+                    )
+                    .child(
+                        AutomationNode::new(
+                            AutomationRole::Status,
+                            format!("torrent-{}-status", row.id),
+                            row.state.clone(),
+                        )
+                        .value(row.state.clone()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The open modal's subtree, built from the tracked body entity.
+    fn agent_modal_node(&self, modal: &ActiveModal, cx: &App) -> AutomationNode {
+        match modal {
+            ActiveModal::Magnet(dialog) => {
+                let value = dialog.read(cx).magnet_value(cx);
+                AutomationNode::new(AutomationRole::Dialog, "dialog-magnet", "Add Magnet Link")
+                    .child(
+                        AutomationNode::new(AutomationRole::TextBox, "magnet-input", "Magnet link")
+                            .value(value),
+                    )
+                    .child(AutomationNode::new(
+                        AutomationRole::Button,
+                        "magnet-add",
+                        "Add",
+                    ))
+                    .child(AutomationNode::new(
+                        AutomationRole::Button,
+                        "magnet-cancel",
+                        "Cancel",
+                    ))
+            }
+            ActiveModal::Delete(dialog) => {
+                let dialog = dialog.read(cx);
+                AutomationNode::new(AutomationRole::Dialog, "dialog-delete", dialog.title())
+                    .child(
+                        AutomationNode::new(
+                            AutomationRole::Checkbox,
+                            "delete-files",
+                            "Also delete downloaded files",
+                        )
+                        .checked(dialog.delete_files()),
+                    )
+                    .child(AutomationNode::new(
+                        AutomationRole::Button,
+                        "delete-confirm",
+                        dialog.ok_label(),
+                    ))
+                    .child(AutomationNode::new(
+                        AutomationRole::Button,
+                        "delete-cancel",
+                        "Cancel",
+                    ))
+            }
+            ActiveModal::Add(dialog) => {
+                let dialog = dialog.read(cx);
+                AutomationNode::new(AutomationRole::Dialog, "dialog-add", dialog.title())
+                    .child(AutomationNode::new(
+                        AutomationRole::Button,
+                        "add-ok",
+                        dialog.ok_label(),
+                    ))
+                    .child(AutomationNode::new(
+                        AutomationRole::Button,
+                        "add-cancel",
+                        "Cancel",
+                    ))
+            }
+            ActiveModal::About(dialog) => {
+                let info = dialog.read(cx).info();
+                AutomationNode::new(
+                    AutomationRole::Dialog,
+                    "dialog-about",
+                    info.app_name.to_string(),
+                )
+                .value(format!("{} {}", info.app_name, info.version))
+                .child(AutomationNode::new(
+                    AutomationRole::Button,
+                    "about-close",
+                    "Close",
+                ))
+            }
+        }
+    }
+
+    /// Click a semantic target. Buttons reuse the exact handlers the human
+    /// path uses; dialog Confirm/Cancel dispatch the same gpui actions as
+    /// the footer buttons (and Enter/Escape).
+    pub fn agent_click(
+        &mut self,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        match target {
+            "add-magnet" => {
+                self.on_add_magnet(window, cx);
+                Ok(())
+            }
+            "settings" => {
+                self.on_settings(window, cx);
+                if self.active_page_kind == Some(ActivePageKind::Settings) {
+                    Ok(())
+                } else {
+                    Err("the settings page did not open".to_string())
+                }
+            }
+            "logs" => {
+                self.on_logs(window, cx);
+                Ok(())
+            }
+            "theme" => {
+                self.toggle_theme(window, cx);
+                Ok(())
+            }
+            "start" | "pause" => {
+                if self.selected_torrent_ids(cx).is_empty() {
+                    return Err(format!("{target} requires at least one selected torrent"));
+                }
+                if target == "start" {
+                    self.on_start(cx);
+                } else {
+                    self.on_pause(cx);
+                }
+                Ok(())
+            }
+            "delete" => {
+                if self.selected_torrent_ids(cx).is_empty() {
+                    return Err("delete requires at least one selected torrent".to_string());
+                }
+                self.on_delete(window, cx);
+                Ok(())
+            }
+            "refresh" => {
+                self.on_refresh(cx);
+                Ok(())
+            }
+            "explorer-toggle" => {
+                self.toggle_explorer(window, cx);
+                Ok(())
+            }
+            "back" => {
+                if self.active_page.is_some() {
+                    self.close_page(cx);
+                    Ok(())
+                } else {
+                    Err("no settings or logs page is open".to_string())
+                }
+            }
+            "magnet-add" => self.agent_dispatch_dialog(ModalKind::Magnet, true, window, cx),
+            "magnet-cancel" => self.agent_dispatch_dialog(ModalKind::Magnet, false, window, cx),
+            "delete-confirm" => self.agent_dispatch_dialog(ModalKind::Delete, true, window, cx),
+            "delete-cancel" => self.agent_dispatch_dialog(ModalKind::Delete, false, window, cx),
+            "add-ok" => self.agent_dispatch_dialog(ModalKind::Add, true, window, cx),
+            "add-cancel" => self.agent_dispatch_dialog(ModalKind::Add, false, window, cx),
+            "about-close" => self.agent_dispatch_dialog(ModalKind::About, true, window, cx),
+            "delete-files" => {
+                let Some(ActiveModal::Delete(dialog)) = &self.active_modal else {
+                    return Err(self.modal_mismatch(ModalKind::Delete));
+                };
+                let dialog = dialog.clone();
+                let next = !dialog.read(cx).delete_files();
+                dialog.update(cx, |d, cx| d.set_delete_files(next, cx));
+                Ok(())
+            }
+            _ => self.agent_click_dynamic(target, cx),
+        }
+    }
+
+    /// Click dispatch for id-parameterized targets: torrent rows, the detail
+    /// panel's tabs, and file rows.
+    fn agent_click_dynamic(&mut self, target: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        if parse_torrent_detail_target(target).is_some() {
+            return Err(format!(
+                "{target:?} is a container, not a clickable control"
+            ));
+        }
+        if let Some(tab) = parse_detail_tab_target(target) {
+            let tab = tab.to_string();
+            let Some(panel) = self.detail_panel.clone() else {
+                return Err(format!("{target:?} requires an open torrent detail panel"));
+            };
+            return panel.update(cx, |panel, cx| panel.agent_select_tab(&tab, cx));
+        }
+        if let Some((torrent_id, file_index)) = parse_torrent_file_target(target) {
+            let Some(panel) = self.detail_panel.clone() else {
+                return Err(format!("{target:?} requires an open torrent detail panel"));
+            };
+            return panel.update(cx, |panel, cx| {
+                if panel.torrent_id() != torrent_id as usize {
+                    return Err(format!(
+                        "the detail panel shows torrent {}, not {torrent_id}",
+                        panel.torrent_id()
+                    ));
+                }
+                panel.agent_toggle_file(file_index, cx)
+            });
+        }
+        if let Some(id) =
+            parse_torrent_status_target(target).or_else(|| parse_torrent_row_target(target))
+        {
+            return self.agent_select_torrent_row(id, cx);
+        }
+        Err(format!("unknown automation target {target:?}"))
+    }
+
+    /// Select a torrent row by id, mirroring a plain mouse click: replace the
+    /// delegate selection, record the shift-click anchor, and go through
+    /// [`TableState::set_selected_row`] so the `SelectRow` subscription opens
+    /// the detail panel.
+    fn agent_select_torrent_row(&mut self, id: u64, cx: &mut Context<Self>) -> Result<(), String> {
+        let row_ix = self
+            .table_state
+            .read(cx)
+            .delegate()
+            .rows
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or_else(|| format!("torrent-{id} is not in the filtered torrent list"))?;
+        self.table_state.update(cx, |state, cx| {
+            {
+                let delegate = state.delegate_mut();
+                delegate.selected_rows.clear();
+                delegate.selected_rows.insert(row_ix);
+                delegate.set_anchor(id);
+            }
+            state.set_selected_row(row_ix, cx);
+        });
+        Ok(())
+    }
+
+    /// Dispatch the active dialog's Confirm/Cancel action after validating
+    /// that `kind` is the open dialog.
+    fn agent_dispatch_dialog(
+        &mut self,
+        kind: ModalKind,
+        confirm: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        match &self.active_modal {
+            Some(modal) if modal.kind() == kind => {
+                if confirm {
+                    window.dispatch_action(Box::new(Confirm { secondary: false }), cx);
+                } else {
+                    window.dispatch_action(Box::new(Cancel), cx);
+                }
+                Ok(())
+            }
+            _ => Err(self.modal_mismatch(kind)),
+        }
+    }
+
+    /// Why a dialog-scoped target is unavailable right now.
+    fn modal_mismatch(&self, expected: ModalKind) -> String {
+        match &self.active_modal {
+            Some(modal) => format!(
+                "the {} dialog is not open (the {} dialog is)",
+                expected.name(),
+                modal.kind().name()
+            ),
+            None => format!("the {} dialog is not open", expected.name()),
+        }
+    }
+
+    /// Replace the text of a semantic textbox. Only `torrent-search` and
+    /// `magnet-input` are writable.
+    ///
+    /// `InputState::set_value` deliberately does not emit
+    /// [`InputEvent::Change`], so the search path applies the filter directly
+    /// instead of relying on the change subscription.
+    pub fn agent_set_value(
+        &mut self,
+        target: &str,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        match target {
+            "torrent-search" => {
+                let input = self.search_input.clone();
+                input.update(cx, |state, cx| {
+                    state.set_value(value.to_string(), window, cx)
+                });
+                self.apply_search_and_filter(cx);
+                Ok(())
+            }
+            "magnet-input" => {
+                let Some(ActiveModal::Magnet(dialog)) = &self.active_modal else {
+                    return Err(self.modal_mismatch(ModalKind::Magnet));
+                };
+                let dialog = dialog.clone();
+                dialog.update(cx, |d, cx| d.set_magnet(value, window, cx));
+                Ok(())
+            }
+            _ => Err(format!("set-value is not supported for target {target:?}")),
+        }
+    }
+
+    /// Append text to a semantic textbox, through the same path as
+    /// [`Self::agent_set_value`].
+    pub fn agent_type_text(
+        &mut self,
+        target: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let current = match target {
+            "torrent-search" => self.search_input.read(cx).value().to_string(),
+            "magnet-input" => match &self.active_modal {
+                Some(ActiveModal::Magnet(dialog)) => dialog.read(cx).magnet_value(cx),
+                _ => return Err(self.modal_mismatch(ModalKind::Magnet)),
+            },
+            _ => return Err(format!("type is not supported for target {target:?}")),
+        };
+        self.agent_set_value(target, &format!("{current}{text}"), window, cx)
+    }
+
+    /// Send a named key to a dialog target: "enter"/"return" confirms,
+    /// "escape"/"esc" cancels — the same gpui actions the keyboard triggers.
+    pub fn agent_key(
+        &mut self,
+        target: &str,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let kind = match target {
+            "dialog-magnet" | "magnet-input" | "magnet-add" | "magnet-cancel" => ModalKind::Magnet,
+            "dialog-delete" | "delete-files" | "delete-confirm" | "delete-cancel" => {
+                ModalKind::Delete
+            }
+            "dialog-add" | "add-ok" | "add-cancel" => ModalKind::Add,
+            "dialog-about" | "about-close" => ModalKind::About,
+            _ => {
+                return Err(format!(
+                    "key dispatch is only supported on dialog targets, not {target:?}"
+                ));
+            }
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "enter" | "return" => self.agent_dispatch_dialog(kind, true, window, cx),
+            "escape" | "esc" => self.agent_dispatch_dialog(kind, false, window, cx),
+            other => Err(format!(
+                "unsupported key {other:?} (expected \"enter\" or \"escape\")"
+            )),
+        }
+    }
+
+    /// Focus a semantic textbox (`torrent-search` or `magnet-input`).
+    pub fn agent_focus(
+        &mut self,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let handle = match target {
+            "torrent-search" => self.search_input.read(cx).focus_handle(cx),
+            "magnet-input" => match &self.active_modal {
+                Some(ActiveModal::Magnet(dialog)) => dialog.read(cx).input_focus_handle(cx),
+                _ => return Err(self.modal_mismatch(ModalKind::Magnet)),
+            },
+            _ => return Err(format!("focus is not supported for target {target:?}")),
+        };
+        handle.focus(window, cx);
+        Ok(())
     }
 }
 
@@ -2021,5 +2686,680 @@ mod tests {
         assert_eq!(confirmed.get(), 1, "OK runs the confirm handler");
         assert_eq!(cancelled.get(), 1);
         assert!(!dialog_open(cx), "a `true` confirm closes the dialog");
+    }
+}
+
+/// Agent-surface tests: a deterministic in-memory client/host drive a real
+/// `MainPanel` headlessly, exercising stable semantic IDs, filtering, and
+/// dispatch. Gated on the feature because `MainPanel::new_with_agent` and the
+/// dispatch methods only exist with `agent-testing`.
+#[cfg(all(test, feature = "agent-testing"))]
+mod agent_tests {
+    // NOTE: no `use super::*` — it would pull gpui's own `#[test]` attribute
+    // macro into scope and shadow the builtin one (see the module above).
+    use super::MainPanel;
+    use crate::client::{AddTorrentRequest, ClientResult, TorrentClient, UiAddSource};
+    use crate::host::{UiCapabilities, UiHost};
+    use crate::ui::agent::{AutomationNode, AutomationSnapshot};
+    use async_trait::async_trait;
+    use futures::stream::LocalBoxStream;
+    use gpui_kit::{
+        AnyWindowHandle, AppContext as _, Bounds, Context, Entity, IntoElement, ParentElement as _,
+        Point, Render, TestAppContext, Window, WindowBounds, WindowOptions, div, px, size,
+    };
+    use rqbit_protocol::{
+        ApiAddTorrent, DhtStats, PeerStatsSnapshot, ProtoError, ProtoErrorKind, SessionStats,
+        TorrentAction, TorrentDetails, TorrentFile, TorrentId, TorrentList, TorrentState,
+        TorrentStats,
+    };
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// Deterministic, in-memory `TorrentClient`: two seeded torrents, actions
+    /// recorded, magnet adds accepted.
+    struct MockClient {
+        torrents: RefCell<BTreeMap<u64, TorrentDetails>>,
+        actions: RefCell<Vec<(u64, TorrentAction)>>,
+    }
+
+    impl MockClient {
+        fn new() -> Self {
+            let torrents: BTreeMap<u64, TorrentDetails> = [
+                mock_torrent(1, "Alpha torrent", TorrentState::Live),
+                mock_torrent(2, "Beta torrent", TorrentState::Paused),
+            ]
+            .into_iter()
+            .map(|t| (t.id.expect("mock id"), t))
+            .collect();
+            Self {
+                torrents: RefCell::new(torrents),
+                actions: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn recorded_actions(&self) -> Vec<(u64, TorrentAction)> {
+            self.actions.borrow().clone()
+        }
+
+        fn lookup(&self, id: &TorrentId) -> ClientResult<TorrentDetails> {
+            let id = id
+                .as_id()
+                .ok_or_else(|| ProtoError::bad_request("mock ids are numeric"))?;
+            self.torrents.borrow().get(&id).cloned().ok_or_else(|| {
+                ProtoError::new(
+                    ProtoErrorKind::TorrentNotFound,
+                    format!("mock torrent {id} not found"),
+                )
+            })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl TorrentClient for MockClient {
+        async fn list(&self, _with_stats: bool) -> ClientResult<TorrentList> {
+            let torrents = self
+                .torrents
+                .borrow()
+                .values()
+                .cloned()
+                .map(|mut t| {
+                    t.files = None;
+                    t
+                })
+                .collect();
+            Ok(TorrentList { torrents })
+        }
+
+        async fn details(&self, torrent: &TorrentId) -> ClientResult<TorrentDetails> {
+            self.lookup(torrent)
+        }
+
+        async fn stats(&self, torrent: &TorrentId) -> ClientResult<TorrentStats> {
+            self.lookup(torrent)?
+                .stats
+                .as_deref()
+                .cloned()
+                .ok_or_else(|| ProtoError::internal("mock torrent is missing stats"))
+        }
+
+        async fn peer_stats(&self, torrent: &TorrentId) -> ClientResult<PeerStatsSnapshot> {
+            self.lookup(torrent)?;
+            Ok(PeerStatsSnapshot::default())
+        }
+
+        async fn session_stats(&self) -> ClientResult<SessionStats> {
+            Ok(SessionStats {
+                uptime_seconds: 42,
+                ..Default::default()
+            })
+        }
+
+        async fn session_default_folder(&self) -> ClientResult<Option<String>> {
+            Ok(Some("/mock".into()))
+        }
+
+        async fn dht_stats(&self) -> ClientResult<DhtStats> {
+            Err(ProtoError::new(
+                ProtoErrorKind::DhtDisabled,
+                "DHT is disabled in the mock",
+            ))
+        }
+
+        async fn action(&self, torrent: &TorrentId, action: TorrentAction) -> ClientResult<()> {
+            let id = torrent
+                .as_id()
+                .ok_or_else(|| ProtoError::bad_request("mock ids are numeric"))?;
+            if matches!(action, TorrentAction::Forget | TorrentAction::Delete) {
+                if self.torrents.borrow_mut().remove(&id).is_none() {
+                    return Err(ProtoError::new(
+                        ProtoErrorKind::TorrentNotFound,
+                        format!("mock torrent {id} not found"),
+                    ));
+                }
+                self.actions.borrow_mut().push((id, action));
+                return Ok(());
+            }
+            if !self.torrents.borrow().contains_key(&id) {
+                return Err(ProtoError::new(
+                    ProtoErrorKind::TorrentNotFound,
+                    format!("mock torrent {id} not found"),
+                ));
+            }
+            self.actions.borrow_mut().push((id, action));
+            Ok(())
+        }
+
+        async fn add_torrent(&self, req: &AddTorrentRequest) -> ClientResult<ApiAddTorrent> {
+            let UiAddSource::Magnet(_) = &req.source else {
+                return Err(ProtoError::bad_request("the mock accepts magnets only"));
+            };
+            let mut details = mock_torrent(0, "Mock magnet", TorrentState::Paused);
+            let id = if req.list_only {
+                None
+            } else {
+                let id = self
+                    .torrents
+                    .borrow()
+                    .keys()
+                    .next_back()
+                    .copied()
+                    .unwrap_or(0)
+                    + 1;
+                details.id = Some(id);
+                self.torrents.borrow_mut().insert(id, details.clone());
+                Some(id)
+            };
+            Ok(ApiAddTorrent {
+                id,
+                details,
+                output_folder: "/mock".into(),
+            })
+        }
+
+        async fn set_rust_log(&self, _value: String) -> ClientResult<()> {
+            Ok(())
+        }
+
+        fn log_lines(&self) -> ClientResult<LocalBoxStream<'static, Vec<u8>>> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn mock_torrent(id: u64, name: &str, state: TorrentState) -> TorrentDetails {
+        let files = vec![
+            TorrentFile {
+                name: format!("{name} - first.txt"),
+                components: vec![format!("{name} - first.txt")],
+                length: 512,
+                included: true,
+                padding: false,
+                custom: None,
+            },
+            TorrentFile {
+                name: format!("{name} - second.txt"),
+                components: vec![format!("{name} - second.txt")],
+                length: 512,
+                included: true,
+                padding: false,
+                custom: None,
+            },
+        ];
+        TorrentDetails {
+            id: Some(id),
+            info_hash: format!("{id:040x}"),
+            name: Some(name.into()),
+            files: Some(files),
+            stats: Some(Box::new(TorrentStats {
+                state,
+                file_progress: vec![256, 256],
+                error: None,
+                progress_bytes: 512,
+                uploaded_bytes: 0,
+                total_bytes: 1024,
+                finished: false,
+                live: (state == TorrentState::Live).then_some(Default::default()),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// A placeholder full page the mock host opens for "settings".
+    struct DummyPage;
+    impl Render for DummyPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child("dummy settings page")
+        }
+    }
+
+    struct MockHost;
+    impl UiHost for MockHost {
+        fn capabilities(&self) -> UiCapabilities {
+            UiCapabilities {
+                add_torrent_files: false,
+                open_folder: false,
+                settings_page: true,
+                logs_page: true,
+            }
+        }
+
+        fn version(&self) -> String {
+            "agent-test".into()
+        }
+
+        fn open_settings(
+            &self,
+            _client: Arc<dyn TorrentClient>,
+            _window: &mut Window,
+            cx: &mut Context<MainPanel>,
+        ) -> Option<gpui_kit::AnyView> {
+            Some(cx.new(|_| DummyPage).into())
+        }
+    }
+
+    fn open_panel(
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<MainPanel>, Arc<MockClient>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        // TorrentClient is deliberately ?Send and UI-thread-local.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let client = Arc::new(MockClient::new());
+        let (window, panel) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: size(px(1200.), px(800.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                {
+                    let client = client.clone();
+                    move |window, cx| {
+                        cx.new(|cx| {
+                            MainPanel::new_with_agent(
+                                client.clone(),
+                                Arc::new(MockHost),
+                                window,
+                                cx,
+                            )
+                        })
+                    }
+                },
+            )
+            .expect("open test window")
+        });
+        (window, panel, client)
+    }
+
+    fn draw_frame(window: AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("test window open");
+    }
+
+    /// MainPanel's one-second polling task is intentionally perpetual, so an
+    /// unbounded run_until_parked would never finish. Pump only immediate work.
+    fn pump(cx: &TestAppContext) {
+        for _ in 0..64 {
+            if !cx.executor().tick() {
+                break;
+            }
+        }
+    }
+
+    fn snapshot(panel: &Entity<MainPanel>, cx: &TestAppContext) -> AutomationSnapshot {
+        cx.read(|cx| panel.read(cx).agent_snapshot(true, cx))
+    }
+
+    fn click(
+        panel: &Entity<MainPanel>,
+        window: AnyWindowHandle,
+        target: &str,
+        cx: &mut TestAppContext,
+    ) -> Result<(), String> {
+        cx.update_window(window, |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.agent_click(target, window, cx))
+        })
+        .expect("test window open")
+    }
+
+    fn set_value(
+        panel: &Entity<MainPanel>,
+        window: AnyWindowHandle,
+        target: &str,
+        value: &str,
+        cx: &mut TestAppContext,
+    ) -> Result<(), String> {
+        cx.update_window(window, |_, window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.agent_set_value(target, value, window, cx)
+            })
+        })
+        .expect("test window open")
+    }
+
+    fn find_node<'a>(nodes: &'a [AutomationNode], id: &str) -> Option<&'a AutomationNode> {
+        nodes.iter().find_map(|n| {
+            if n.id == id {
+                Some(n)
+            } else {
+                find_node(&n.children, id)
+            }
+        })
+    }
+
+    fn torrent_row_ids(snap: &AutomationSnapshot) -> Vec<&str> {
+        find_node(&snap.nodes, "torrent-list")
+            .expect("torrent-list node")
+            .children
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn snapshot_has_stable_ids_and_reflects_filtering(cx: &mut TestAppContext) {
+        let (window, panel, _client) = open_panel(cx);
+        pump(cx);
+        draw_frame(window, cx);
+        draw_frame(window, cx);
+
+        let snap = snapshot(&panel, cx);
+        assert!(snap.ready, "the first paint marks the snapshot ready");
+        assert!(snap.fixture);
+        assert_eq!(snap.app, "rqbit-desktop-fixture");
+        assert_eq!(snap.nodes.len(), 1);
+        assert_eq!(snap.nodes[0].id, "rqbit-window");
+        assert!(
+            snap.nodes[0].bounds.is_some(),
+            "the window root records painted bounds"
+        );
+
+        for id in [
+            "page-main",
+            "add-magnet",
+            "settings",
+            "logs",
+            "theme",
+            "start",
+            "pause",
+            "delete",
+            "refresh",
+            "explorer-toggle",
+            "explorer",
+            "torrent-search",
+            "status-filter",
+            "torrent-list",
+        ] {
+            assert!(find_node(&snap.nodes, id).is_some(), "missing node {id}");
+        }
+
+        // The explorer starts hidden but is still listed.
+        let explorer = find_node(&snap.nodes, "explorer").unwrap();
+        assert!(!explorer.visible, "the explorer starts hidden");
+        let toggle = find_node(&snap.nodes, "explorer-toggle").unwrap();
+        assert_eq!(toggle.checked, Some(false));
+
+        // Rows use torrent-id identity and carry a status child.
+        assert_eq!(torrent_row_ids(&snap), vec!["torrent-1", "torrent-2"]);
+        let row = find_node(&snap.nodes, "torrent-1").unwrap();
+        assert_eq!(row.name, "Alpha torrent");
+        assert!(row.bounds.is_some(), "torrent rows retain painted bounds");
+        assert!(
+            find_node(&snap.nodes, "torrent-search")
+                .unwrap()
+                .bounds
+                .is_some(),
+            "child trackers run before the window root and must not be cleared"
+        );
+        let status = find_node(&snap.nodes, "torrent-1-status").unwrap();
+        assert_eq!(status.name, "live");
+        assert_eq!(status.value.as_deref(), Some("live"));
+
+        // Search filtering re-derives the visible rows; the snapshot follows.
+        set_value(&panel, window, "torrent-search", "alpha", cx).expect("set search");
+        let snap = snapshot(&panel, cx);
+        assert_eq!(torrent_row_ids(&snap), vec!["torrent-1"]);
+        let search = find_node(&snap.nodes, "torrent-search").unwrap();
+        assert_eq!(search.value.as_deref(), Some("alpha"));
+
+        // Unknown targets never silently succeed.
+        let err = click(&panel, window, "no-such-target", cx).unwrap_err();
+        assert!(
+            err.contains("unknown automation target"),
+            "unexpected error: {err}"
+        );
+        // A real torrent id hidden by the filter is not clickable either.
+        let err = click(&panel, window, "torrent-2", cx).unwrap_err();
+        assert!(
+            err.contains("not in the filtered torrent list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn row_click_opens_details_and_drives_tabs_and_files(cx: &mut TestAppContext) {
+        let (window, panel, client) = open_panel(cx);
+        pump(cx);
+        draw_frame(window, cx);
+
+        click(&panel, window, "torrent-2", cx).expect("row click");
+        // The SelectRow subscription queues the panel; a render creates it,
+        // then its details fetch completes.
+        pump(cx);
+        draw_frame(window, cx);
+        pump(cx);
+
+        let snap = snapshot(&panel, cx);
+        let detail = find_node(&snap.nodes, "torrent-detail-2").expect("detail node");
+        let overview = find_node(&detail.children, "detail-tab-overview").unwrap();
+        assert_eq!(overview.checked, Some(true), "the overview tab is active");
+        assert!(find_node(&detail.children, "torrent-2-file-0").is_some());
+        assert!(find_node(&detail.children, "torrent-2-file-1").is_some());
+
+        // A row of a different torrent retargets the detail panel.
+        click(&panel, window, "torrent-1", cx).expect("row click");
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "torrent-detail-1").is_some());
+        assert!(find_node(&snap.nodes, "torrent-detail-2").is_none());
+
+        // Switch to the Files tab and toggle a file by its torrent file index.
+        click(&panel, window, "detail-tab-files", cx).expect("files tab");
+        let snap = snapshot(&panel, cx);
+        let detail = find_node(&snap.nodes, "torrent-detail-1").unwrap();
+        assert_eq!(
+            find_node(&detail.children, "detail-tab-files")
+                .unwrap()
+                .checked,
+            Some(true)
+        );
+
+        click(&panel, window, "torrent-1-file-1", cx).expect("toggle file");
+        pump(cx);
+        assert_eq!(
+            client.recorded_actions(),
+            vec![(1, TorrentAction::UpdateOnlyFiles(vec![0]))],
+            "toggling file 1 off persists the remaining selection"
+        );
+        let snap = snapshot(&panel, cx);
+        let file = find_node(&snap.nodes, "torrent-1-file-1").unwrap();
+        assert_eq!(file.checked, Some(false));
+
+        // File targets resolve by torrent file index, not row position.
+        let err = click(&panel, window, "torrent-1-file-9", cx).unwrap_err();
+        assert!(err.contains("not in torrent 1"), "unexpected error: {err}");
+        // A file click for the wrong torrent id is rejected.
+        let err = click(&panel, window, "torrent-2-file-0", cx).unwrap_err();
+        assert!(
+            err.contains("detail panel shows torrent 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn magnet_dialog_set_value_confirm_and_cancel(cx: &mut TestAppContext) {
+        let (window, panel, _client) = open_panel(cx);
+        pump(cx);
+        draw_frame(window, cx);
+
+        // Dialog-scoped targets fail while no dialog is open.
+        let err = click(&panel, window, "magnet-add", cx).unwrap_err();
+        assert!(
+            err.contains("magnet dialog is not open"),
+            "unexpected error: {err}"
+        );
+
+        click(&panel, window, "add-magnet", cx).expect("open magnet dialog");
+        draw_frame(window, cx);
+        draw_frame(window, cx);
+
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "dialog-magnet").is_some());
+        assert!(find_node(&snap.nodes, "magnet-input").is_some());
+        assert!(find_node(&snap.nodes, "magnet-add").is_some());
+        assert!(find_node(&snap.nodes, "magnet-cancel").is_some());
+        let page = find_node(&snap.nodes, "page-main").unwrap();
+        assert!(!page.visible, "a modal marks the page behind it invisible");
+        for id in [
+            "add-magnet",
+            "start",
+            "delete",
+            "torrent-search",
+            "torrent-1",
+        ] {
+            assert!(
+                !find_node(&snap.nodes, id).unwrap().visible,
+                "modal background target {id} must not be drivable"
+            );
+        }
+
+        // Confirming with an empty input keeps the dialog open (the human
+        // path's decision, unchanged).
+        click(&panel, window, "magnet-add", cx).expect("dispatch confirm");
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(
+            find_node(&snap.nodes, "dialog-magnet").is_some(),
+            "an empty magnet input does not close the dialog"
+        );
+
+        // Fill the input and confirm: the add-torrent dialog takes over.
+        set_value(
+            &panel,
+            window,
+            "magnet-input",
+            "magnet:?xt=urn:btih:0000000000000000000000000000000000000003",
+            cx,
+        )
+        .expect("set magnet");
+        let snap = snapshot(&panel, cx);
+        let input = find_node(&snap.nodes, "magnet-input").unwrap();
+        assert_eq!(
+            input.value.as_deref(),
+            Some("magnet:?xt=urn:btih:0000000000000000000000000000000000000003")
+        );
+
+        click(&panel, window, "magnet-add", cx).expect("confirm magnet");
+        pump(cx);
+        draw_frame(window, cx);
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "dialog-magnet").is_none());
+        assert!(
+            find_node(&snap.nodes, "dialog-add").is_some(),
+            "the file-selection dialog follows the magnet dialog"
+        );
+
+        // Confirm the add: the mock gains torrent 3 and the modal clears.
+        click(&panel, window, "add-ok", cx).expect("confirm add");
+        pump(cx);
+        draw_frame(window, cx);
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "dialog-add").is_none());
+        assert!(
+            find_node(&snap.nodes, "page-main").unwrap().visible,
+            "the page is visible again once the modal closed"
+        );
+        assert_eq!(
+            torrent_row_ids(&snap),
+            vec!["torrent-1", "torrent-2", "torrent-3"]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn magnet_cancel_and_delete_flow(cx: &mut TestAppContext) {
+        let (window, panel, client) = open_panel(cx);
+        pump(cx);
+        draw_frame(window, cx);
+
+        // Open and cancel the magnet dialog.
+        click(&panel, window, "add-magnet", cx).expect("open magnet dialog");
+        draw_frame(window, cx);
+        click(&panel, window, "magnet-cancel", cx).expect("cancel");
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "dialog-magnet").is_none());
+
+        // Select a torrent and delete it without deleting files (Forget).
+        click(&panel, window, "torrent-2", cx).expect("select torrent");
+        pump(cx);
+        draw_frame(window, cx);
+        click(&panel, window, "delete", cx).expect("open delete dialog");
+        pump(cx);
+        draw_frame(window, cx);
+        draw_frame(window, cx);
+
+        let snap = snapshot(&panel, cx);
+        let dialog = find_node(&snap.nodes, "dialog-delete").expect("delete dialog");
+        assert_eq!(
+            find_node(&dialog.children, "delete-files").unwrap().checked,
+            Some(true),
+            "delete-files defaults to checked"
+        );
+
+        // Uncheck "also delete downloaded files" via its semantic id.
+        click(&panel, window, "delete-files", cx).expect("toggle delete-files");
+        let snap = snapshot(&panel, cx);
+        assert_eq!(
+            find_node(&snap.nodes, "delete-files").unwrap().checked,
+            Some(false)
+        );
+
+        click(&panel, window, "delete-confirm", cx).expect("confirm delete");
+        pump(cx);
+        draw_frame(window, cx);
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "dialog-delete").is_none());
+        assert_eq!(torrent_row_ids(&snap), vec!["torrent-1"]);
+        assert_eq!(
+            client.recorded_actions(),
+            vec![(2, TorrentAction::Forget)],
+            "an unchecked delete-files box forgets instead of deleting"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn settings_and_logs_pages_report_their_kind(cx: &mut TestAppContext) {
+        let (window, panel, _client) = open_panel(cx);
+        pump(cx);
+        draw_frame(window, cx);
+
+        click(&panel, window, "settings", cx).expect("open settings");
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "page-settings").is_some());
+        assert!(find_node(&snap.nodes, "page-main").is_none());
+        assert!(find_node(&snap.nodes, "back").is_some());
+
+        click(&panel, window, "back", cx).expect("close settings");
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "page-main").is_some());
+
+        click(&panel, window, "logs", cx).expect("open logs");
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "page-logs").is_some());
+
+        click(&panel, window, "back", cx).expect("close logs");
+        pump(cx);
+        let snap = snapshot(&panel, cx);
+        assert!(find_node(&snap.nodes, "page-main").is_some());
+
+        // Back with no page open is an error, not a no-op.
+        let err = click(&panel, window, "back", cx).unwrap_err();
+        assert!(
+            err.contains("no settings or logs page is open"),
+            "unexpected error: {err}"
+        );
     }
 }

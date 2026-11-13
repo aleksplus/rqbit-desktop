@@ -1,4 +1,3 @@
-use gpui_kit::*;
 use gpui_kit::base::SelectableText;
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable, WindowExt as _,
@@ -10,6 +9,7 @@ use gpui_kit::component::{
     table::{Column, ColumnSort, DataTable, TableDelegate, TableState},
     v_flex,
 };
+use gpui_kit::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +21,9 @@ use rqbit_protocol::{
 
 use crate::client::TorrentClient;
 use crate::host::UiHost;
+#[cfg(feature = "agent-testing")]
+use crate::ui::agent::{AutomationNode, AutomationRole};
+use crate::ui::agent::{AutomationRegistry, SharedAutomationRegistry};
 use crate::ui::artwork::{ArtworkShape, DETAIL_ARTWORK_SIZE, masked_artwork};
 use crate::ui::file_table::{FileRow, FileTableDelegate};
 use crate::ui::utils::{StatusTone, format_bytes, format_speed, status_tone};
@@ -59,6 +62,8 @@ pub struct TorrentDetailPanel {
     file_table_state: Entity<TableState<FileTableDelegate>>,
     peer_table_state: Entity<TableState<PeerTableDelegate>>,
     focus_handle: FocusHandle,
+    /// Painted-bounds registry (disabled in production builds).
+    automation: SharedAutomationRegistry,
     /// Keeps the periodic peer-stats polling task alive for the lifetime of the panel.
     _peer_task: Option<Task<()>>,
 }
@@ -145,12 +150,20 @@ impl TorrentDetailPanel {
             file_table_state,
             peer_table_state,
             focus_handle: cx.focus_handle(),
+            automation: AutomationRegistry::disabled(),
             _peer_task: None,
         };
 
         this.fetch_details(cx);
         this.start_peer_polling(cx);
         this
+    }
+
+    /// Attach a painted-bounds registry (agent-testing). The default is a
+    /// disabled registry, so production callers keep using [`Self::new`].
+    pub fn with_automation(mut self, automation: SharedAutomationRegistry) -> Self {
+        self.automation = automation;
+        self
     }
 
     /// The torrent the panel is currently displaying.
@@ -839,59 +852,142 @@ impl TorrentDetailPanel {
 impl Render for TorrentDetailPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_tab = self.active_tab;
+        let automation = self.automation.clone();
 
-        v_flex()
-            .size_full()
-            .gap_0()
-            // Tab bar
-            .pl(px(10.))
-            .pr(px(10.))
-            .child(
-                TabBar::new("detail-tabs")
-                    .underline()
-                    .suffix(
-                        h_flex().gap_1().child(
-                            Button::new("close")
-                                .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(|this, _, _, cx| this.on_back(cx))),
-                        ),
-                    )
-                    .selected_index(match active_tab {
-                        DetailTab::Overview => 0,
-                        DetailTab::Trackers => 1,
-                        DetailTab::Peers => 2,
-                        DetailTab::Files => 3,
-                    })
-                    .on_click(cx.listener(|this, index, _, cx| {
-                        this.active_tab = match index {
-                            0 => DetailTab::Overview,
-                            1 => DetailTab::Trackers,
-                            2 => DetailTab::Peers,
-                            3 => DetailTab::Files,
-                            _ => DetailTab::Overview,
-                        };
-                        cx.notify();
-                    }))
-                    .child(Tab::new().label("Overview"))
-                    .child(Tab::new().label("Trackers"))
-                    .child(Tab::new().label("Peers"))
-                    .child(Tab::new().label("Files")),
-            )
-            // Tab content
-            .child(div().flex_1().min_h_0().child(match active_tab {
-                DetailTab::Overview => self.render_overview(cx).into_any_element(),
-                DetailTab::Trackers => self.render_trackers(cx).into_any_element(),
-                DetailTab::Peers => self.render_peers(cx).into_any_element(),
-                DetailTab::Files => self.render_files(cx).into_any_element(),
-            }))
+        AutomationRegistry::track(
+            &automation,
+            format!("torrent-detail-{}", self.torrent_id),
+            v_flex()
+                .size_full()
+                .gap_0()
+                // Tab bar
+                .pl(px(10.))
+                .pr(px(10.))
+                .child(
+                    TabBar::new("detail-tabs")
+                        .underline()
+                        .suffix(
+                            h_flex().gap_1().child(
+                                Button::new("close")
+                                    .icon(IconName::Close)
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(|this, _, _, cx| this.on_back(cx))),
+                            ),
+                        )
+                        .selected_index(match active_tab {
+                            DetailTab::Overview => 0,
+                            DetailTab::Trackers => 1,
+                            DetailTab::Peers => 2,
+                            DetailTab::Files => 3,
+                        })
+                        .on_click(cx.listener(|this, index, _, cx| {
+                            this.active_tab = match index {
+                                0 => DetailTab::Overview,
+                                1 => DetailTab::Trackers,
+                                2 => DetailTab::Peers,
+                                3 => DetailTab::Files,
+                                _ => DetailTab::Overview,
+                            };
+                            cx.notify();
+                        }))
+                        .child(Tab::new().label("Overview"))
+                        .child(Tab::new().label("Trackers"))
+                        .child(Tab::new().label("Peers"))
+                        .child(Tab::new().label("Files")),
+                )
+                // Tab content
+                .child(div().flex_1().min_h_0().child(match active_tab {
+                    DetailTab::Overview => self.render_overview(cx).into_any_element(),
+                    DetailTab::Trackers => self.render_trackers(cx).into_any_element(),
+                    DetailTab::Peers => self.render_peers(cx).into_any_element(),
+                    DetailTab::Files => self.render_files(cx).into_any_element(),
+                })),
+        )
     }
 }
 
 impl Focusable for TorrentDetailPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// Agent-testing surface: neutral snapshot nodes for the tabs and the file
+/// list, plus dispatch that reuses the same logic as the human clicks (the
+/// tab bar's `on_click` and the file checkbox's `on_toggle`).
+#[cfg(feature = "agent-testing")]
+impl TorrentDetailPanel {
+    /// Tab nodes (`detail-tab-*`, checked = active) followed by the file rows
+    /// (`torrent-{id}-file-{index}`, checked = included). File identity is
+    /// the torrent's file index, not the visible row position.
+    pub fn agent_nodes(&self, cx: &App) -> Vec<AutomationNode> {
+        let tabs = [
+            ("detail-tab-overview", "Overview", DetailTab::Overview),
+            ("detail-tab-trackers", "Trackers", DetailTab::Trackers),
+            ("detail-tab-peers", "Peers", DetailTab::Peers),
+            ("detail-tab-files", "Files", DetailTab::Files),
+        ]
+        .into_iter()
+        .map(|(id, name, tab)| {
+            AutomationNode::new(AutomationRole::Button, id, name).checked(self.active_tab == tab)
+        });
+        let torrent_id = self.torrent_id;
+        let files = self
+            .file_table_state
+            .read(cx)
+            .delegate()
+            .rows
+            .iter()
+            .map(|row| {
+                AutomationNode::new(
+                    AutomationRole::Checkbox,
+                    format!("torrent-{torrent_id}-file-{}", row.file_index),
+                    row.name.clone(),
+                )
+                .checked(row.included)
+            });
+        tabs.chain(files).collect()
+    }
+
+    /// Select a tab by its semantic suffix ("overview", "trackers", "peers",
+    /// "files") — the same state change as clicking the tab in the tab bar.
+    pub fn agent_select_tab(&mut self, tab: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        self.active_tab = match tab {
+            "overview" => DetailTab::Overview,
+            "trackers" => DetailTab::Trackers,
+            "peers" => DetailTab::Peers,
+            "files" => DetailTab::Files,
+            other => return Err(format!("unknown detail tab {other:?}")),
+        };
+        cx.notify();
+        Ok(())
+    }
+
+    /// Toggle a file's inclusion by its torrent file index (not the visible
+    /// row position), reusing [`Self::set_file_included`] exactly like the
+    /// Files-tab checkbox.
+    pub fn agent_toggle_file(
+        &mut self,
+        file_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let position = self
+            .file_table_state
+            .read(cx)
+            .delegate()
+            .rows
+            .iter()
+            .position(|r| r.file_index == file_index);
+        let Some(row_ix) = position else {
+            return Err(format!(
+                "file index {file_index} is not in torrent {}",
+                self.torrent_id
+            ));
+        };
+        let included = self.file_table_state.read(cx).delegate().rows[row_ix].included;
+        self.set_file_included(row_ix, !included, cx);
+        Ok(())
     }
 }
 

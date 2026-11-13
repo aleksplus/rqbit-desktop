@@ -110,4 +110,6 @@ To upgrade librqbit: bump the version in the root `Cargo.toml`, extract the new 
   https://longbridge.github.io/gpui-component/docs/ are a useful API reference
   when building or modifying UI widgets.
 - Feature specs live in `docs/` (e.g. `docs/HOOKS.md` documents the Hooks
-  settings page, its config model and the outbound HTTP contract).
+  settings page, its config model and the outbound HTTP contract;
+  `docs/GPUI_AGENT.md` documents the default-off agent-testing bridge, its
+  isolated fixture, security gates, and UI test recipe).
