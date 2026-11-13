@@ -328,9 +328,17 @@ async fn main() {
 
     // The tray keeps the session alive without a window. Exiting is explicit
     // through the tray menu, native application menu, or hold-to-quit shortcut.
+    let main_window = SharedMainWindow::default();
     let platform = platform::application()
         .with_assets(assets::Assets)
         .with_quit_mode(QuitMode::Explicit);
+    platform.on_reopen({
+        let backend = backend.clone();
+        let main_window = main_window.clone();
+        move |cx| {
+            open_main_window(&backend, &main_window, cx, agent_enabled);
+        }
+    });
     platform.run(move |cx: &mut App| {
         // Real mode only: store the state globally so all windows/views can
         // access it. The fixture backend has no State and installs no global.
@@ -348,7 +356,6 @@ async fn main() {
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
         }
 
-        let main_window = SharedMainWindow::default();
         open_main_window(&backend, &main_window, cx, agent_enabled);
 
         #[cfg(feature = "agent-testing")]
