@@ -7470,6 +7470,7 @@ dependencies = [
  "gpui-kit",
  "image",
  "rqbit-protocol",
+ "serde",
  "serde_json",
 ]
 

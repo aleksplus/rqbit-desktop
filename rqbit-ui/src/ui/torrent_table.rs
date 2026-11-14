@@ -3,12 +3,17 @@
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, checkbox::Checkbox, h_flex,
-    menu::PopupMenuItem, notification::Notification, progress::Progress,
+    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
+    checkbox::Checkbox,
+    h_flex,
+    menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
+    notification::Notification,
+    progress::Progress,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use rqbit_protocol::{
@@ -29,6 +34,22 @@ use crate::ui::utils::{
 /// Marker type so repeated context-menu "playlist copied" notifications
 /// replace each other instead of stacking up.
 struct MenuPlaylistCopiedNotice;
+
+/// User-configurable torrent-table columns, keyed by stable column key so the
+/// layout survives row sorting, hook reconnects, and desktop restarts. Widths
+/// are rounded logical pixels; keeping them integral also keeps the desktop
+/// config's `Eq` semantics.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TorrentTableLayout {
+    /// Preferred order. Unknown keys are retained for hook columns that are
+    /// temporarily unavailable; reconciliation ignores them until they exist.
+    pub order: Vec<String>,
+    /// Columns the user hid. `select` is always ignored as it stays pinned.
+    pub hidden: BTreeSet<String>,
+    /// User-resized widths in logical pixels, rounded to the nearest pixel.
+    pub widths: BTreeMap<String, u32>,
+}
 
 /// Visual tone for a torrent row, derived from the torrent state. Drives
 /// row-level styling: paused rows render with dimmed text, and the progress
@@ -401,6 +422,119 @@ fn context_menu_target_ids(
     ids
 }
 
+/// Initial layout for the currently available catalog: all columns visible,
+/// default widths, built-ins first and hook columns in declared order.
+fn initial_column_layout(available: &[Column]) -> TorrentTableLayout {
+    TorrentTableLayout {
+        order: available.iter().map(|c| c.key.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+/// Reconcile available columns with the saved layout. The selection checkbox
+/// is pinned first; every other available column follows saved order, then new
+/// columns in catalog order. Hidden columns stay in `layout` for later menus
+/// and reconnects but are omitted from the returned visible definitions.
+fn reconcile_columns(
+    available: Vec<Column>,
+    layout: &TorrentTableLayout,
+    sort_key: Option<&str>,
+    sort_dir: ColumnSort,
+) -> Vec<Column> {
+    let catalog_order: Vec<String> = available.iter().map(|c| c.key.to_string()).collect();
+    let mut by_key: HashMap<String, Column> = HashMap::new();
+    for column in available {
+        // Built-ins win over a malformed hook spec that reuses their key.
+        by_key.entry(column.key.to_string()).or_insert(column);
+    }
+
+    let mut columns: Vec<Column> = by_key.remove("select").into_iter().collect();
+    let mut seen: HashSet<String> = columns.iter().map(|c| c.key.to_string()).collect();
+    let push_key = |key: &str, columns: &mut Vec<Column>, seen: &mut HashSet<String>| {
+        if key == "select" || !seen.insert(key.to_string()) {
+            return;
+        }
+        if let Some(column) = by_key.get(key)
+            && !layout.hidden.contains(key)
+        {
+            columns.push(column.clone());
+        }
+    };
+    for key in &layout.order {
+        push_key(key, &mut columns, &mut seen);
+    }
+    for key in catalog_order {
+        push_key(&key, &mut columns, &mut seen);
+    }
+
+    for column in &mut columns {
+        if let Some(width) = layout.widths.get(column.key.as_ref()) {
+            column.width = px(*width as f32);
+        }
+        column.sort = if sort_key == Some(column.key.as_ref()) {
+            Some(sort_dir)
+        } else {
+            column.sort.map(|_| ColumnSort::Default)
+        };
+    }
+    columns
+}
+
+/// Whether hiding `key` would leave at least one visible data column.
+fn can_hide_column(columns: &[Column], key: &str) -> bool {
+    key != "select"
+        && columns.iter().any(|c| c.key.as_ref() == key)
+        && columns
+            .iter()
+            .filter(|c| c.key.as_ref() != "select")
+            .count()
+            > 1
+}
+
+/// Compute the full saved order after a visible-column move. `available` is
+/// already reconciled and includes hidden active columns. Unknown saved keys
+/// (for example an offline hook) remain stored after the active columns.
+fn moved_column_order(
+    visible: &[Column],
+    available: &[Column],
+    layout: &TorrentTableLayout,
+    from_ix: usize,
+    to_ix: usize,
+) -> Option<Vec<String>> {
+    if from_ix == to_ix
+        || from_ix == 0
+        || to_ix == 0
+        || from_ix >= visible.len()
+        || to_ix >= visible.len()
+    {
+        return None;
+    }
+    let source = visible[from_ix].key.to_string();
+    let target = visible[to_ix].key.to_string();
+    if source == "select" || target == "select" {
+        return None;
+    }
+
+    let mut active: Vec<String> = available.iter().map(|c| c.key.to_string()).collect();
+    let source_pos = active.iter().position(|key| *key == source)?;
+    active.remove(source_pos);
+    let target_pos = active.iter().position(|key| *key == target)?;
+    let insert_pos = if from_ix < to_ix {
+        target_pos + 1
+    } else {
+        target_pos
+    };
+    active.insert(insert_pos, source);
+
+    let mut seen: HashSet<String> = active.iter().cloned().collect();
+    for key in &layout.order {
+        if seen.insert(key.clone()) {
+            active.push(key.clone());
+        }
+    }
+    Some(active)
+}
+
 /// Table delegate that holds torrent row data.
 pub struct TorrentTableDelegate {
     /// Full, unfiltered set of rows as last fetched from the client. The
@@ -409,7 +543,7 @@ pub struct TorrentTableDelegate {
     pub all_rows: Vec<TorrentRow>,
     pub rows: Vec<TorrentRow>,
     columns: Vec<Column>,
-    /// Hook-provided dynamic columns currently appended to `columns`. Empty
+    /// Hook-provided dynamic columns currently available to the table. Empty
     /// when no hook provides columns or the providing hook is unreachable.
     custom_specs: Vec<CustomColumnSpec>,
     /// Render kind per dynamic column key (mirrors `custom_specs`; avoids a
@@ -425,10 +559,14 @@ pub struct TorrentTableDelegate {
     /// (which shift row indices); resolved to a row lazily by
     /// [`TorrentTableDelegate::anchor_row_ix`].
     anchor_id: Option<u64>,
-    /// Currently active sort column index (None = no active sort).
-    sort_col_ix: Option<usize>,
+    /// Currently active sort column key (None = no active sort). Keyed rather
+    /// than indexed so dragging or hiding other columns cannot retarget it.
+    sort_key: Option<String>,
     /// Currently active sort direction.
     sort_dir: ColumnSort,
+    /// Saved column order, visibility, and widths. Hook columns that are
+    /// temporarily disconnected remain here while absent from `columns`.
+    layout: TorrentTableLayout,
     /// Folder keys whose groups the user collapsed. Groups are expanded by
     /// default, so this starts (and mostly stays) empty. Keyed by folder, so
     /// collapse state survives refreshes and parent promotion alike.
@@ -478,7 +616,11 @@ impl TorrentTableDelegate {
     /// hook-provided dynamic ones.
     fn base_columns() -> Vec<Column> {
         vec![
-            Column::new("select", "").width(40.),
+            Column::new("select", "")
+                .width(40.)
+                .fixed_left()
+                .movable(false)
+                .selectable(false),
             Column::new("name", "Name").width(300.).sortable(),
             Column::new("state", "Status").width(100.).sortable(),
             Column::new("progress", "Progress").width(140.).sortable(),
@@ -499,24 +641,28 @@ impl TorrentTableDelegate {
         host: Arc<dyn UiHost>,
         automation: SharedAutomationRegistry,
     ) -> Self {
-        Self {
+        let layout = host.torrent_table_layout();
+        let mut this = Self {
             all_rows: Vec::new(),
             rows: Vec::new(),
-            columns: Self::base_columns(),
+            columns: Vec::new(),
             custom_specs: Vec::new(),
             custom_kinds: HashMap::new(),
             filter: TorrentFilter::default(),
             selected_rows: HashSet::new(),
             anchor_id: None,
-            sort_col_ix: None,
+            sort_key: None,
             sort_dir: ColumnSort::Default,
+            layout,
             collapsed_folders: HashSet::new(),
             default_folder_key: None,
             main_panel,
             client,
             host,
             automation,
-        }
+        };
+        this.rebuild_columns();
+        this
     }
 
     /// Store the given search text and status filter, then re-derive the
@@ -548,7 +694,8 @@ impl TorrentTableDelegate {
     /// Replace the hook-provided dynamic columns. `None` (no column hook
     /// configured) and a disconnected state both drop every dynamic column —
     /// hook data is only shown while the providing service is reachable.
-    /// Returns whether the visible column set changed; the caller must then
+    /// Saved preferences are retained by key for a later reconnect.
+    /// Returns whether the available column set changed; the caller must then
     /// `refresh()` the table state so the framework re-reads the columns.
     pub fn set_custom_columns(&mut self, state: Option<&CustomColumnsState>) -> bool {
         let specs: Vec<CustomColumnSpec> = match state {
@@ -572,28 +719,16 @@ impl TorrentTableDelegate {
             .iter()
             .map(|s| (s.key.clone(), s.kind))
             .collect();
-        // The sort index may point past the (shorter) column list.
-        if self.sort_col_ix.is_some_and(|ix| ix >= self.columns.len()) {
-            self.sort_col_ix = None;
-            self.sort_dir = ColumnSort::Default;
+        if self.rebuild_columns() {
+            // The actively sorted hook column disappeared.
+            self.apply_filter();
         }
-        self.rebuild_columns();
         true
     }
 
-    /// Persist user-resized widths back into the column defs so they survive
-    /// a `refresh()` (which re-reads `column()` into the framework's cached
-    /// column groups).
-    pub fn set_column_widths(&mut self, widths: &[Pixels]) {
-        for (col, width) in self.columns.iter_mut().zip(widths) {
-            col.width = *width;
-        }
-    }
-
-    /// Rebuild `columns` from the static base plus the dynamic specs,
-    /// re-mirroring the active sort onto the fresh definitions so the header
-    /// arrow survives the rebuild.
-    fn rebuild_columns(&mut self) {
+    /// All currently available columns in their original catalog order,
+    /// including hidden ones. Disconnected hook columns are not available.
+    fn available_columns(&self) -> Vec<Column> {
         let mut columns = Self::base_columns();
         for spec in &self.custom_specs {
             let mut col = Column::new(spec.key.clone(), spec.name.clone()).sortable();
@@ -602,15 +737,105 @@ impl TorrentTableDelegate {
             }
             columns.push(col);
         }
-        for (ix, col) in columns.iter_mut().enumerate() {
-            col.sort = if Some(ix) == self.sort_col_ix {
-                Some(self.sort_dir)
-            } else {
-                // Keep the sortable flag, clear any stale active sort.
-                col.sort.map(|_| ColumnSort::Default)
-            };
+        columns
+    }
+
+    /// Available columns in user order, including hidden ones. Used to update
+    /// the saved order without losing the positions of hidden columns.
+    fn ordered_available_columns(&self) -> Vec<Column> {
+        let mut layout = self.layout.clone();
+        layout.hidden.clear();
+        reconcile_columns(
+            self.available_columns(),
+            &layout,
+            self.sort_key.as_deref(),
+            self.sort_dir,
+        )
+    }
+
+    /// Show or hide one available data column, preserving at least one visible
+    /// data column. The selection checkbox is deliberately not configurable.
+    pub fn set_column_visible(&mut self, key: &str, visible: bool) {
+        if key == "select"
+            || !self
+                .available_columns()
+                .iter()
+                .any(|column| column.key.as_ref() == key)
+        {
+            return;
         }
-        self.columns = columns;
+        if visible {
+            if !self.layout.hidden.remove(key) {
+                return;
+            }
+        } else {
+            if self.layout.hidden.contains(key) {
+                return;
+            }
+            if !can_hide_column(&self.columns, key) {
+                return;
+            }
+            self.layout.hidden.insert(key.to_string());
+        }
+        if self.rebuild_columns() {
+            // Hiding the actively sorted column restores default ID order.
+            self.apply_filter();
+        }
+        self.persist_layout();
+    }
+
+    /// Restore default order, visibility, and widths for currently available
+    /// columns. Preferences for unavailable hook columns are discarded.
+    pub fn reset_columns(&mut self) {
+        self.layout = initial_column_layout(&self.available_columns());
+        if self.rebuild_columns() {
+            self.apply_filter();
+        }
+        self.persist_layout();
+    }
+
+    fn persist_layout(&self) {
+        self.host.persist_torrent_table_layout(self.layout.clone());
+    }
+
+    /// Persist user-resized widths by column key so they survive refreshes,
+    /// reordering, hidden columns, hook updates, and desktop restarts.
+    pub fn set_column_widths(&mut self, widths: &[Pixels]) {
+        let mut changed = false;
+        for (col, width) in self.columns.iter_mut().zip(widths) {
+            col.width = *width;
+            let saved = f32::from(*width).round().max(0.) as u32;
+            if self.layout.widths.get(col.key.as_ref()) != Some(&saved) {
+                self.layout.widths.insert(col.key.to_string(), saved);
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_layout();
+        }
+    }
+
+    /// Rebuild visible `columns` from the static base, dynamic specs, and the
+    /// saved layout. Returns whether the active sort was cleared because its
+    /// column is no longer visible.
+    fn rebuild_columns(&mut self) -> bool {
+        self.columns = reconcile_columns(
+            self.available_columns(),
+            &self.layout,
+            self.sort_key.as_deref(),
+            self.sort_dir,
+        );
+        if self
+            .sort_key
+            .as_ref()
+            .is_some_and(|key| !self.columns.iter().any(|column| column.key.as_ref() == key))
+        {
+            self.sort_key = None;
+            self.sort_dir = ColumnSort::Default;
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether a search text or status filter is currently constraining the
@@ -635,10 +860,7 @@ impl TorrentTableDelegate {
     /// [`TorrentTableDelegate::set_filter`], so the view stays correct even
     /// as torrent statuses update live.
     pub fn apply_filter(&mut self) {
-        let sort_key = self
-            .sort_col_ix
-            .and_then(|ix| self.columns.get(ix))
-            .map(|c| c.key.to_string());
+        let sort_key = self.sort_key.clone();
         let custom_keys: HashSet<String> =
             self.custom_specs.iter().map(|s| s.key.clone()).collect();
         self.rows = derive_display_rows(
@@ -897,11 +1119,12 @@ impl TableDelegate for TorrentTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let col = &self.columns[col_ix];
-        if col.key.as_ref() == "select" {
+        let col_key = col.key.clone();
+        let content = if col.key.as_ref() == "select" {
             let all_selected = !self.rows.is_empty() && self.selected_rows.len() == self.rows.len();
             let total = self.rows.len();
             let table_state = cx.entity().clone();
-            return div()
+            div()
                 .size_full()
                 .flex()
                 .items_center()
@@ -920,11 +1143,70 @@ impl TableDelegate for TorrentTableDelegate {
                             });
                         }),
                 )
-                .into_any_element();
-        }
+                .into_any_element()
+        } else {
+            div()
+                .size_full()
+                .child(self.column(col_ix, cx).name.clone())
+                .into_any_element()
+        };
+
+        // Snapshot the catalog for the menu builder, which runs when the menu
+        // opens rather than when this header renders. Hidden columns therefore
+        // remain reachable from every other header's menu.
+        let visible_data_count = self
+            .columns
+            .iter()
+            .filter(|column| column.key.as_ref() != "select")
+            .count();
+        let entries: Vec<(String, SharedString, bool, bool)> = self
+            .available_columns()
+            .into_iter()
+            .filter(|column| column.key.as_ref() != "select")
+            .map(|column| {
+                let visible = !self.layout.hidden.contains(column.key.as_ref());
+                (
+                    column.key.to_string(),
+                    column.name,
+                    visible,
+                    !visible || visible_data_count > 1,
+                )
+            })
+            .collect();
+        let table_state = cx.entity().clone();
         div()
+            .id(SharedString::from(format!("torrent-column-menu-{col_key}")))
             .size_full()
-            .child(self.column(col_ix, cx).name.clone())
+            .child(content)
+            .context_menu(move |mut menu, _, _| {
+                menu = menu.item(PopupMenuItem::label("Columns")).scrollable(true);
+                for (key, name, visible, enabled) in entries.iter().cloned() {
+                    let table_state = table_state.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(name)
+                            .checked(visible)
+                            .disabled(!enabled)
+                            .on_click(move |_, _, cx: &mut App| {
+                                table_state.update(cx, |state, cx| {
+                                    state.delegate_mut().set_column_visible(&key, !visible);
+                                    state.refresh(cx);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                let reset_table_state = table_state.clone();
+                menu.separator()
+                    .item(PopupMenuItem::new("Reset columns").on_click(
+                        move |_, _, cx: &mut App| {
+                            reset_table_state.update(cx, |state, cx| {
+                                state.delegate_mut().reset_columns();
+                                state.refresh(cx);
+                                cx.notify();
+                            });
+                        },
+                    ))
+            })
             .into_any_element()
     }
 
@@ -945,10 +1227,13 @@ impl TableDelegate for TorrentTableDelegate {
         // (which replace `self.rows` wholesale), and mirror it onto the
         // column definitions so the header arrow survives a `refresh()`
         // (which re-reads them into the framework's column groups).
-        self.sort_col_ix = Some(col_ix);
+        let Some(key) = self.columns.get(col_ix).map(|col| col.key.to_string()) else {
+            return;
+        };
+        self.sort_key = Some(key);
         self.sort_dir = sort;
-        for (ix, col) in self.columns.iter_mut().enumerate() {
-            col.sort = if ix == col_ix {
+        for col in &mut self.columns {
+            col.sort = if Some(col.key.as_ref()) == self.sort_key.as_deref() {
                 Some(sort)
             } else {
                 col.sort.map(|_| ColumnSort::Default)
@@ -958,6 +1243,27 @@ impl TableDelegate for TorrentTableDelegate {
         // clears the index-based selection, which just went stale.
         self.apply_filter();
         cx.notify();
+    }
+
+    /// Apply the framework's header drag result to the saved key order. The
+    /// framework moves its own cached column group after this callback; the
+    /// delegate is rebuilt here so future refreshes produce the same order.
+    fn move_column(
+        &mut self,
+        col_ix: usize,
+        to_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        let available = self.ordered_available_columns();
+        let Some(order) =
+            moved_column_order(&self.columns, &available, &self.layout, col_ix, to_ix)
+        else {
+            return;
+        };
+        self.layout.order = order;
+        self.rebuild_columns();
+        self.persist_layout();
     }
 
     fn render_tr(
@@ -1068,10 +1374,10 @@ impl TableDelegate for TorrentTableDelegate {
     fn context_menu(
         &mut self,
         row_ix: usize,
-        menu: gpui_kit::component::menu::PopupMenu,
+        menu: PopupMenu,
         _window: &mut Window,
         _cx: &mut Context<TableState<Self>>,
-    ) -> gpui_kit::component::menu::PopupMenu {
+    ) -> PopupMenu {
         let Some(row) = self.rows.get(row_ix) else {
             return menu;
         };
@@ -1281,10 +1587,12 @@ mod tests {
     // attribute macro (re-exported via `use gpui::*` above) into scope and
     // shadow the builtin `#[test]`.
     use super::{
-        RowTone, TorrentFilter, TorrentRow, context_menu_target_ids, derive_display_rows,
-        normalize_folder, resolve_anchor_row, shift_range_start,
+        RowTone, TorrentFilter, TorrentRow, TorrentTableDelegate, TorrentTableLayout,
+        can_hide_column, context_menu_target_ids, derive_display_rows, initial_column_layout,
+        moved_column_order, normalize_folder, reconcile_columns, resolve_anchor_row,
+        shift_range_start,
     };
-    use gpui_kit::component::table::ColumnSort;
+    use gpui_kit::component::table::{Column, ColumnSort};
     use std::collections::HashSet;
 
     fn row(id: u64, name: &str, folder: &str) -> TorrentRow {
@@ -1570,6 +1878,141 @@ mod tests {
             ),
             vec![(1, 0, 1), (2, 0, 1)]
         );
+    }
+
+    #[test]
+    fn default_column_layout_matches_original_table() {
+        let available = TorrentTableDelegate::base_columns();
+        let columns = reconcile_columns(
+            available.clone(),
+            &TorrentTableLayout::default(),
+            None,
+            ColumnSort::Default,
+        );
+        let keys: Vec<String> = columns.iter().map(|c| c.key.to_string()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "select",
+                "name",
+                "state",
+                "progress",
+                "down",
+                "downloaded",
+                "up",
+                "uploaded",
+                "eta",
+                "peers",
+            ]
+        );
+        assert_eq!(initial_column_layout(&available).order, keys);
+        assert!(columns[0].fixed.is_some());
+        assert!(!columns[0].movable);
+    }
+
+    #[test]
+    fn layout_reconciles_order_visibility_widths_and_sort_by_key() {
+        let mut available = TorrentTableDelegate::base_columns();
+        available.push(Column::new("rating", "Rating").width(120.));
+        let mut layout = TorrentTableLayout {
+            order: ["up", "name", "up", "offline", "select"]
+                .map(str::to_string)
+                .into(),
+            ..Default::default()
+        };
+        layout.hidden.insert("downloaded".into());
+        layout.widths.insert("name".into(), 321);
+
+        let columns = reconcile_columns(available, &layout, Some("name"), ColumnSort::Ascending);
+        let keys: Vec<String> = columns.iter().map(|c| c.key.to_string()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "select", "up", "name", "state", "progress", "down", "uploaded", "eta", "peers",
+                "rating",
+            ]
+        );
+        let name = columns.iter().find(|c| c.key.as_ref() == "name").unwrap();
+        assert_eq!(f32::from(name.width), 321.);
+        assert_eq!(name.sort, Some(ColumnSort::Ascending));
+        assert!(layout.order.contains(&"offline".to_string()));
+    }
+
+    #[test]
+    fn hook_preferences_survive_disconnect_and_new_columns_append() {
+        let mut available = TorrentTableDelegate::base_columns();
+        available.push(Column::new("rating", "Rating").width(120.));
+        available.push(Column::new("genre", "Genre").width(100.));
+        let mut layout = TorrentTableLayout {
+            order: ["select", "name", "rating"].map(str::to_string).into(),
+            ..Default::default()
+        };
+        layout.hidden.insert("rating".into());
+        layout.widths.insert("rating".into(), 222);
+
+        let columns = reconcile_columns(available.clone(), &layout, None, ColumnSort::Default);
+        assert!(!columns.iter().any(|c| c.key.as_ref() == "rating"));
+        assert_eq!(columns.last().unwrap().key.as_ref(), "genre");
+
+        // Offline hooks disappear without mutating their saved preferences.
+        let offline = reconcile_columns(
+            TorrentTableDelegate::base_columns(),
+            &layout,
+            None,
+            ColumnSort::Default,
+        );
+        assert!(!offline.iter().any(|c| c.key.as_ref() == "rating"));
+        assert!(layout.hidden.contains("rating"));
+        assert_eq!(layout.widths.get("rating"), Some(&222));
+
+        // Showing the reconnected column restores its saved place and width.
+        layout.hidden.remove("rating");
+        let reconnected = reconcile_columns(available, &layout, None, ColumnSort::Default);
+        assert_eq!(reconnected[2].key.as_ref(), "rating");
+        assert_eq!(f32::from(reconnected[2].width), 222.);
+    }
+
+    #[test]
+    fn moving_columns_updates_saved_order_and_keeps_unknown_keys() {
+        let available = TorrentTableDelegate::base_columns();
+        let visible = reconcile_columns(
+            available.clone(),
+            &TorrentTableLayout::default(),
+            Some("name"),
+            ColumnSort::Ascending,
+        );
+        let mut layout = initial_column_layout(&available);
+        layout.order.push("offline".into());
+
+        let order = moved_column_order(&visible, &available, &layout, 1, 3).unwrap();
+        assert_eq!(
+            &order[..5],
+            &["select", "state", "progress", "name", "down"]
+        );
+        assert_eq!(order.last().unwrap(), "offline");
+        layout.order = order;
+
+        let moved = reconcile_columns(available, &layout, Some("name"), ColumnSort::Ascending);
+        assert_eq!(moved[3].key.as_ref(), "name");
+        assert_eq!(moved[3].sort, Some(ColumnSort::Ascending));
+    }
+
+    #[test]
+    fn last_data_column_cannot_be_hidden_and_select_is_protected() {
+        let available = TorrentTableDelegate::base_columns();
+        let mut layout = TorrentTableLayout::default();
+        for column in available.iter().skip(2) {
+            layout.hidden.insert(column.key.to_string());
+        }
+        let visible = reconcile_columns(available, &layout, None, ColumnSort::Default);
+        assert_eq!(visible.len(), 2);
+        assert!(!can_hide_column(&visible, "name"));
+        assert!(!can_hide_column(&visible, "select"));
+
+        let reset = initial_column_layout(&TorrentTableDelegate::base_columns());
+        assert!(reset.hidden.is_empty());
+        assert!(reset.widths.is_empty());
+        assert!(!reset.order.contains(&"offline".to_string()));
     }
 
     #[test]

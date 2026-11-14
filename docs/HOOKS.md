@@ -512,9 +512,12 @@ gets hooks via `--column-hook <URL>` (repeatable, POST) and
     `PushUpdate::CustomColumns` (change-diffed) to session-level
     subscribers and decorates `List`/`Details` responses, giving the
     browser client the same data.
-  * UI: dynamic columns are appended to the torrent and file tables only
-    while `connected` is true; the detail Overview additionally shows the
-    torrent-level values (its "Links" section); the status bar shows a
+  * UI: dynamic columns are available in the torrent and file tables only
+    while `connected` is true. Torrent-table headers let the user hide/show
+    columns and drag built-in and hook columns into one shared order; the
+    desktop persists those preferences by stable column key and restores them
+    when a disconnected hook returns. The detail Overview additionally shows
+    the torrent-level values (its "Links" section); the status bar shows a
     green plug + hook name
     when connected, a gray one + "offline" when configured but unreachable,
     and nothing when no hook provides columns.

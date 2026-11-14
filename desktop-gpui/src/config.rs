@@ -9,6 +9,7 @@ use librqbit::{
     ConnectionOptions, ListenerMode, ListenerOptions, PeerConnectionOptions, dht::PersistentDht,
     limits::LimitsConfig,
 };
+use rqbit_ui::ui::torrent_table::TorrentTableLayout;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
@@ -335,6 +336,11 @@ pub struct RqbitDesktopConfig {
     /// UI theme: "light" or "dark". Defaults to "light".
     #[serde(default)]
     pub theme: String,
+
+    /// Torrent-table column order, visibility, and widths. Managed outside
+    /// the settings draft because header changes apply immediately.
+    #[serde(default)]
+    pub torrent_table_layout: TorrentTableLayout,
 }
 
 impl Default for RqbitDesktopConfig {
@@ -363,6 +369,7 @@ impl Default for RqbitDesktopConfig {
             disable_previews: false,
             poster_tint: false,
             theme: "light".to_string(),
+            torrent_table_layout: Default::default(),
             #[cfg(feature = "disable-upload")]
             disable_upload: false,
         }
@@ -394,6 +401,7 @@ mod tests {
         let json = r#"{"default_download_location": "/tmp/dl"}"#;
         let cfg: RqbitDesktopConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.hooks.hooks.is_empty());
+        assert_eq!(cfg.torrent_table_layout, TorrentTableLayout::default());
         // Sections added later default sensibly: the web view is on, on its
         // own port (not app-daemon's 3080), so both can run side by side.
         assert!(!cfg.web_view.disable);
@@ -412,6 +420,25 @@ mod tests {
         let s = serde_json::to_string(&cfg).unwrap();
         let back: RqbitDesktopConfig = serde_json::from_str(&s).unwrap();
         assert!(cfg == back);
+    }
+
+    #[test]
+    fn torrent_table_layout_roundtrip() {
+        let mut torrent_table_layout = TorrentTableLayout {
+            order: ["select", "up", "name", "rating"]
+                .map(str::to_string)
+                .into(),
+            ..Default::default()
+        };
+        torrent_table_layout.hidden.insert("name".into());
+        torrent_table_layout.widths.insert("up".into(), 137);
+        let cfg = RqbitDesktopConfig {
+            torrent_table_layout,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&cfg).unwrap();
+        let back: RqbitDesktopConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(cfg, back);
     }
 
     #[test]

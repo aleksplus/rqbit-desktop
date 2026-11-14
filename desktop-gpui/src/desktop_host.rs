@@ -8,11 +8,12 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui_kit::{AnyView, App, AppContext as _, Context, Window, PathPromptOptions};
+use gpui_kit::{AnyView, App, AppContext as _, Context, PathPromptOptions, Window};
 use rqbit_ui::client::TorrentClient;
 use rqbit_ui::host::{PickedTorrentFile, UiCapabilities, UiHost};
 use rqbit_ui::ui::add_torrent_dialog::AddTorrentEntry;
 use rqbit_ui::ui::main_panel::MainPanel;
+use rqbit_ui::ui::torrent_table::TorrentTableLayout;
 use tracing::warn;
 
 use crate::state::State;
@@ -106,6 +107,14 @@ impl UiHost for DesktopHost {
 
     fn persist_theme(&self, mode: &str) {
         self.state.set_theme(mode);
+    }
+
+    fn torrent_table_layout(&self) -> TorrentTableLayout {
+        self.state.config().torrent_table_layout
+    }
+
+    fn persist_torrent_table_layout(&self, layout: TorrentTableLayout) {
+        self.state.set_torrent_table_layout(layout);
     }
 
     fn playlist_url(&self, torrent_id: u64) -> Option<String> {

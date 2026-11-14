@@ -12,6 +12,7 @@ use gpui_kit::{AnyView, App, Context, Window};
 use crate::client::{TorrentClient, UiAddSource};
 use crate::ui::add_torrent_dialog::AddTorrentEntry;
 use crate::ui::main_panel::MainPanel;
+use crate::ui::torrent_table::TorrentTableLayout;
 
 /// Which host-provided affordances the shared UI should render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,16 @@ pub trait UiHost: 'static {
 
     /// Persist the theme choice ("dark"/"light").
     fn persist_theme(&self, _mode: &str) {}
+
+    /// Load the torrent table's column layout. The default keeps the shared
+    /// browser and test hosts session-only; the desktop overrides this with
+    /// its config file.
+    fn torrent_table_layout(&self) -> TorrentTableLayout {
+        TorrentTableLayout::default()
+    }
+
+    /// Persist a user-initiated torrent-table column layout change.
+    fn persist_torrent_table_layout(&self, _layout: TorrentTableLayout) {}
 
     /// The playlist (M3U8) URL served for a torrent, when the host knows a
     /// usable HTTP media base. `None` renders the row as "Unavailable".

@@ -14,6 +14,7 @@ async-trait = {workspace = true}
 futures = {workspace = true}
 gpui-kit = {version = "0.9.0", features = ["gpui-fast"]}
 rqbit-protocol = {workspace = true}
+serde = {workspace = true, features = ["derive"]}
 serde_json = {workspace = true}
 # Artwork decoding + masking (posters/previews). Version must stay compatible
 # with gpui-fast's `image` dependency so `image::Frame` types unify with

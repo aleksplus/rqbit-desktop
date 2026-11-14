@@ -419,6 +419,24 @@ impl State {
         self.shared.write().set_config(config);
     }
 
+    /// Persist torrent-table column changes immediately, independently of the
+    /// settings page draft (the same single-writer pattern as `set_theme`).
+    pub fn set_torrent_table_layout(
+        &self,
+        layout: rqbit_ui::ui::torrent_table::TorrentTableLayout,
+    ) {
+        let mut config = self.shared.read().config();
+        if config.torrent_table_layout == layout {
+            return;
+        }
+        config.torrent_table_layout = layout;
+        if let Err(e) = write_config(&self.config_filename, &config) {
+            error!("error writing config: {:#}", e);
+            return;
+        }
+        self.shared.write().set_config(config);
+    }
+
     pub async fn configure(&self, config: RqbitDesktopConfig) -> Result<(), ApiError> {
         // Quick check under a brief read lock: if nothing changed, bail out.
         {
@@ -627,6 +645,28 @@ pub(crate) mod tests {
         // Setting the same theme again is a no-op (and writes nothing).
         state.set_theme("dark");
         assert_eq!(state.config().theme, "dark");
+    }
+
+    #[tokio::test]
+    async fn set_torrent_table_layout_updates_shared_and_file() {
+        let scratch = crate::folder_watcher::tests::TempDir::new("torrent-table-layout");
+        let config_filename = scratch.path().join("config.json");
+        let config_filename = config_filename.to_str().unwrap().to_owned();
+        let state = test_state(quiet_config(), config_filename.clone()).await;
+        let mut layout = rqbit_ui::ui::torrent_table::TorrentTableLayout {
+            order: ["select", "up", "name"].map(str::to_string).into(),
+            ..Default::default()
+        };
+        layout.hidden.insert("name".into());
+        layout.widths.insert("up".into(), 140);
+
+        state.set_torrent_table_layout(layout.clone());
+        assert_eq!(state.config().torrent_table_layout, layout);
+        let persisted = crate::config::read_config(&config_filename).unwrap();
+        assert_eq!(persisted.torrent_table_layout, layout);
+
+        // Repeating an unchanged layout is a no-op.
+        state.set_torrent_table_layout(layout);
     }
 
     /// Same as above but with the "full-fat" config a real user has: TCP

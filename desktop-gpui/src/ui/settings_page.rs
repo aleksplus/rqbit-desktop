@@ -24,6 +24,13 @@ use crate::{
 
 type ConfigArc = Arc<parking_lot::RwLock<RqbitDesktopConfig>>;
 
+/// UI preferences that change immediately must come from live state when an
+/// older settings draft is applied, rather than being overwritten by it.
+fn preserve_live_ui_preferences(config: &mut RqbitDesktopConfig, live: &RqbitDesktopConfig) {
+    config.theme = live.theme.clone();
+    config.torrent_table_layout = live.torrent_table_layout.clone();
+}
+
 /// Events emitted by [`SettingsPage`] to communicate with the parent view.
 #[derive(Clone, Debug)]
 pub enum SettingsPageEvent {
@@ -74,11 +81,10 @@ impl SettingsPage {
 
         let mut config = self.config.read().clone();
 
-        // Theme is deliberately not owned by the draft: the switches apply and
-        // persist it immediately (see `theme_switch_field`), so take the live
-        // value here — Apply can neither clobber a concurrent toggle nor be
-        // reverted by one.
-        config.theme = self.state.config().theme;
+        // Theme and the torrent-column layout are deliberately not owned by
+        // the draft: their controls apply and persist immediately, so take the
+        // live values here — Apply cannot clobber a concurrent change.
+        preserve_live_ui_preferences(&mut config, &self.state.config());
 
         if let Err(e) = write_config(&self.state.config_filename, &config) {
             self.apply_error = Some(format!("Error writing config: {e:#}").into());
@@ -1370,10 +1376,28 @@ impl Focusable for SettingsPage {
 mod tests {
     // NOTE: no `use super::*` / `use gpui::*` here — a glob-imported `test`
     // macro shadows the built-in #[test] that #[gpui_kit::test] expands to.
-    use super::SettingsPage;
+    use super::{SettingsPage, preserve_live_ui_preferences};
     use crate::folder_watcher::tests::TempDir;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AppContext as _, TestAppContext, px, size};
+
+    #[test]
+    fn settings_apply_preserves_live_theme_and_torrent_layout() {
+        let mut draft = crate::config::RqbitDesktopConfig {
+            theme: "light".into(),
+            ..Default::default()
+        };
+        let mut live = crate::config::RqbitDesktopConfig {
+            theme: "dark".into(),
+            ..Default::default()
+        };
+        live.torrent_table_layout.order = ["select", "up", "name"].map(str::to_string).into();
+        live.torrent_table_layout.hidden.insert("name".into());
+
+        preserve_live_ui_preferences(&mut draft, &live);
+        assert_eq!(draft.theme, "dark");
+        assert_eq!(draft.torrent_table_layout, live.torrent_table_layout);
+    }
 
     /// The port field must only rewrite the port of the web view listen
     /// address, and the IP field must only rewrite the IP — neither
