@@ -78,6 +78,15 @@ impl UiHost for DesktopHost {
         }
     }
 
+    fn open_file(&self, path: &str) {
+        // Detached: opening the default application must not block the UI.
+        if !path.is_empty()
+            && let Err(e) = open::that_detached(path)
+        {
+            tracing::warn!(path = %path, error = %e, "error opening file");
+        }
+    }
+
     fn open_url(&self, url: &str) {
         // Detached: opening a browser/player must not block the UI thread.
         if let Err(e) = open::that_detached(url) {

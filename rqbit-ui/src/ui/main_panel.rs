@@ -2918,6 +2918,7 @@ mod agent_tests {
             UiCapabilities {
                 add_torrent_files: false,
                 open_folder: false,
+                open_file: false,
                 settings_page: true,
                 logs_page: true,
             }

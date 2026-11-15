@@ -14,18 +14,20 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div, px,
-};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
+    checkbox::Checkbox,
     dock::{BasePanel, Panel, PanelEvent},
     h_flex,
     list::ListItem,
     menu::{PopupMenu, PopupMenuItem},
     notification::Notification,
     tree::{Tree, TreeEntry, TreeItem, TreeState},
+    v_flex,
+};
+use gpui_kit::{
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div, px,
 };
 use rqbit_protocol::{TorrentDetails, TorrentFile, TorrentId, TorrentStats};
 
@@ -126,6 +128,8 @@ enum NodeKind {
         length: u64,
         status: FileStatus,
         progress_pct: Option<u8>,
+        /// Hook-provided watched state (`watched=yes` / `watched=no`).
+        watched: Option<bool>,
     },
 }
 
@@ -245,6 +249,19 @@ fn last_component(file: &TorrentFile) -> &str {
         .unwrap_or(&file.name)
 }
 
+/// Read the moviesync-compatible per-file watched flag. Missing and
+/// unrecognized values stay unknown and never match the unwatched filter.
+fn file_watched_state(file: &TorrentFile) -> Option<bool> {
+    let value = file.custom.as_ref()?.get("watched")?.trim();
+    if value.eq_ignore_ascii_case("yes") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("no") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Build one torrent's subtree: `TreeItem`s for the tree plus the flat
 /// [`NodeInfo`] metadata for every generated id. File components are
 /// relative to the torrent root, and the root row stands in for that root
@@ -316,6 +333,7 @@ fn emit_dir_group(
                     length: file.length,
                     status,
                     progress_pct: file_progress_pct(progress_bytes, file.length),
+                    watched: file_watched_state(file),
                 },
             },
         ));
@@ -323,6 +341,30 @@ fn emit_dir_group(
     }
 
     items
+}
+
+/// Clone and prune a tree to explicitly unwatched files (`watched=no`).
+/// Empty ancestor folders and torrent roots disappear. `TreeItem` clones
+/// share expansion state, so filtering never resets the user's folding.
+fn unwatched_items(items: &[TreeItem], meta: &HashMap<SharedString, NodeInfo>) -> Vec<TreeItem> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let kind = &meta.get(&item.id)?.kind;
+            match kind {
+                NodeKind::File {
+                    watched: Some(false),
+                    ..
+                } => Some(item.clone()),
+                NodeKind::File { .. } => None,
+                NodeKind::Torrent | NodeKind::Dir { .. } => {
+                    let mut item = item.clone();
+                    item.children = unwatched_items(&item.children, meta);
+                    (!item.children.is_empty()).then_some(item)
+                }
+            }
+        })
+        .collect()
 }
 
 /// Marker type for the "path copied" notification, so repeated copies
@@ -354,6 +396,8 @@ pub struct ExplorerPanel {
     files: HashMap<u64, TorrentFiles>,
     /// torrent id → per-file downloaded bytes (latest list refresh).
     progress: HashMap<u64, Vec<u64>>,
+    /// Show only files whose hook-provided watched value is explicitly `no`.
+    unwatched_only: bool,
     /// Last user-selected item id, restored after each `set_items` wipe.
     selected_node: Option<SharedString>,
     /// Selection already reported via [`ExplorerEvent::TorrentSelected`].
@@ -382,6 +426,7 @@ impl ExplorerPanel {
             folders: HashMap::new(),
             files: HashMap::new(),
             progress: HashMap::new(),
+            unwatched_only: false,
             selected_node: None,
             reported_selection: None,
             focus_handle: cx.focus_handle(),
@@ -543,7 +588,11 @@ impl ExplorerPanel {
     /// the selection the wipe just cleared. Expansion state survives on its
     /// own via the shared `TreeItem` state.
     fn rebuild_tree(&mut self, cx: &mut Context<Self>) {
-        let items = self.roots.clone();
+        let items = if self.unwatched_only {
+            unwatched_items(&self.roots, &self.meta)
+        } else {
+            self.roots.clone()
+        };
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
         });
@@ -555,6 +604,15 @@ impl ExplorerPanel {
                 });
             }
         }
+    }
+
+    fn set_unwatched_only(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.unwatched_only == enabled {
+            return;
+        }
+        self.unwatched_only = enabled;
+        self.rebuild_tree(cx);
+        cx.notify();
     }
 
     /// Track tree selection: remember it for restore, and report genuinely
@@ -672,7 +730,21 @@ impl ExplorerPanel {
             );
         }
 
-        ListItem::new(id).child(row).selected(selected)
+        let mut item = ListItem::new(id).child(row).selected(selected);
+        let output_folder = self
+            .folders
+            .get(&info.torrent_id)
+            .map(String::as_str)
+            .unwrap_or_default();
+        if let Some(path) = file_open_path(self.host.as_ref(), output_folder, &info.kind) {
+            let host = self.host.clone();
+            item = item.on_click(move |event, _, _| {
+                if event.click_count() == 2 {
+                    host.open_file(&path);
+                }
+            });
+        }
+        item
     }
 
     /// Build the right-click menu for one entry: reveal on disk (desktop
@@ -726,6 +798,18 @@ impl ExplorerPanel {
 
         menu
     }
+}
+
+/// Resolve a file row's local open target. Folders and roots, hosts without
+/// OS file opening, and remote rows without an output folder have none.
+fn file_open_path(host: &dyn UiHost, output_folder: &str, kind: &NodeKind) -> Option<String> {
+    if !host.capabilities().open_file {
+        return None;
+    }
+    let NodeKind::File { path, .. } = kind else {
+        return None;
+    };
+    join_disk_path(output_folder, path)
 }
 
 /// Join the output folder and relative components into an on-disk path.
@@ -793,7 +877,24 @@ impl Render for ExplorerPanel {
             panel.read(cx).context_menu(entry, menu)
         });
 
-        div().size_full().overflow_hidden().child(tree)
+        v_flex()
+            .size_full()
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .p_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Checkbox::new("explorer-unwatched-only")
+                            .label("Unwatched only")
+                            .checked(self.unwatched_only)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.set_unwatched_only(*checked, cx);
+                            })),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().overflow_hidden().child(tree))
     }
 }
 
@@ -814,6 +915,14 @@ mod tests {
 
     fn ids(items: &[TreeItem]) -> Vec<String> {
         items.iter().map(|i| i.id.to_string()).collect()
+    }
+
+    fn with_watched(mut file: TorrentFile, watched: &str) -> TorrentFile {
+        file.custom = Some(BTreeMap::from([(
+            "watched".to_string(),
+            watched.to_string(),
+        )]));
+        file
     }
 
     #[test]
@@ -990,6 +1099,66 @@ mod tests {
     }
 
     #[test]
+    fn unwatched_filter_keeps_only_explicit_no_and_nonempty_ancestors() {
+        let files = vec![
+            with_watched(
+                file("new.mkv", &["alpha", "sub", "new.mkv"], 10, true),
+                "NO",
+            ),
+            with_watched(file("seen.mkv", &["alpha", "seen.mkv"], 20, true), "yes"),
+            file("unknown.mkv", &["unknown.mkv"], 30, true),
+            with_watched(file("old.mkv", &["archive", "old.mkv"], 40, true), "yes"),
+        ];
+        let (mut items, metas) = build_torrent_subtree(9, &files, None);
+        items[0] = items[0].clone().expanded(true);
+        items[0].children[0] = items[0].children[0].clone().expanded(true);
+        let root = TreeItem::new(root_item_id(9), "Pack")
+            .expanded(true)
+            .children(items);
+        let mut meta: HashMap<_, _> = metas.into_iter().collect();
+        meta.insert(
+            root.id.clone(),
+            NodeInfo {
+                torrent_id: 9,
+                kind: NodeKind::Torrent,
+            },
+        );
+
+        let filtered = unwatched_items(&[root], &meta);
+
+        assert_eq!(ids(&filtered), vec!["t9"]);
+        assert_eq!(ids(&filtered[0].children), vec!["t9/d/alpha"]);
+        assert_eq!(
+            ids(&filtered[0].children[0].children),
+            vec!["t9/d/alpha/sub"]
+        );
+        assert_eq!(
+            ids(&filtered[0].children[0].children[0].children),
+            vec!["t9/f/0"]
+        );
+        assert!(filtered[0].is_expanded());
+        assert!(filtered[0].children[0].is_expanded());
+        assert!(filtered[0].children[0].children[0].is_expanded());
+    }
+
+    #[test]
+    fn watched_values_require_a_recognized_explicit_flag() {
+        assert_eq!(
+            file_watched_state(&with_watched(file("a", &["a"], 1, true), " Yes ")),
+            Some(true)
+        );
+        assert_eq!(
+            file_watched_state(&with_watched(file("a", &["a"], 1, true), "no")),
+            Some(false)
+        );
+        assert_eq!(
+            file_watched_state(&with_watched(file("a", &["a"], 1, true), "unknown")),
+            None
+        );
+        assert_eq!(file_watched_state(&file("a", &["a"], 1, true)), None);
+    }
+
+    #[test]
     fn torrent_ids_parse_from_every_id_kind() {
         assert_eq!(torrent_id_of_item_id("t42"), Some(42));
         assert_eq!(torrent_id_of_item_id("t42/d/alpha"), Some(42));
@@ -1014,6 +1183,49 @@ mod tests {
         assert_eq!(
             torrent_root_label("Ubuntu", Some(&stats(25, 100))),
             "Ubuntu · 25%"
+        );
+    }
+
+    #[test]
+    fn file_open_path_requires_a_file_desktop_capability_and_folder() {
+        struct TestHost(bool);
+        impl UiHost for TestHost {
+            fn capabilities(&self) -> crate::host::UiCapabilities {
+                if self.0 {
+                    crate::host::UiCapabilities::desktop()
+                } else {
+                    crate::host::UiCapabilities::remote()
+                }
+            }
+
+            fn version(&self) -> String {
+                "test".to_string()
+            }
+        }
+
+        let kind = NodeKind::File {
+            file_index: 0,
+            path: vec!["alpha".to_string(), "a.txt".to_string()],
+            length: 1,
+            status: FileStatus::Done,
+            progress_pct: Some(100),
+            watched: None,
+        };
+        assert_eq!(
+            file_open_path(&TestHost(true), "/downloads", &kind),
+            Some(
+                PathBuf::from("/downloads")
+                    .join("alpha")
+                    .join("a.txt")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(file_open_path(&TestHost(true), "", &kind), None);
+        assert_eq!(file_open_path(&TestHost(false), "/downloads", &kind), None);
+        assert_eq!(
+            file_open_path(&TestHost(true), "/downloads", &NodeKind::Torrent),
+            None
         );
     }
 

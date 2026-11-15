@@ -172,6 +172,7 @@ impl UiHost for WebHost {
         UiCapabilities {
             add_torrent_files: true,
             open_folder: false,
+            open_file: false,
             settings_page: true,
             logs_page: false,
         }

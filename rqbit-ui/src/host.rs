@@ -21,6 +21,8 @@ pub struct UiCapabilities {
     pub add_torrent_files: bool,
     /// Offer "Open Folder" in the torrent context menu.
     pub open_folder: bool,
+    /// Open a local file with the OS default application.
+    pub open_file: bool,
     /// Show the settings button / page.
     pub settings_page: bool,
     /// Show the logs button / page.
@@ -33,6 +35,7 @@ impl UiCapabilities {
         Self {
             add_torrent_files: false,
             open_folder: false,
+            open_file: false,
             settings_page: false,
             logs_page: false,
         }
@@ -43,6 +46,7 @@ impl UiCapabilities {
         Self {
             add_torrent_files: true,
             open_folder: true,
+            open_file: true,
             settings_page: true,
             logs_page: true,
         }
@@ -68,6 +72,9 @@ pub trait UiHost: 'static {
 
     /// Reveal a folder in the OS file manager.
     fn open_folder(&self, _path: &str) {}
+
+    /// Open a local file with the host's default application.
+    fn open_file(&self, _path: &str) {}
 
     /// Open a URL with the host's default handler (desktop: the OS opener;
     /// browser: a new tab).
