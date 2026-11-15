@@ -10,13 +10,13 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::*;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rqbit_protocol::{
-    CustomColumnKind, CustomColumnsState, PeerEntry, PeerStatsSnapshot, TorrentDetails, TorrentId,
-    TorrentStats,
+    CustomColumnKind, CustomColumnSpec, CustomColumnsState, PeerEntry, PeerStatsSnapshot,
+    TorrentDetails, TorrentId, TorrentStats,
 };
 
 use crate::client::TorrentClient;
@@ -729,22 +729,39 @@ impl TorrentDetailPanel {
             })
     }
 
-    /// The Overview's hook-provided section: every declared custom column
+    /// The Overview's hook-provided sections: every declared custom column
     /// that carries a torrent-level value on the details payload — including
     /// file-level columns that also carry a torrent-level value (a `movie`
     /// column can link the torrent in the Overview and each file in the file
     /// list). Link-kind values render an "Open" button (the URL in its
     /// tooltip) that opens the browser, status values render
-    /// tone-tinted, the rest as plain text. (Image columns are skipped:
+    /// tone-tinted, the rest as plain text. External players (`player_*`)
+    /// move from the regular "Links" section into a following "External
+    /// links" section, with Kinopoisk first. (Image columns are skipped:
     /// their URLs are already shown as the corner artwork.)
-    fn render_custom_overview(&self, cx: &Context<Self>) -> Option<Div> {
-        let custom = self.details.as_ref()?.custom.as_ref()?;
-        let specs = &self.custom_columns.as_ref()?.columns;
-        let rows: Vec<_> = specs
-            .iter()
-            .filter(|spec| spec.kind != CustomColumnKind::Image)
-            .filter_map(|spec| custom.get(&spec.key).map(|value| (spec, value)))
-            .collect();
+    fn render_custom_overview(&self, cx: &Context<Self>) -> Vec<Div> {
+        let Some(custom) = self.details.as_ref().and_then(|d| d.custom.as_ref()) else {
+            return Vec::new();
+        };
+        let Some(specs) = self.custom_columns.as_ref().map(|state| &state.columns) else {
+            return Vec::new();
+        };
+        let (rows, player_rows) = custom_overview_rows(specs, custom);
+        [
+            self.render_custom_section("Links", rows, cx),
+            self.render_custom_section("External links", player_rows, cx),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn render_custom_section(
+        &self,
+        title: &'static str,
+        rows: Vec<CustomOverviewRow<'_>>,
+        cx: &Context<Self>,
+    ) -> Option<Div> {
         if rows.is_empty() {
             return None;
         }
@@ -756,7 +773,7 @@ impl TorrentDetailPanel {
                     div()
                         .text_size(px(14.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Links"),
+                        .child(title),
                 )
                 .children(rows.into_iter().map(|(spec, value)| {
                     let label = div()
@@ -1138,6 +1155,32 @@ impl TableDelegate for PeerTableDelegate {
 
 // --- Helpers ---
 
+type CustomOverviewRow<'a> = (&'a CustomColumnSpec, &'a String);
+
+/// Split torrent-level custom values into the regular Overview rows and the
+/// external-player rows. Player order is stable except that Kinopoisk is
+/// promoted to the front when the hook provides it.
+fn custom_overview_rows<'a>(
+    specs: &'a [CustomColumnSpec],
+    custom: &'a BTreeMap<String, String>,
+) -> (Vec<CustomOverviewRow<'a>>, Vec<CustomOverviewRow<'a>>) {
+    let (rows, mut player_rows): (Vec<_>, Vec<_>) = specs
+        .iter()
+        .filter(|spec| spec.kind != CustomColumnKind::Image)
+        .filter_map(|spec| custom.get(&spec.key).map(|value| (spec, value)))
+        .partition(|(spec, _)| !is_external_player(spec));
+    player_rows.sort_by_key(|(spec, _)| !is_kinopoisk_player(spec));
+    (rows, player_rows)
+}
+
+fn is_external_player(spec: &CustomColumnSpec) -> bool {
+    spec.kind == CustomColumnKind::Link && spec.key.starts_with("player_")
+}
+
+fn is_kinopoisk_player(spec: &CustomColumnSpec) -> bool {
+    spec.key == "player_kinopoisk" || spec.name.eq_ignore_ascii_case("kinopoisk")
+}
+
 /// Build a label/value info row.
 fn info_row(label: impl Into<String>, value: impl Into<String>) -> Div {
     let label = label.into();
@@ -1172,4 +1215,94 @@ fn selectable_info_row(label: impl Into<String>, value: impl Into<String>) -> Di
                 .flex_1()
                 .child(SelectableText::new("selectable-info-value", value)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CustomOverviewRow, custom_overview_rows};
+    use rqbit_protocol::{CustomColumnKind, CustomColumnSpec};
+    use std::collections::BTreeMap;
+
+    fn column(key: &str, name: &str, kind: CustomColumnKind) -> CustomColumnSpec {
+        CustomColumnSpec {
+            key: key.to_owned(),
+            name: name.to_owned(),
+            files: false,
+            kind,
+            width: None,
+        }
+    }
+
+    fn keys<'a>(rows: &[CustomOverviewRow<'a>]) -> Vec<&'a str> {
+        rows.iter().map(|(spec, _)| spec.key.as_str()).collect()
+    }
+
+    #[test]
+    fn external_players_are_separate_and_kinopoisk_is_first() {
+        let specs = vec![
+            column("myshows", "MyShows", CustomColumnKind::Link),
+            column("player_ivi", "Иви", CustomColumnKind::Link),
+            column("player_kinopoisk", "Kinopoisk", CustomColumnKind::Link),
+            column("player_amediateka", "AMEDIATEKA", CustomColumnKind::Link),
+            column("sync_status", "Sync", CustomColumnKind::Status),
+            column("poster", "Poster", CustomColumnKind::Image),
+        ];
+        let custom = BTreeMap::from([
+            (
+                "myshows".to_owned(),
+                "https://myshows.me/view/1/".to_owned(),
+            ),
+            (
+                "player_ivi".to_owned(),
+                "https://www.ivi.ru/watch/1".to_owned(),
+            ),
+            (
+                "player_kinopoisk".to_owned(),
+                "https://www.kinopoisk.ru/film/1/".to_owned(),
+            ),
+            (
+                "player_amediateka".to_owned(),
+                "https://amediateka.ru/watch/1".to_owned(),
+            ),
+            ("sync_status".to_owned(), "synced".to_owned()),
+            (
+                "poster".to_owned(),
+                "https://img.test/poster.jpg".to_owned(),
+            ),
+        ]);
+
+        let (rows, players) = custom_overview_rows(&specs, &custom);
+
+        assert_eq!(keys(&rows), ["myshows", "sync_status"]);
+        assert_eq!(
+            keys(&players),
+            ["player_kinopoisk", "player_ivi", "player_amediateka"]
+        );
+    }
+
+    #[test]
+    fn player_rows_require_a_link_value_and_match_kinopoisk_by_label() {
+        let specs = vec![
+            column("player_ivi", "Иви", CustomColumnKind::Link),
+            column("player_service", "KiNoPoIsk", CustomColumnKind::Link),
+            column("player_note", "Note", CustomColumnKind::Text),
+            column("player_missing", "Missing", CustomColumnKind::Link),
+        ];
+        let custom = BTreeMap::from([
+            (
+                "player_ivi".to_owned(),
+                "https://www.ivi.ru/watch/1".to_owned(),
+            ),
+            (
+                "player_service".to_owned(),
+                "https://www.kinopoisk.ru/film/1/".to_owned(),
+            ),
+            ("player_note".to_owned(), "not a player link".to_owned()),
+        ]);
+
+        let (rows, players) = custom_overview_rows(&specs, &custom);
+
+        assert_eq!(keys(&rows), ["player_note"]);
+        assert_eq!(keys(&players), ["player_service", "player_ivi"]);
+    }
 }
