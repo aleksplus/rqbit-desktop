@@ -632,6 +632,10 @@ impl MainPanel {
     /// columns are dropped while disconnected (or unconfigured) and only
     /// trigger a table `refresh()` when the visible set actually changed.
     fn apply_custom_columns(&mut self, state: Option<CustomColumnsState>, cx: &mut Context<Self>) {
+        let connected = state.as_ref().is_some_and(|state| state.connected);
+        self.explorer.update(cx, |explorer, cx| {
+            explorer.set_hook_connected(connected, cx);
+        });
         if self.custom_columns == state {
             return;
         }

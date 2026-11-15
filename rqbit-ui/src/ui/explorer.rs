@@ -13,6 +13,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
@@ -25,6 +26,7 @@ use gpui_kit::component::{
     tree::{Tree, TreeEntry, TreeItem, TreeState},
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div, px,
@@ -343,7 +345,8 @@ fn emit_dir_group(
     items
 }
 
-/// Clone and prune a tree to explicitly unwatched files (`watched=no`).
+/// Clone and prune a tree to unwatched files. Explicitly watched files
+/// (`watched=yes`) disappear; explicit `no` and untracked files remain.
 /// Empty ancestor folders and torrent roots disappear. `TreeItem` clones
 /// share expansion state, so filtering never resets the user's folding.
 fn unwatched_items(items: &[TreeItem], meta: &HashMap<SharedString, NodeInfo>) -> Vec<TreeItem> {
@@ -353,10 +356,10 @@ fn unwatched_items(items: &[TreeItem], meta: &HashMap<SharedString, NodeInfo>) -
             let kind = &meta.get(&item.id)?.kind;
             match kind {
                 NodeKind::File {
-                    watched: Some(false),
+                    watched: Some(true),
                     ..
-                } => Some(item.clone()),
-                NodeKind::File { .. } => None,
+                } => None,
+                NodeKind::File { .. } => Some(item.clone()),
                 NodeKind::Torrent | NodeKind::Dir { .. } => {
                     let mut item = item.clone();
                     item.children = unwatched_items(&item.children, meta);
@@ -370,6 +373,10 @@ fn unwatched_items(items: &[TreeItem], meta: &HashMap<SharedString, NodeInfo>) -
 /// Marker type for the "path copied" notification, so repeated copies
 /// replace instead of stacking.
 struct ExplorerPathCopiedNotice;
+
+/// Watched metadata rides on `details()` responses; refresh it only while
+/// the filter is active rather than fetching every torrent on every poll.
+const WATCHED_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Cached static metadata for one torrent: the file list answered by
 /// `details()`.
@@ -392,11 +399,17 @@ pub struct ExplorerPanel {
     /// torrent id → output folder (from list rows; may be empty on remote
     /// hosts that don't expose paths).
     folders: HashMap<u64, String>,
-    /// torrent id → static file metadata, filled once `details()` answers.
+    /// torrent id → file metadata from the latest `details()` response.
     files: HashMap<u64, TorrentFiles>,
+    /// Details requests currently awaiting a response.
+    details_in_flight: HashSet<u64>,
+    /// Last refresh of hook-provided watched values while filtering.
+    last_watched_refresh: Option<Instant>,
     /// torrent id → per-file downloaded bytes (latest list refresh).
     progress: HashMap<u64, Vec<u64>>,
-    /// Show only files whose hook-provided watched value is explicitly `no`.
+    /// Whether a custom-columns hook is currently connected.
+    hook_connected: bool,
+    /// Hide files whose hook-provided watched value is explicitly `yes`.
     unwatched_only: bool,
     /// Last user-selected item id, restored after each `set_items` wipe.
     selected_node: Option<SharedString>,
@@ -425,7 +438,10 @@ impl ExplorerPanel {
             meta: HashMap::new(),
             folders: HashMap::new(),
             files: HashMap::new(),
+            details_in_flight: HashSet::new(),
+            last_watched_refresh: None,
             progress: HashMap::new(),
+            hook_connected: false,
             unwatched_only: false,
             selected_node: None,
             reported_selection: None,
@@ -505,12 +521,28 @@ impl ExplorerPanel {
 
         self.rebuild_meta();
         self.rebuild_tree(cx);
+        self.refresh_watched_if_due(cx);
     }
 
-    /// Install file metadata answered by a `details()` fetch. The torrent's
-    /// children are built once here; later refreshes only touch labels.
+    /// Install file metadata answered by a `details()` fetch. Only the
+    /// initial response builds children; refreshes retain the existing items
+    /// (and their expansion state) while updating watched/file metadata.
     fn install_files(&mut self, torrent_id: u64, files: Vec<TorrentFile>, cx: &mut Context<Self>) {
+        let Some(root_ix) = self
+            .roots
+            .iter()
+            .position(|r| torrent_id_of_item_id(&r.id) == Some(torrent_id))
+        else {
+            return;
+        };
+        let had_files = self.files.contains_key(&torrent_id);
         self.files.insert(torrent_id, TorrentFiles { files });
+        if had_files {
+            self.rebuild_meta();
+            self.rebuild_tree(cx);
+            return;
+        }
+
         let Some(cached) = self.files.get(&torrent_id) else {
             return;
         };
@@ -519,40 +551,57 @@ impl ExplorerPanel {
             &cached.files,
             self.progress.get(&torrent_id).map(Vec::as_slice),
         );
-
-        let root_ix = self
-            .roots
-            .iter()
-            .position(|r| torrent_id_of_item_id(&r.id) == Some(torrent_id));
-        if let Some(ix) = root_ix {
-            self.roots[ix].children = children;
-            self.meta.extend(metas);
-            self.rebuild_tree(cx);
-        }
+        self.roots[root_ix].children = children;
+        self.meta.extend(metas);
+        self.rebuild_tree(cx);
     }
 
-    /// Fetch (once per torrent) the static file list the list rows don't
-    /// carry. Failures are silent — the root stays a bare node until the
-    /// torrent is removed and re-added.
+    /// Queue a details fetch unless one is already running. Failures are
+    /// silent; clearing the in-flight marker lets a later refresh retry.
     fn queue_details_fetch(&mut self, torrent_id: u64, cx: &mut Context<Self>) {
+        if !self.details_in_flight.insert(torrent_id) {
+            return;
+        }
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let Ok(details) = client.details(&TorrentId::Id(torrent_id)).await else {
-                return;
-            };
-            let Some(files) = details.files else {
-                return;
-            };
+            let result = client.details(&TorrentId::Id(torrent_id)).await;
             let _ = this.update(cx, |this, cx| {
-                // List rows always carry the id, so the fetch is queued once;
-                // still guard against a late duplicate answer.
-                if this.files.contains_key(&torrent_id) {
+                this.details_in_flight.remove(&torrent_id);
+                let Ok(details) = result else {
                     return;
-                }
+                };
+                let Some(files) = details.files else {
+                    return;
+                };
                 this.install_files(torrent_id, files, cx);
             });
         })
         .detach();
+    }
+
+    fn refresh_watched(&mut self, cx: &mut Context<Self>) {
+        self.last_watched_refresh = Some(Instant::now());
+        let ids: Vec<u64> = self
+            .roots
+            .iter()
+            .filter_map(|root| torrent_id_of_item_id(&root.id))
+            .collect();
+        for id in ids {
+            self.queue_details_fetch(id, cx);
+        }
+    }
+
+    fn refresh_watched_if_due(&mut self, cx: &mut Context<Self>) {
+        if !self.hook_connected || !self.unwatched_only {
+            return;
+        }
+        if self
+            .last_watched_refresh
+            .is_some_and(|last| last.elapsed() < WATCHED_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.refresh_watched(cx);
     }
 
     /// Regenerate the flat id → metadata map from the cached file lists.
@@ -611,7 +660,27 @@ impl ExplorerPanel {
             return;
         }
         self.unwatched_only = enabled;
+        if enabled {
+            self.refresh_watched(cx);
+        } else {
+            self.last_watched_refresh = None;
+        }
         self.rebuild_tree(cx);
+        cx.notify();
+    }
+
+    /// Show the filter only while a custom-columns hook is connected. A
+    /// disconnect restores the full tree rather than hiding the active filter.
+    pub fn set_hook_connected(&mut self, connected: bool, cx: &mut Context<Self>) {
+        if self.hook_connected == connected {
+            return;
+        }
+        self.hook_connected = connected;
+        if !connected {
+            self.unwatched_only = false;
+            self.last_watched_refresh = None;
+            self.rebuild_tree(cx);
+        }
         cx.notify();
     }
 
@@ -880,20 +949,22 @@ impl Render for ExplorerPanel {
         v_flex()
             .size_full()
             .overflow_hidden()
-            .child(
-                h_flex()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        Checkbox::new("explorer-unwatched-only")
-                            .label("Unwatched only")
-                            .checked(self.unwatched_only)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.set_unwatched_only(*checked, cx);
-                            })),
-                    ),
-            )
+            .when(self.hook_connected, |this| {
+                this.child(
+                    h_flex()
+                        .p_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            Checkbox::new("explorer-unwatched-only")
+                                .label("Unwatched only")
+                                .checked(self.unwatched_only)
+                                .on_click(cx.listener(|this, checked, _, cx| {
+                                    this.set_unwatched_only(*checked, cx);
+                                })),
+                        ),
+                )
+            })
             .child(div().flex_1().min_h_0().overflow_hidden().child(tree))
     }
 }
@@ -1099,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn unwatched_filter_keeps_only_explicit_no_and_nonempty_ancestors() {
+    fn unwatched_filter_hides_only_watched_files_and_empty_ancestors() {
         let files = vec![
             with_watched(
                 file("new.mkv", &["alpha", "sub", "new.mkv"], 10, true),
@@ -1127,7 +1198,7 @@ mod tests {
         let filtered = unwatched_items(&[root], &meta);
 
         assert_eq!(ids(&filtered), vec!["t9"]);
-        assert_eq!(ids(&filtered[0].children), vec!["t9/d/alpha"]);
+        assert_eq!(ids(&filtered[0].children), vec!["t9/d/alpha", "t9/f/2"]);
         assert_eq!(
             ids(&filtered[0].children[0].children),
             vec!["t9/d/alpha/sub"]
