@@ -230,6 +230,11 @@ impl TorrentClient for LocalClient {
                         conv::proto_error_from_api_error(&e, ProtoErrorKind::BadRequest)
                     })?;
             }
+            TorrentAction::CheckFiles => {
+                api.api_torrent_action_check_files(id).await.map_err(|e| {
+                    conv::proto_error_from_api_error(&e, ProtoErrorKind::BadRequest)
+                })?;
+            }
         }
         Ok(())
     }

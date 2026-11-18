@@ -164,6 +164,7 @@ impl TorrentClient for FixtureClient {
                     file.included = selected.contains(&(index as u64));
                 }
             }
+            TorrentAction::CheckFiles => {}
             TorrentAction::Forget | TorrentAction::Delete => unreachable!(),
         }
         data.actions.push((id, action));

@@ -88,6 +88,13 @@ mod tests {
                     action: TorrentAction::UpdateOnlyFiles(vec![1, 3]),
                 },
             },
+            ClientMessage::Request {
+                id: 5,
+                req: Request::Action {
+                    torrent: TorrentId::Id(7),
+                    action: TorrentAction::CheckFiles,
+                },
+            },
             ClientMessage::Subscribe { torrent: None },
             ClientMessage::Subscribe {
                 torrent: Some(TorrentId::Id(3)),

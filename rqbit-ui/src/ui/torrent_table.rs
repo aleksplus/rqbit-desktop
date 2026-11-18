@@ -1428,6 +1428,17 @@ impl TableDelegate for TorrentTableDelegate {
             .separator()
         };
 
+        // Checking is deliberately single-torrent even when the pause/start
+        // actions above target a multi-row selection.
+        m = m
+            .item(torrent_action_menu_item(
+                "Check files".to_string(),
+                torrent_id as usize,
+                rqbit_protocol::TorrentAction::CheckFiles,
+                client.clone(),
+            ))
+            .separator();
+
         // Media playback: offered when the host has a media base at all
         // (the same condition that fills the detail panel's playlist row).
         // Single-torrent by nature — like Open Folder, always the

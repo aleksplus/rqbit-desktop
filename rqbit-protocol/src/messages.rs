@@ -100,6 +100,8 @@ pub enum TorrentAction {
     Delete,
     /// `api_torrent_action_update_only_files` — replace the file selection.
     UpdateOnlyFiles(Vec<u64>),
+    /// `api_torrent_action_check_files` — validate existing files against piece hashes.
+    CheckFiles,
 }
 
 /// Where a torrent comes from. `Bytes` carries a picked .torrent file's

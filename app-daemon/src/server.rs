@@ -138,6 +138,11 @@ pub async fn handle_request(
                         .await
                         .map_err(api_err)?;
                 }
+                proto::TorrentAction::CheckFiles => {
+                    api.api_torrent_action_check_files(id)
+                        .await
+                        .map_err(api_err)?;
+                }
             }
             ResponsePayload::Empty
         }

@@ -438,7 +438,7 @@ mod tests {
         };
         let encoded = serde_json::to_string(&cfg).unwrap();
         let back: RqbitDesktopConfig = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(cfg, back);
+        assert!(cfg == back);
     }
 
     #[test]

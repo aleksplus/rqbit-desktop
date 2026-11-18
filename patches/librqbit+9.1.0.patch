@@ -1,5 +1,5 @@
 diff --git a/src/api.rs b/src/api.rs
-index f795c1f..9607b6d 100644
+index f795c1f..ad4446d 100644
 --- a/src/api.rs
 +++ b/src/api.rs
 @@ -15,10 +15,7 @@ use crate::{
@@ -10,7 +10,7 @@ index f795c1f..9607b6d 100644
 -        FileStream, ManagedTorrentHandle,
 -        peer::stats::snapshot::{PeerStatsFilter, PeerStatsSnapshot},
 -    },
-+    torrent_state::{FileStream, ManagedTorrentHandle},
++    torrent_state::{FileStream, ManagedTorrentHandle, ManagedTorrentState},
      type_aliases::BF,
  };
  
@@ -45,7 +45,68 @@ index f795c1f..9607b6d 100644
          )
      }
  
-@@ -398,6 +405,12 @@ impl Api {
+@@ -347,6 +354,60 @@ impl Api {
+         Ok(Default::default())
+     }
+ 
++    /// Force a full checksum validation of the torrent's existing files.
++    ///
++    /// Forgetting removes the fast-resume bitfield, so re-adding the stored
++    /// torrent bytes runs the same initial check used for pre-existing files.
++    pub async fn api_torrent_action_check_files(
++        &self,
++        idx: TorrentIdOrHash,
++    ) -> Result<EmptyJsonResponse> {
++        let handle = self.mgr_handle(idx)?;
++        if handle.with_state(|state| {
++            matches!(state, ManagedTorrentState::Initializing(_))
++        }) {
++            return Err(ApiError::from((
++                StatusCode::BAD_REQUEST,
++                "torrent is already checking files",
++            )));
++        }
++
++        let metadata = handle
++            .metadata
++            .load_full()
++            .context("torrent metadata is not resolved")
++            .with_status(StatusCode::BAD_REQUEST)?;
++        let id = handle.id();
++        let output_folder = handle
++            .output_folder()
++            .to_str()
++            .context("torrent output folder is not valid UTF-8")
++            .with_status(StatusCode::BAD_REQUEST)?
++            .to_owned();
++        let shared = handle.shared();
++        let opts = AddTorrentOptions {
++            paused: handle.is_paused(),
++            only_files: handle.only_files(),
++            overwrite: true,
++            output_folder: Some(output_folder),
++            force_tracker_interval: shared.options.force_tracker_interval,
++            ratelimits: shared.options.ratelimits,
++            initial_peers: Some(shared.options.initial_peers.clone()),
++            peer_limit: shared.options.peer_limit,
++            preferred_id: Some(id),
++            trackers: Some(shared.trackers.iter().map(|t| t.to_string()).collect()),
++            ..Default::default()
++        };
++
++        self.api_torrent_action_forget(id.into()).await?;
++        self.api_add_torrent(
++            AddTorrent::TorrentFileBytes(metadata.torrent_bytes.clone()),
++            Some(opts),
++        )
++        .await?;
++        Ok(Default::default())
++    }
++
+     pub fn api_set_rust_log(&self, new_value: String) -> Result<EmptyJsonResponse> {
+         let tx = self
+             .rust_log_reload_tx
+@@ -398,6 +459,12 @@ impl Api {
                          .output_folder
                          .to_string_lossy()
                          .into_owned(),
@@ -58,7 +119,7 @@ index f795c1f..9607b6d 100644
                  )
                  .context("error making torrent details")?;
                  ApiAddTorrentResponse {
-@@ -430,6 +443,7 @@ impl Api {
+@@ -430,6 +497,7 @@ impl Api {
                      None,
                      only_files.as_deref(),
                      output_folder.to_string_lossy().into_owned().to_string(),
@@ -66,7 +127,7 @@ index f795c1f..9607b6d 100644
                  )
                  .context("error making torrent details")?,
              },
-@@ -446,6 +460,12 @@ impl Api {
+@@ -446,6 +514,12 @@ impl Api {
                          .output_folder
                          .to_string_lossy()
                          .into_owned(),
@@ -79,7 +140,7 @@ index f795c1f..9607b6d 100644
                  )
                  .context("error making torrent details")?;
                  ApiAddTorrentResponse {
-@@ -549,6 +569,8 @@ pub struct TorrentDetailsResponse {
+@@ -549,6 +623,8 @@ pub struct TorrentDetailsResponse {
      pub files: Option<Vec<TorrentDetailsResponseFile>>,
      #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
      pub stats: Option<TorrentStats>,
@@ -88,7 +149,7 @@ index f795c1f..9607b6d 100644
  }
  
  #[derive(Serialize, Deserialize)]
-@@ -566,6 +588,7 @@ fn make_torrent_details(
+@@ -566,6 +642,7 @@ fn make_torrent_details(
      name: Option<&str>,
      only_files: Option<&[usize]>,
      output_folder: String,
@@ -96,7 +157,7 @@ index f795c1f..9607b6d 100644
  ) -> Result<TorrentDetailsResponse> {
      let files = match info {
          Some(info) => info
-@@ -596,6 +619,7 @@ fn make_torrent_details(
+@@ -596,6 +673,7 @@ fn make_torrent_details(
          files: Some(files),
          output_folder,
          total_pieces,
