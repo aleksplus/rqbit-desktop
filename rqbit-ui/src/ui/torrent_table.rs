@@ -1998,6 +1998,39 @@ mod tests {
     }
 
     #[test]
+    fn moving_hook_columns_uses_the_same_saved_order_as_builtins() {
+        let mut available = TorrentTableDelegate::base_columns();
+        available.push(Column::new("rating", "Rating").width(120.));
+        available.push(Column::new("genre", "Genre").width(100.));
+        let mut layout = initial_column_layout(&available);
+        let visible = reconcile_columns(
+            available.clone(),
+            &layout,
+            Some("rating"),
+            ColumnSort::Ascending,
+        );
+
+        // Drag the API-provided rating column from the end to before Name.
+        let rating_ix = visible
+            .iter()
+            .position(|column| column.key.as_ref() == "rating")
+            .unwrap();
+        let name_ix = visible
+            .iter()
+            .position(|column| column.key.as_ref() == "name")
+            .unwrap();
+        layout.order =
+            moved_column_order(&visible, &available, &layout, rating_ix, name_ix).unwrap();
+
+        let moved = reconcile_columns(available, &layout, Some("rating"), ColumnSort::Ascending);
+        let keys: Vec<String> = moved.iter().map(|c| c.key.to_string()).collect();
+        assert_eq!(&keys[..4], &["select", "rating", "name", "state"]);
+        assert_eq!(keys.last().unwrap(), "genre");
+        assert_eq!(moved[1].sort, Some(ColumnSort::Ascending));
+        assert!(moved[1].movable);
+    }
+
+    #[test]
     fn last_data_column_cannot_be_hidden_and_select_is_protected() {
         let available = TorrentTableDelegate::base_columns();
         let mut layout = TorrentTableLayout::default();
