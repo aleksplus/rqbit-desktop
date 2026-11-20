@@ -259,8 +259,7 @@ async fn real_backend(init_logging_result: InitLoggingResult) -> AppBackend {
     AppBackend::Real { state, state_arc }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     task_profiler::maybe_start();
 
     // The agent fixture requires the `agent-testing` feature; without it the
@@ -285,6 +284,8 @@ async fn main() {
     })
     .unwrap();
 
+    let runtime = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
+
     // Fixture mode (feature `agent-testing` + RQBIT_AGENT_FIXTURE=1) bypasses
     // State::new and all real session/service setup: no librqbit session, no
     // listeners, no config file. The logging guards have no other owner in
@@ -292,22 +293,24 @@ async fn main() {
     // Without the fixture flag this is the real startup, whether or not
     // GPUI_AGENT is set (the agent server is wired up separately, later).
     #[cfg(feature = "agent-testing")]
-    let (backend, _fixture_logging_guard) = if env_flag_enabled("RQBIT_AGENT_FIXTURE") {
-        info!("RQBIT_AGENT_FIXTURE is set: using the deterministic agent fixture backend");
-        // The fixture is deliberately UI-thread-local (`?Send`, RefCell
-        // inside); the `Arc` matches the `Arc<dyn TorrentClient>` /
-        // `Arc<dyn UiHost>` service types `MainPanel` takes.
-        #[allow(clippy::arc_with_non_send_sync)]
-        let fixture = AppBackend::Fixture {
-            client: Arc::new(agent_fixture::FixtureClient::new()),
-            host: Arc::new(agent_fixture::FixtureHost::new()),
-        };
-        (fixture, Some(init_logging_result))
-    } else {
-        (real_backend(init_logging_result).await, None)
-    };
+    let (backend, _fixture_logging_guard) = runtime.block_on(async {
+        if env_flag_enabled("RQBIT_AGENT_FIXTURE") {
+            info!("RQBIT_AGENT_FIXTURE is set: using the deterministic agent fixture backend");
+            // The fixture is deliberately UI-thread-local (`?Send`, RefCell
+            // inside); the `Arc` matches the `Arc<dyn TorrentClient>` /
+            // `Arc<dyn UiHost>` service types `MainPanel` takes.
+            #[allow(clippy::arc_with_non_send_sync)]
+            let fixture = AppBackend::Fixture {
+                client: Arc::new(agent_fixture::FixtureClient::new()),
+                host: Arc::new(agent_fixture::FixtureHost::new()),
+            };
+            (fixture, Some(init_logging_result))
+        } else {
+            (real_backend(init_logging_result).await, None)
+        }
+    });
     #[cfg(not(feature = "agent-testing"))]
-    let backend = real_backend(init_logging_result).await;
+    let backend = runtime.block_on(real_backend(init_logging_result));
 
     #[cfg(feature = "agent-testing")]
     let agent_control =
@@ -325,6 +328,13 @@ async fn main() {
             false
         }
     };
+
+    // GPUI's event loop must not run inside Runtime::block_on. Tokio's
+    // cooperative-budget deferred wakes then requeue pending GPUI foreground
+    // tasks continuously (for example delete's RwLock acquire and artwork's
+    // JoinHandle), pegging the main thread. Entering the runtime instead keeps
+    // Handle::current() and tokio::spawn available without a block_on frame.
+    let _runtime_guard = runtime.enter();
 
     // The tray keeps the session alive without a window. Exiting is explicit
     // through the tray menu, native application menu, or hold-to-quit shortcut.
