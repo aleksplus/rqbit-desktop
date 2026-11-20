@@ -275,6 +275,11 @@ fn main() {
         std::process::exit(2);
     }
 
+    // init_logging spawns its filter-reloader task with tokio::spawn, so the
+    // runtime must exist and be entered before logging is initialized.
+    let runtime = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
+    let _runtime_guard = runtime.enter();
+
     // Logging
     let init_logging_result = init_logging(InitLoggingOptions {
         default_rust_log_value: Some("info"),
@@ -283,8 +288,6 @@ fn main() {
         log_file_json: false,
     })
     .unwrap();
-
-    let runtime = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
 
     // Fixture mode (feature `agent-testing` + RQBIT_AGENT_FIXTURE=1) bypasses
     // State::new and all real session/service setup: no librqbit session, no
@@ -332,9 +335,8 @@ fn main() {
     // GPUI's event loop must not run inside Runtime::block_on. Tokio's
     // cooperative-budget deferred wakes then requeue pending GPUI foreground
     // tasks continuously (for example delete's RwLock acquire and artwork's
-    // JoinHandle), pegging the main thread. Entering the runtime instead keeps
-    // Handle::current() and tokio::spawn available without a block_on frame.
-    let _runtime_guard = runtime.enter();
+    // JoinHandle), pegging the main thread. The runtime guard entered above
+    // keeps Handle::current() and tokio::spawn available without a block_on frame.
 
     // The tray keeps the session alive without a window. Exiting is explicit
     // through the tray menu, native application menu, or hold-to-quit shortcut.
