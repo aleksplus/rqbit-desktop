@@ -33,8 +33,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gpui_kit::{App, Global, RenderImage, Hsla, Rgba as GpuiRgba};
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::{App, Global, Hsla, RenderImage, Rgba as GpuiRgba};
 use image::imageops::FilterType;
 use image::{DynamicImage, Frame, ImageBuffer, Rgba as ImageRgba};
 use rqbit_protocol::types::TorrentArtwork;
@@ -479,9 +479,13 @@ mod tests {
     #[test]
     fn build_image_applies_tint() {
         let mut png = Vec::new();
-        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1, 1, ImageRgba([255, 255, 255, 255])))
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            1,
+            1,
+            ImageRgba([255, 255, 255, 255]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
         let tint = ArtworkTint {
             shadow: ImageRgba([10, 20, 30, 255]),
             highlight: ImageRgba([40, 60, 80, 255]),

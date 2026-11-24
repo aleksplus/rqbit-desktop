@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
+use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, menu::PopupMenuItem};
 use gpui_kit::{
     App, Div, ElementId, InteractiveElement as _, ParentElement as _,
     StatefulInteractiveElement as _, Styled, div,
 };
-use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, menu::PopupMenuItem};
 
 use rqbit_protocol::{ApiAddTorrent, CustomColumnKind, TorrentAction, TorrentId};
 

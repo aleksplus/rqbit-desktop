@@ -81,10 +81,13 @@ To upgrade librqbit: bump the version in the root `Cargo.toml`, extract the new 
 ## Rust Development
 
 ### Warnings & Linting
-- After making code changes in Rust, always run `cargo check` and `cargo clippy`
-  before declaring work complete. Never claim compilation success without verifying.
+- After making code changes in Rust, always run `cargo fmt --all`, `cargo check`,
+  and `cargo clippy` before declaring work complete. Never claim compilation
+  success without verifying.
 - When fixing compiler warnings, batch all related warnings together and fix them
   in a single pass. Run `cargo check 2>&1` to capture the full list before editing.
+- Always run `cargo fmt --all -- --check` to verify formatting is clean; if it
+  fails, run `cargo fmt --all` to apply fixes.
 
 ## General Rules
 - Never declare a task complete until tests actually pass and compilation is verified.

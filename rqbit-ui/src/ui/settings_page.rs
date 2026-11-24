@@ -15,8 +15,6 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::*;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, Size,
     button::{Button, ButtonVariants},
@@ -25,6 +23,8 @@ use gpui_kit::component::{
     setting::{NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use rqbit_protocol::SessionSettings;
 
 use crate::client::TorrentClient;
