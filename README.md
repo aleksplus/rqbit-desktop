@@ -3,7 +3,7 @@
 Native desktop app built with [GPUI](https://github.com/zed-industries/zed) (the UI framework behind Zed), and the same client compiled to WebAssembly running in the browser.
 
 
-> **About this repository:** this is the rqbit **desktop client** repo (native GPUI app, browser build, headless daemon). The rqbit engine itself (`librqbit`) lives [upstream](https://github.com/ikatson/rqbit) and on [crates.io](https://crates.io/crates/librqbit); this repo uses it as a Cargo dependency and applies its local API additions as a [cargo-patch-crate](https://github.com/mokeyish/cargo-patch-crate) patch (`patches/`).
+> **About this repository:** this is the rqbit **desktop client** repo (native GPUI app, browser build, headless daemon). The rqbit engine itself (`librqbit`) lives at [ikatson/rqbit](https://github.com/ikatson/rqbit) and on [crates.io](https://crates.io/crates/librqbit); this repo uses it as a Cargo dependency and applies its local API additions as a [cargo-patch-crate](https://github.com/mokeyish/cargo-patch-crate) patch (`patches/`).
 
 The desktop app (`desktop-gpui`) is a native client built with GPUI. It bundles the daemon (`app-daemon`), so a single session serves both the native UI and a web view of the same client in the browser.
 
@@ -13,15 +13,15 @@ Download it in [Releases](https://github.com/aleksplus/rqbit/releases) for OSX, 
 
 **After cloning, run `cargo install patch-crate && cargo patch-crate` once before building** — it materializes the patched librqbit source into `target/patch/`.
 
-<img width="1000" src="https://github.com/user-attachments/assets/9ee6c029-73f0-4ef1-be9a-d5f7fd1907e4" />
-
+<img width="1000" alt="torrents list" src="https://github.com/user-attachments/assets/e80993d5-3837-48d2-9222-46f30515a188" />
+<img width="1000" alt="torrent detail" src="https://github.com/user-attachments/assets/4f829963-ed90-471b-af75-78b0322f9c4b" />
 
 
 ## Web UI
 
 Access at http://localhost:3081/. See screenshot below (torrent names and speeds are simulated).
 
-<img width="3840" height="2560" alt="client-blurred" src="https://github.com/user-attachments/assets/5660aae8-9864-46a8-bb6f-7e269fb580c5" />
+<img width="1000" alt="Screenshot 2026-11-24 at 19 26 35 - blurred" src="https://github.com/user-attachments/assets/1c5ca6ce-f52a-48b9-91d4-4b1947841bc3" />
 
 ## Streaming support
 
