@@ -8,7 +8,7 @@ edition = "2024"
 license = "MIT"
 publish = false
 repository = "https://github.com/aleksplus/rqbit"
-version = "0.0.10"
+version = "0.0.11"
 
 [package.metadata.bundle]
 icon = ["icons/icon.ico", "icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns"]
@@ -16,7 +16,7 @@ identifier = "com.rqbit.gpui-desktop"
 long_description = """https://github.com/aleksplus/rqbit"""
 name = "rqbit-gpui-desktop"
 short_description = "Native desktop for rqbit"
-version = "0.0.10"
+version = "0.0.11"
 
 # Built in CI with:
 #   cargo deb -p desktop-gpui --no-build --profile release-github --target x86_64-unknown-linux-gnu
